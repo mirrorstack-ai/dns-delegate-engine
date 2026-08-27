@@ -25,6 +25,6 @@ check: lint build test-race
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...
 
 # Local HTTP transport on :8093. MS_INTERNAL_SECRET gates every route except
-# /healthz; DATABASE_URL is optional (without it /readyz reports unconfigured).
+# /healthz. There is no database to point at — see README.
 dev:
 	cd cmd/dns-delegate-api && go run .

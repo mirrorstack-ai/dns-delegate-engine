@@ -4,14 +4,29 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"golang.org/x/oauth2"
+
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/grant"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfoauth"
 )
 
-type stubPinger struct{ err error }
+func readyDispatcher() *dispatcher {
+	return &dispatcher{grants: &grant.Service{
+		OAuth: stubOAuth{cfg: &cfoauth.Config{Config: oauth2.Config{
+			ClientID: "cid", RedirectURL: "https://account.example/cb", Scopes: []string{"dns.write"},
+		}}},
+	}}
+}
 
-func (s stubPinger) Ping(context.Context) error { return s.err }
+type stubOAuth struct{ cfg *cfoauth.Config }
+
+func (s stubOAuth) Config(context.Context) *cfoauth.Config { return s.cfg }
 
 func TestLambdaHandlerAnswersTheGatewayHealthProbeWithoutDispatching(t *testing.T) {
 	// No pool wired: if the probe reached the dispatcher it would report
@@ -72,36 +87,54 @@ func TestLambdaHandlerRejectsAMalformedEnvelope(t *testing.T) {
 	}
 }
 
-func TestHealthIsTruthfulAboutTheDatabase(t *testing.T) {
+func TestHealthIsTruthfulAboutDelegation(t *testing.T) {
+	if got := (&dispatcher{}).health(context.Background()); got.OK || got.Delegation != "unconfigured" {
+		t.Fatalf("no grant service must report unconfigured: %#v", got)
+	}
+	if got := (&dispatcher{grants: &grant.Service{}}).health(context.Background()); got.OK || got.Delegation != "unconfigured" {
+		t.Fatalf("no OAuth client must report unconfigured: %#v", got)
+	}
+	// A client without a keyset is a REAL, supported state: grants publish but
+	// cannot be held. Reporting it as unhealthy would take a working deployment
+	// out of rotation over a capability it does not need for the console lane.
+	if got := readyDispatcher().health(context.Background()); !got.OK || got.Delegation != "no-keyset" {
+		t.Fatalf("a client without a keyset is healthy but cannot hold: %#v", got)
+	}
+}
+
+// 🔴 Every error code the caller acts on. `unavailable` and `invalid_request`
+// mean nothing was consumed; a plan refusal means retrying cannot help; anything
+// unrecognised must fall through to `internal`, which the caller treats as a
+// retry and never as a reason to release a grant.
+func TestErrorCodesAreTheCallersContract(t *testing.T) {
 	cases := []struct {
-		name string
-		db   pinger
+		err  error
 		want string
 	}{
-		{"no pool", nil, "unconfigured"},
-		{"unreachable", stubPinger{err: errors.New("dial")}, "unreachable"},
-		{"reachable", stubPinger{}, "ok"},
+		{errUnknownAction, "unknown_action"},
+		{fmt.Errorf("%w: x", errInvalidInput), "invalid_request"},
+		{fmt.Errorf("%w: x", grant.ErrInvalidRequest), "invalid_request"},
+		{grant.ErrUnavailable, "unavailable"},
+		{fmt.Errorf("%w: x", dnsplan.ErrAnchorEscape), "anchor_escape"},
+		{fmt.Errorf("%w: x", dnsplan.ErrPlanChanged), "plan_changed"},
+		{fmt.Errorf("%w: x", dnsplan.ErrPlanPreparing), "plan_preparing"},
+		{fmt.Errorf("%w: x", dnsplan.ErrPlanInvalid), "plan_invalid"},
+		{errors.New("something new"), "internal"},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			d := &dispatcher{}
-			if tc.db != nil {
-				d.db = tc.db
-			}
-			got := d.health(context.Background())
-			if got.Database != tc.want {
-				t.Fatalf("want %q, got %q", tc.want, got.Database)
-			}
-			if got.OK != (tc.want == "ok") {
-				t.Fatalf("ok=%v disagrees with database=%q", got.OK, got.Database)
-			}
-		})
+		if got := errorCode(tc.err); got != tc.want {
+			t.Errorf("%v -> %q, want %q", tc.err, got, tc.want)
+		}
+	}
+	// ErrAnchorEscape wraps ErrPlanInvalid, so ordering inside errorCode is
+	// load-bearing: the specific code must win.
+	if errorCode(fmt.Errorf("%w: x", dnsplan.ErrAnchorEscape)) == "plan_invalid" {
+		t.Error("an anchor escape must not be flattened into plan_invalid")
 	}
 }
 
 func TestHTTPHealthzIsUngatedAndReadyzIsNot(t *testing.T) {
-	d := &dispatcher{db: stubPinger{}}
-	h := d.httpHandler("s3cret")
+	h := readyDispatcher().httpHandler("s3cret")
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))

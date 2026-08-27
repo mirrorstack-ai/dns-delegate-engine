@@ -122,17 +122,22 @@ value. It cannot opt out of a safety rule, because it never sees one.
 
 ```
 dns-delegate-engine/
-├── cmd/dns-delegate-api/   Lambda: the internal RPC surface api-platform calls
+├── cmd/dns-delegate-api/       Lambda: the RPC surface api-platform calls
 ├── internal/
-│   ├── dnsplan/            the authorization boundary — containment, digest, normalization
-│   ├── dnsprovider/        the provider seam; safety rules live ABOVE it
-│   └── shared/             config, internal-secret auth, the JSON envelope
-└── Makefile                make check — vet, build, race tests, arm64 cross-build
+│   ├── dnsplan/                the authorization boundary — containment, digest, normalization
+│   ├── dnsprovider/            the provider seam; safety rules live ABOVE it
+│   ├── reconcile/              the publisher, and every safety rule
+│   ├── provider/cloudflare/    the first adapter
+│   ├── grant/                  the RPC surface: authorize, publish, revoke
+│   └── shared/                 the OAuth client, the sealing keyset, the JSON envelope
+└── Makefile                    make check — vet, build, race tests, arm64 cross-build
 ```
 
-There are no migrations here. The tables this service reads belong to
-`api-platform`'s `ms_organizations` schema and `api-platform` owns their DDL;
-duplicating them would create a second source of truth for one set of rows.
+**There is no database.** This service owns no table, opens no connection, and
+ships no migration. MirrorStack stores every row — including your held grant,
+as ciphertext it holds no key for. This service holds the key and the OAuth
+client, and has nowhere to persist anything. Neither half can act alone, and
+you do not have to reason about a schema to audit what can reach your zone.
 
 ## Running the checks yourself
 
