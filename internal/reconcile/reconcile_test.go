@@ -205,22 +205,71 @@ func TestPublishReadsEveryNameBeforeWritingAny(t *testing.T) {
 	}
 }
 
-// A second CNAME at one owner leaves the customer serving from whichever the
-// provider happens to pick.
-func TestPublishUpdatesACNAMEInPlace(t *testing.T) {
+// 🔴 THE CUSTOMER'S OWN RECORD SURVIVES AUTHORIZATION. THIS IS THE PROMISE.
+//
+// This test used to assert the opposite — that an existing CNAME pointing
+// somewhere else was patched to our target. It was, and a customer authorizing
+// a domain took their own service off the air with no warning and no undo.
+//
+// We ADD. A name already answering with something that is not ours is refused,
+// and the customer deletes it themselves and authorizes again.
+func TestPublishRefusesToReplaceARecordThatIsNotOurs(t *testing.T) {
 	f := newFake()
 	f.rows[anchor] = []dnsprovider.LiveRecord{
-		{ID: "old", Type: "CNAME", Name: anchor, Value: "somewhere-else.example", Proxied: false},
+		{ID: "theirs", Type: "CNAME", Name: anchor, Value: "their-live-service.example", Proxied: false},
+	}
+	plan := planOf(t, dnsplan.Record{Type: "CNAME", Name: anchor, Value: "edge.mirrorstack.ai", Proxied: true})
+
+	err := fast(f).Publish(context.Background(), "tok", plan)
+	if !errors.Is(err, ErrNameInUse) {
+		t.Fatalf("want ErrNameInUse, got %v", err)
+	}
+	// It must NAME what is in the way — the customer has to know which record
+	// to delete, and what it currently points at.
+	if !strings.Contains(err.Error(), anchor) || !strings.Contains(err.Error(), "their-live-service.example") {
+		t.Fatalf("the refusal must name the record and its value: %v", err)
+	}
+	if f.countCalls("patch:")+f.countCalls("create:") != 0 {
+		t.Fatalf("NOTHING may be written; calls=%v", f.calls)
+	}
+	if len(f.rows[anchor]) != 1 || f.rows[anchor][0].Value != "their-live-service.example" {
+		t.Fatalf("the customer's record must be untouched, got %#v", f.rows[anchor])
+	}
+}
+
+// The in-place repair still exists, and is still needed: a record with OUR
+// target but the wrong proxy state is ours, and is exactly what it is for.
+func TestPublishStillRepairsOurOwnRecordInPlace(t *testing.T) {
+	f := newFake()
+	f.rows[anchor] = []dnsprovider.LiveRecord{
+		{ID: "ours", Type: "CNAME", Name: anchor, Value: "edge.mirrorstack.ai", Proxied: false},
 	}
 	plan := planOf(t, dnsplan.Record{Type: "CNAME", Name: anchor, Value: "edge.mirrorstack.ai", Proxied: true})
 	if err := fast(f).Publish(context.Background(), "tok", plan); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	if f.countCalls("create:") != 0 {
-		t.Fatalf("must patch, not create a second CNAME; calls=%v", f.calls)
+		t.Fatalf("must patch our own row, not create a second CNAME; calls=%v", f.calls)
 	}
-	if len(f.rows[anchor]) != 1 || f.rows[anchor][0].ID != "old" {
-		t.Fatalf("want the existing row updated, got %#v", f.rows[anchor])
+	if len(f.rows[anchor]) != 1 || f.rows[anchor][0].ID != "ours" || !f.rows[anchor][0].Proxied {
+		t.Fatalf("want our row repaired in place, got %#v", f.rows[anchor])
+	}
+}
+
+// Ours may not be the first row at that owner. Picking sameType[0] blindly
+// would refuse a name we already hold.
+func TestPublishFindsOurRecordAmongOthersAtTheSameOwner(t *testing.T) {
+	f := newFake()
+	f.rows[anchor] = []dnsprovider.LiveRecord{
+		{ID: "stale", Type: "CNAME", Name: anchor, Value: "old-vendor.example", Proxied: false},
+		{ID: "ours", Type: "CNAME", Name: anchor, Value: "edge.mirrorstack.ai", Proxied: false},
+	}
+	plan := planOf(t, dnsplan.Record{Type: "CNAME", Name: anchor, Value: "edge.mirrorstack.ai", Proxied: true})
+	if err := fast(f).Publish(context.Background(), "tok", plan); err != nil {
+		t.Fatalf("our own record must still be repairable: %v", err)
+	}
+	if f.countCalls("patch:ours|") == 0 && f.countCalls("patch:ours") == 0 {
+		t.Fatalf("the OURS row must be the one patched; calls=%v", f.calls)
 	}
 }
 
