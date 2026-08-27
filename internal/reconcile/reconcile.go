@@ -15,6 +15,8 @@
 //  5. Do all of it inside one bounded window, detached from the caller's
 //     cancellation — a browser disconnect must not strand an arbitrary prefix of
 //     an approved plan.
+//  6. Re-check both plan bounds — anchor containment and the proxy rule — before
+//     the first write, because a snapshot can arrive from storage.
 package reconcile
 
 import (
@@ -110,12 +112,23 @@ func (p Publisher) Publish(ctx context.Context, token string, snapshot dnsplan.S
 	if len(desired) == 0 {
 		return ErrNoRecords
 	}
-	// Containment is re-checked here, not assumed. Publish is the last place a
-	// record can be stopped, and a snapshot can arrive from storage.
+	// Both plan bounds are re-checked here, not assumed. Publish is the last
+	// place a record can be stopped, and a snapshot can arrive from storage —
+	// written by an older build, or by one that predates a rule.
+	//
+	// They are re-checked TOGETHER because they are the same tier of rule: one
+	// stops a write leaving the subtree the customer proved, the other stops a
+	// write that would break certificate renewal inside it. Enforcing only the
+	// first here would give containment three independent layers and the proxy
+	// rule two, for no reason a reader could find.
 	for _, record := range desired {
 		if !dnsplan.Contains(snapshot.Anchor, record.Name) {
 			return fmt.Errorf("%w: %q is not at or under %q",
 				dnsplan.ErrAnchorEscape, dnsplan.NormalizeName(record.Name), snapshot.Anchor)
+		}
+		if record.Proxied && dnsplan.IsValidation(record) {
+			return fmt.Errorf("%w: %q is a %s record and may not be proxied",
+				dnsplan.ErrProxiedValidation, dnsplan.NormalizeName(record.Name), dnsplan.Classify(record))
 		}
 	}
 	if err := validateNoConflictingCNAMEs(desired); err != nil {

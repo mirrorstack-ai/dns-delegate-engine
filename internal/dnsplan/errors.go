@@ -23,6 +23,15 @@ var (
 	// caller that only checks ErrPlanInvalid.
 	ErrAnchorEscape = fmt.Errorf("%w: record outside the plan anchor", ErrPlanInvalid)
 
+	// ErrProxiedValidation is the refusal for a plan that would hide a
+	// certificate-validation record behind Cloudflare's proxy. Like
+	// ErrAnchorEscape it WRAPS ErrPlanInvalid, so a caller matching the boundary
+	// keeps one opaque answer while logs and tests can name the real cause.
+	//
+	// See assertNoProxiedValidation for why a provider accepting the setting is
+	// exactly the reason this has to be refused here.
+	ErrProxiedValidation = fmt.Errorf("%w: validation record is proxied", ErrPlanInvalid)
+
 	// ErrPlanPreparing means the plan is not publishable yet — most commonly a
 	// row with no durable validation record. It is a wait, not a fault.
 	ErrPlanPreparing = errors.New("dnsplan: plan preparing")

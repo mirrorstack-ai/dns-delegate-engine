@@ -402,6 +402,29 @@ func TestPublishRefusesAnEscapingSnapshotBeforeTouchingTheProvider(t *testing.T)
 	}
 }
 
+// The proxy rule's half of the same last line of defence. A stored snapshot can
+// predate the rule, so Publish must refuse it rather than trust that whatever
+// built the row ran today's checks.
+func TestPublishRefusesAProxiedValidationRecordFromStorage(t *testing.T) {
+	f := newFake()
+	// Bypass NewSnapshot, exactly as the containment test above does.
+	plan := dnsplan.Snapshot{
+		Version: dnsplan.Version, Kind: dnsplan.KindPlatform,
+		TargetID: "3f2a1b4c-5d6e-4f70-8a91-b2c3d4e5f607", Anchor: anchor,
+		Records: []dnsplan.Record{
+			{Type: "CNAME", Name: "_acme-challenge." + anchor, Value: "a.dcv.cloudflare.com", Proxied: true},
+		},
+		Identities: []string{"CNAME|_acme-challenge." + anchor + "|a.dcv.cloudflare.com"},
+	}
+	err := fast(f).Publish(context.Background(), "tok", plan)
+	if !errors.Is(err, dnsplan.ErrProxiedValidation) {
+		t.Fatalf("want ErrProxiedValidation, got %v", err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("the provider must not be touched at all; calls=%v", f.calls)
+	}
+}
+
 func TestPublishRefusesConflictingCNAMETargets(t *testing.T) {
 	f := newFake()
 	plan := planOf(t,

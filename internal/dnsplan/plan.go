@@ -125,6 +125,9 @@ func NewSnapshot(kind, targetID, anchor string, records []Record) (Snapshot, err
 		return Snapshot{}, fmt.Errorf("%w: %q is not at or under %q",
 			ErrAnchorEscape, NormalizeName(record.Name), anchor)
 	}
+	if err := assertNoProxiedValidation(normalized); err != nil {
+		return Snapshot{}, err
+	}
 	return Snapshot{
 		Version: Version, Kind: kind, TargetID: canonical, Anchor: anchor,
 		Records: normalized, Identities: identities,
@@ -198,6 +201,11 @@ func (s Snapshot) Validate(storedDigest []byte) error {
 			return fmt.Errorf("%w: %q is not at or under %q",
 				ErrAnchorEscape, NormalizeName(record.Name), s.Anchor)
 		}
+	}
+	// Same reasoning as containment: a row written before this rule existed, or
+	// by a build without it, must not publish now.
+	if err := assertNoProxiedValidation(s.Records); err != nil {
+		return err
 	}
 	if digest := s.Digest(); len(digest) == 0 || !bytes.Equal(digest, storedDigest) {
 		return fmt.Errorf("%w: digest mismatch", ErrPlanInvalid)

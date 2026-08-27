@@ -17,6 +17,28 @@ holds a customer's DNS-provider grant.
    design change and a broken promise in the README, not a refactor.
 3. **Never retry an ambiguous write.** Re-read instead. `IsAmbiguous` must fail
    TOWARD ambiguous for any error an adapter does not recognise.
+4. **Never take over a name in use.** A CNAME already answering with something
+   that is not ours is refused (`reconcile.ErrNameInUse`), never repointed. We
+   ADD, and may repair a record whose target is already ours.
+5. **Never proxy a validation record.** `assertNoProxiedValidation` refuses the
+   plan. The provider ACCEPTS the setting and then flattens the CNAME, so
+   nothing downstream would catch it — the failure is a silent certificate
+   renewal months later.
+
+## The documentation is executable, and that is deliberate
+
+`README.md` and `docs/RECORDS.md` are the reason this repository is public, so
+they are written against code rather than beside it:
+
+- `dnsplan.Classify` names what a record is FOR from its name alone. That is not
+  derivation — it needs no topology — which is why it can live here.
+- `internal/dnsplan/example_test.go` PRINTS real plans for both lanes through
+  `Snapshot.Explain`, with `// Output:` blocks. `go test` fails if the tables in
+  the documentation drift from what the code produces.
+
+When you change a record shape, a refusal or a lifetime, update the example and
+let the output block tell you what actually changed. Do not hand-edit a table in
+the README and leave the example alone.
 
 ## Do not put here
 
