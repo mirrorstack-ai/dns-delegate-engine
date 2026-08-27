@@ -25,8 +25,12 @@ holds a customer's DNS-provider grant.
   in `api-platform`. The public claim survives that split because containment,
   not derivation, is what bounds the blast radius. Moving derivation here would
   move exactly the topology this repository exists to leave behind.
-- Migrations. The tables live in `api-platform`'s `ms_organizations` schema and
-  `api-platform` owns their DDL.
+- A database. This service is STATELESS by design: it owns no table, opens no
+  connection, and ships no migration. api-platform holds every row, including
+  sealed grants as ciphertext it has no key for. Adding a database here would
+  add a schema to keep in sync, a second writer to the customer's rows, and a
+  surface an auditor has to read. If something seems to need persisting, it
+  belongs in the caller's row.
 - Anything that makes the repository harder to read end-to-end in an afternoon.
 
 ## The digest is a cross-repository contract
@@ -40,6 +44,13 @@ If that test fails, a marshalled field moved. In production that invalidates
 every in-flight attempt — every customer mid-connect is told the plan changed.
 Fix the drift. Do not regenerate the constant unless you are deliberately
 versioning the envelope (bump `dnsplan.Version`, and expect that invalidation).
+
+## No database, ever
+
+This service is stateless. `internal/shared/config` has no pool helper, and the
+health action resolves credentials rather than pinging anything. That is the
+property that makes the repository auditable in an afternoon; do not trade it
+for convenience.
 
 ## Transport
 

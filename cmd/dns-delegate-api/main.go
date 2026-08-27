@@ -30,10 +30,15 @@ import (
 	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/grant"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/provider/cloudflare"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/reconcile"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/auth"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfoauth"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/config"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/httputil"
 )
 
@@ -49,61 +54,89 @@ type rpcEnvelope struct {
 // of hammering the engine.
 var errUnknownAction = errors.New("unknown action")
 
-// pinger is the narrow slice of *pgxpool.Pool the readiness probe needs, as an
-// interface so the probe is testable without a database.
-type pinger interface {
-	Ping(context.Context) error
-}
+// errInvalidInput is a malformed request payload, distinct from any refusal the
+// grant service itself makes.
+var errInvalidInput = errors.New("invalid request payload")
 
 type dispatcher struct {
-	// db is nil until a deployment supplies DATABASE_URL. A nil pool is a
-	// truthful "not ready", never a panic.
-	db pinger
+	grants *grant.Service
 }
 
-func (d *dispatcher) dispatch(ctx context.Context, action string, _ json.RawMessage) (any, error) {
+func (d *dispatcher) dispatch(ctx context.Context, action string, payload json.RawMessage) (any, error) {
 	switch action {
 	case "Health":
 		return d.health(ctx), nil
+	case "Capabilities":
+		if d.grants == nil {
+			return grant.CapabilitiesResponse{}, nil
+		}
+		return d.grants.Capabilities(ctx), nil
+	case "Authorize":
+		return decodeAnd(payload, d.grants, (*grant.Service).Authorize)
+	case "Publish":
+		return decodeAnd(payload, d.grants, (*grant.Service).Publish)
+	case "Revoke":
+		return decodeAnd(payload, d.grants, (*grant.Service).Revoke)
 	default:
 		return nil, fmt.Errorf("%w: %q", errUnknownAction, action)
 	}
 }
 
-type healthResponse struct {
-	OK       bool   `json:"ok"`
-	Database string `json:"database"`
+// decodeAnd unmarshals one action's request and runs it. A malformed payload is
+// errInvalidInput, never the action's own failure vocabulary: the caller must be
+// able to tell "you sent nonsense" from "the provider refused".
+func decodeAnd[Req any, Res any](
+	payload json.RawMessage,
+	svc *grant.Service,
+	run func(*grant.Service, context.Context, Req) (Res, error),
+) (any, error) {
+	var zero Res
+	if svc == nil {
+		return zero, grant.ErrUnavailable
+	}
+	var req Req
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &req); err != nil {
+			return zero, fmt.Errorf("%w: %v", errInvalidInput, err)
+		}
+	}
+	return run(svc, context.Background(), req)
 }
 
-// health reports whether the service can reach its database. It is the arming
-// check for the deploy: the stack, the RDS-Proxy grant, the IAM database role
-// and the VPC path are all either working here or not working at all.
+type healthResponse struct {
+	OK bool `json:"ok"`
+	// Delegation reports whether this deployment can actually offer delegated
+	// DNS: "ready" (client and keyset), "no-keyset" (client only — grants can be
+	// published but not held), or "unconfigured".
+	Delegation string `json:"delegation"`
+}
+
+// health is the arming check for a deploy. It resolves the credentials the same
+// way a real request does — through the runtime loaders, so a secret filled in
+// after this Lambda started counts — without contacting the provider.
 func (d *dispatcher) health(ctx context.Context) healthResponse {
-	if d.db == nil {
-		return healthResponse{OK: false, Database: "unconfigured"}
+	if d.grants == nil {
+		return healthResponse{Delegation: "unconfigured"}
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := d.db.Ping(ctx); err != nil {
-		slog.Error("dns-delegate: database ping failed", "error", err)
-		return healthResponse{OK: false, Database: "unreachable"}
+	caps := d.grants.Capabilities(ctx)
+	switch {
+	case !caps.Available:
+		return healthResponse{Delegation: "unconfigured"}
+	case !caps.CanHold:
+		return healthResponse{OK: true, Delegation: "no-keyset"}
+	default:
+		return healthResponse{OK: true, Delegation: "ready"}
 	}
-	return healthResponse{OK: true, Database: "ok"}
 }
 
 func main() {
-	var pool *pgxpool.Pool
-	if os.Getenv("DATABASE_URL") != "" {
-		pool = config.MustPgxPool()
-		defer pool.Close()
-	}
-	d := &dispatcher{}
-	// A typed nil *pgxpool.Pool in an interface is non-nil, and the health
-	// check's `d.db == nil` would then be false and Ping would panic. Assign
-	// only when there is a real pool.
-	if pool != nil {
-		d.db = pool
-	}
+	d := &dispatcher{grants: &grant.Service{
+		OAuth: cfoauth.NewDefaultLoader(),
+		Keys:  grantcrypto.NewDefaultLoader(),
+		// Cloudflare is the first provider. A second one is an adapter beside it
+		// plus a selector here; every safety rule stays in reconcile.
+		Publisher: reconcile.Publisher{Provider: cloudflare.Client{}},
+	}}
 
 	if config.IsLambda() {
 		lambda.Start(d.lambdaHandler)
@@ -150,10 +183,7 @@ func (d *dispatcher) lambdaHandler(ctx context.Context, payload json.RawMessage)
 	}
 	response, err := d.dispatch(ctx, envelope.Action, envelope.Request)
 	if err != nil {
-		code := "internal"
-		if errors.Is(err, errUnknownAction) {
-			code = "unknown_action"
-		}
+		code := errorCode(err)
 		// The error is returned INSIDE the envelope, not as the Lambda
 		// function error: a function error is indistinguishable from a
 		// transport failure at the caller, and this service's client must be
@@ -182,4 +212,31 @@ func (d *dispatcher) httpHandler(secret string) http.Handler {
 	})
 	mux.Handle("/", auth.InternalSecret(secret)(gated))
 	return mux
+}
+
+// errorCode maps an engine error onto the caller's contract.
+//
+// 🔴 THE CALLER ACTS ON THESE. `unavailable` and `invalid_request` mean nothing
+// was consumed; a plan refusal means the plan is wrong and retrying it cannot
+// help. Anything unrecognised falls through to `internal`, which the caller must
+// treat as a retry — never as a reason to release a grant.
+func errorCode(err error) string {
+	switch {
+	case errors.Is(err, errUnknownAction):
+		return "unknown_action"
+	case errors.Is(err, errInvalidInput), errors.Is(err, grant.ErrInvalidRequest):
+		return "invalid_request"
+	case errors.Is(err, grant.ErrUnavailable):
+		return "unavailable"
+	case errors.Is(err, dnsplan.ErrAnchorEscape):
+		return "anchor_escape"
+	case errors.Is(err, dnsplan.ErrPlanChanged):
+		return "plan_changed"
+	case errors.Is(err, dnsplan.ErrPlanPreparing):
+		return "plan_preparing"
+	case errors.Is(err, dnsplan.ErrPlanInvalid):
+		return "plan_invalid"
+	default:
+		return "internal"
+	}
 }
