@@ -8,7 +8,9 @@
 //  1. Never delete. There is no delete call, here or in the interface.
 //  2. Read every affected owner name BEFORE writing any of them, so create-vs-
 //     update is decided against a coherent read.
-//  3. Update a routing CNAME in place rather than adding a second one.
+//  3. Update a routing CNAME in place rather than adding a second one — but ONLY
+//     when the record there is already ours. A name the customer is serving
+//     something else from is refused, never repointed.
 //  4. Never retry an ambiguous write. Re-read instead, within a bounded window.
 //  5. Do all of it inside one bounded window, detached from the caller's
 //     cancellation — a browser disconnect must not strand an arbitrary prefix of
@@ -46,6 +48,21 @@ var ErrNoRecords = errors.New("reconcile: no DNS records to publish")
 // provider CNAME between targets and report success after satisfying only the
 // last record in the plan.
 var ErrConflictingPlan = errors.New("reconcile: plan contains conflicting CNAME targets")
+
+// ErrNameInUse means the customer is already serving something from a name in
+// the plan, and it is not ours.
+//
+// 🔴 A REFUSAL, NOT A FAILURE TO RETRY. Nothing we can do makes it succeed: the
+// name is the customer's, the record in it is the customer's, and only they can
+// decide it should go. They delete it in their own dashboard and authorize
+// again — which is the only sequence in which the change was ever theirs to
+// make.
+//
+// It is also what lets publication be described as "we only ever add". A
+// delegated grant carries dns.write over the customer's whole zone; anchor
+// containment stops us leaving the subtree they proved, and this stops us
+// overwriting anything already inside it.
+var ErrNameInUse = errors.New("reconcile: the name is already in use by another record")
 
 // Publisher reconciles plans through one provider.
 type Publisher struct {
@@ -166,11 +183,36 @@ func (p Publisher) Publish(ctx context.Context, token string, snapshot dnsplan.S
 			continue
 		}
 
-		// A CNAME is updated in place when one already exists at this owner.
-		// Creating a second one would leave the customer serving from whichever
-		// the provider picked.
+		// 🔴 A RECORD THAT IS NOT OURS IS NEVER TOUCHED. NOT UPDATED, NOT MOVED.
+		//
+		// This used to patch sameType[0] unconditionally, reasoning that a second
+		// CNAME at one owner would leave the customer serving from whichever the
+		// provider picked. That is true, and it is still why we update in place —
+		// but it is only ever a licence to update OUR OWN record. Applied to a
+		// CNAME pointing somewhere else it silently repointed a name the customer
+		// was serving from, and their service went dark on authorization.
+		//
+		// The rule is: we ADD, and we may repair a record whose target is already
+		// ours. Anything else in the way is refused, and the customer deletes it
+		// in their own dashboard and authorizes again — the only sequence in which
+		// that change was ever theirs to make.
+		//
+		// `ours` matches on VALUE alone, deliberately: a record with our target
+		// but the wrong proxy state IS ours, and is exactly what the in-place
+		// repair exists for.
 		if want.Type == "CNAME" && len(sameType) > 0 {
-			if err := p.patchObserved(ctx, token, zoneID, sameType[0].ID, want); err != nil {
+			ours := -1
+			for i, row := range sameType {
+				if p.Provider.SameValue(want.Type, row.Value, want.Value) {
+					ours = i
+					break
+				}
+			}
+			if ours < 0 {
+				return fmt.Errorf("%w: %q already answers with %q",
+					ErrNameInUse, dnsplan.NormalizeName(want.Name), sameType[0].Value)
+			}
+			if err := p.patchObserved(ctx, token, zoneID, sameType[ours].ID, want); err != nil {
 				return err
 			}
 			continue
