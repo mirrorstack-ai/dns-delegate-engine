@@ -1,0 +1,253 @@
+package dnsplan
+
+import (
+	"encoding/hex"
+	"errors"
+	"strings"
+	"testing"
+)
+
+const (
+	testTarget = "3f2a1b4c-5d6e-4f70-8a91-b2c3d4e5f607"
+	testAnchor = "example.com"
+)
+
+func goldenRecords() []Record {
+	return []Record{
+		{Type: "CNAME", Name: "app.example.com", Value: "edge.mirrorstack.ai", Proxied: true},
+		{Type: "CNAME", Name: "_acme-challenge.app.example.com", Value: "x.acm-validations.aws"},
+		{Type: "TXT", Name: "_cf-custom-hostname.app.example.com", Value: "abc123"},
+	}
+}
+
+// 🔴 GOLDEN DIGEST — DO NOT REGENERATE TO MAKE A FAILURE GO AWAY.
+//
+// api-platform computes this same SHA-256 over this same fixture in
+// TestDelegatedPlanGoldenDigest. The two repositories must agree byte for byte:
+// api-platform derives and persists the digest before a customer authorizes,
+// and this service re-derives it before it writes anything.
+//
+// If this test fails, a marshalled field changed. That invalidates every
+// in-flight attempt in production — every customer mid-connect would be told the
+// plan changed. Fix the drift; do not update the constant unless you are
+// deliberately versioning the envelope (bump Version, and expect exactly that
+// invalidation).
+const goldenDigestHex = "c5fdeb2a95fd30f6091eb8ac9583561547a2481ab4bea5ce2e0fbc2ef494874c"
+
+func TestGoldenDigest(t *testing.T) {
+	snapshot, err := NewSnapshot(KindPlatform, testTarget, testAnchor, goldenRecords())
+	if err != nil {
+		t.Fatalf("NewSnapshot: %v", err)
+	}
+	if got := hex.EncodeToString(snapshot.Digest()); got != goldenDigestHex {
+		t.Fatalf("digest drift\n got: %s\nwant: %s", got, goldenDigestHex)
+	}
+}
+
+func TestContainmentRefusesEscape(t *testing.T) {
+	cases := []struct {
+		name   string
+		record string
+	}{
+		{"the apex above the anchor", "example.com.evil.test"},
+		{"a sibling that merely shares a suffix", "notexample.com"},
+		{"a suffix-confusion neighbour", "evilexample.com"},
+		{"an unrelated zone", "www.someone-else.test"},
+		{"the parent of the anchor", "com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			records := append(goldenRecords(), Record{
+				Type: "CNAME", Name: tc.record, Value: "edge.mirrorstack.ai",
+			})
+			_, err := NewSnapshot(KindPlatform, testTarget, "app.example.com", records)
+			if !errors.Is(err, ErrAnchorEscape) {
+				t.Fatalf("want ErrAnchorEscape, got %v", err)
+			}
+			if !errors.Is(err, ErrPlanInvalid) {
+				t.Fatalf("ErrAnchorEscape must wrap ErrPlanInvalid so the caller keeps one opaque boundary; got %v", err)
+			}
+		})
+	}
+}
+
+// A customer zone is the case the public claim is about: the anchor is a name in
+// somebody else's zone, and the grant covers that whole zone. Platform-zone
+// coverage alone would prove nothing about the situation a customer is worried
+// about.
+func TestContainmentInACustomerZone(t *testing.T) {
+	anchor := "shop.customer-owned.example"
+	ok := []string{anchor, "www." + anchor, "*." + anchor, "_acme-challenge." + anchor}
+	for _, name := range ok {
+		if !Contains(anchor, name) {
+			t.Fatalf("%q must be inside %q", name, anchor)
+		}
+	}
+	// The records a customer fears losing: their apex, their www, their mail.
+	notOK := []string{"customer-owned.example", "www.customer-owned.example", "mail.customer-owned.example", ""}
+	for _, name := range notOK {
+		if Contains(anchor, name) {
+			t.Fatalf("%q must NOT be inside %q", name, anchor)
+		}
+	}
+}
+
+func TestContainmentIsCaseAndTrailingDotInsensitive(t *testing.T) {
+	if !Contains("Example.COM.", "APP.example.com") {
+		t.Fatal("anchor matching must fold case and the root dot")
+	}
+}
+
+func TestValidateRejectsAStoredEscape(t *testing.T) {
+	snapshot, err := NewSnapshot(KindPlatform, testTarget, testAnchor, goldenRecords())
+	if err != nil {
+		t.Fatalf("NewSnapshot: %v", err)
+	}
+	digest := snapshot.Digest()
+
+	// Simulate a row written by a build that predates containment: the records
+	// escape, but the digest is self-consistent, so only a re-check catches it.
+	tampered := snapshot
+	tampered.Records = append([]Record(nil), snapshot.Records...)
+	tampered.Identities = append([]string(nil), snapshot.Identities...)
+	tampered.Records[0].Name = "www.someone-else.test"
+	tampered.Identities[0] = "CNAME|www.someone-else.test|edge.mirrorstack.ai"
+	if err := tampered.Validate(tampered.Digest()); !errors.Is(err, ErrAnchorEscape) {
+		t.Fatalf("a self-consistent stored escape must still be refused, got %v", err)
+	}
+
+	// And an ordinary digest mismatch is still an ordinary refusal. Copy first:
+	// append(digest[:31], ...) would write through digest's own backing array.
+	wrong := append([]byte(nil), digest...)
+	wrong[31] ^= 0xff
+	if err := snapshot.Validate(wrong); !errors.Is(err, ErrPlanInvalid) {
+		t.Fatalf("want ErrPlanInvalid on digest mismatch, got %v", err)
+	}
+	if err := snapshot.Validate(digest); err != nil {
+		t.Fatalf("the untampered snapshot must validate: %v", err)
+	}
+}
+
+func TestNormalizeRecordsDedupesAndCanonicalizes(t *testing.T) {
+	records := []Record{
+		{Type: " cname ", Name: "  APP.Example.com. ", Value: " edge.mirrorstack.ai "},
+		{Type: "CNAME", Name: "app.example.com", Value: "edge.mirrorstack.ai"},
+	}
+	out, identities, err := NormalizeRecords(records)
+	if err != nil {
+		t.Fatalf("NormalizeRecords: %v", err)
+	}
+	if len(out) != 1 || len(identities) != 1 {
+		t.Fatalf("want one deduped record, got %d", len(out))
+	}
+	if identities[0] != "CNAME|app.example.com|edge.mirrorstack.ai" {
+		t.Fatalf("identity not canonical: %q", identities[0])
+	}
+}
+
+func TestNormalizeRecordsRejectsUnsupportedTypes(t *testing.T) {
+	// An A record, an MX record and an NS record are exactly the records a
+	// customer's own site depends on. The plan vocabulary admits neither.
+	for _, kind := range []string{"A", "AAAA", "MX", "NS", "SOA", ""} {
+		_, _, err := NormalizeRecords([]Record{{Type: kind, Name: "example.com", Value: "1.2.3.4"}})
+		if !errors.Is(err, ErrPlanPreparing) {
+			t.Fatalf("type %q must be refused, got %v", kind, err)
+		}
+	}
+}
+
+func TestCanonicalUUIDIsStrict(t *testing.T) {
+	if _, ok := canonicalUUID(strings.ToUpper(testTarget)); !ok {
+		t.Fatal("uppercase canonical form must be accepted")
+	}
+	got, ok := canonicalUUID(strings.ToUpper(testTarget))
+	if !ok || got != testTarget {
+		t.Fatalf("must normalize to lowercase, got %q", got)
+	}
+	for _, bad := range []string{
+		"",
+		"3f2a1b4c5d6e4f708a91b2c3d4e5f607",       // unhyphenated
+		"{3f2a1b4c-5d6e-4f70-8a91-b2c3d4e5f607}", // braced
+		"3f2a1b4c-5d6e-4f70-8a91-b2c3d4e5f60",    // short
+		"3f2a1b4c-5d6e-4f70-8a91-b2c3d4e5f60g",   // non-hex
+		"3f2a1b4c_5d6e_4f70_8a91_b2c3d4e5f607",   // wrong separator
+	} {
+		if _, ok := canonicalUUID(bad); ok {
+			t.Fatalf("%q must be refused", bad)
+		}
+	}
+}
+
+func TestCoveredByAllowsGrowthNotShrinkageOrMutation(t *testing.T) {
+	reviewed, err := NewSnapshot(KindPlatform, testTarget, testAnchor, goldenRecords()[:2])
+	if err != nil {
+		t.Fatalf("NewSnapshot: %v", err)
+	}
+	grown, err := NewSnapshot(KindPlatform, testTarget, testAnchor, goldenRecords())
+	if err != nil {
+		t.Fatalf("NewSnapshot: %v", err)
+	}
+	if !reviewed.CoveredBy(grown) {
+		t.Fatal("a sibling finishing preparation must not strand the customer")
+	}
+	if grown.CoveredBy(reviewed) {
+		t.Fatal("a shrunken plan is a plan the operator did not review")
+	}
+
+	mutated := goldenRecords()[:2]
+	mutated[0].Value = "attacker.example"
+	changed, err := NewSnapshot(KindPlatform, testTarget, testAnchor, mutated)
+	if err != nil {
+		t.Fatalf("NewSnapshot: %v", err)
+	}
+	if reviewed.CoveredBy(changed) {
+		t.Fatal("a mutated value is a different record")
+	}
+
+	other, err := NewSnapshot(KindApp, testTarget, testAnchor, goldenRecords())
+	if err != nil {
+		t.Fatalf("NewSnapshot: %v", err)
+	}
+	if reviewed.CoveredBy(other) {
+		t.Fatal("a different kind is a different authorization")
+	}
+}
+
+func TestAssertReviewedNeverDecodesIntoAWrite(t *testing.T) {
+	authoritative := []string{
+		"CNAME|app.example.com|edge.mirrorstack.ai",
+		"TXT|_cf.app.example.com|abc",
+	}
+	if err := AssertReviewed([]string{authoritative[1], authoritative[0]}, authoritative); err != nil {
+		t.Fatalf("order must not matter: %v", err)
+	}
+	bad := [][]string{
+		{},
+		{authoritative[0]},
+		{authoritative[0], authoritative[0]},
+		{"CNAME|app.example.com|edge.mirrorstack.ai", "TXT|_cf.app.example.com|WRONG"},
+		{"CNAME|APP.EXAMPLE.COM|edge.mirrorstack.ai", authoritative[1]}, // not normalized
+		{"nonsense", authoritative[1]},
+		{"A|app.example.com|1.2.3.4", authoritative[1]},
+	}
+	for i, reviewed := range bad {
+		if err := AssertReviewed(reviewed, authoritative); !errors.Is(err, ErrPlanChanged) {
+			t.Fatalf("case %d must be refused, got %v", i, err)
+		}
+	}
+}
+
+func TestPlanSizeIsBounded(t *testing.T) {
+	records := make([]Record, 0, MaxRecords+1)
+	for i := 0; i <= MaxRecords; i++ {
+		records = append(records, Record{
+			Type: "TXT", Name: "r.example.com", Value: strings.Repeat("x", i+1),
+		})
+	}
+	if _, err := NewSnapshot(KindPlatform, testTarget, testAnchor, records); !errors.Is(err, ErrPlanPreparing) {
+		t.Fatalf("an oversized plan must be refused, got %v", err)
+	}
+	if _, err := NewSnapshot(KindPlatform, testTarget, testAnchor, nil); !errors.Is(err, ErrPlanPreparing) {
+		t.Fatalf("an empty plan must be refused, got %v", err)
+	}
+}

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # 🔴 NO BASE-BRANCH FILTER ON pull_request, DELIBERATELY.
+  #
+  # `branches: [main]` means a PR targeting anything else gets NO workflow runs
+  # at all — not a failure, not a skip: an EMPTY check list, which reads as
+  # "nothing to worry about". A stack is exactly where verification matters
+  # most, since each link is reviewed on top of code that has not landed yet.
+  #
+  # `push` keeps its filter — a push run exists to protect main, and running the
+  # suite on every branch push would duplicate the PR run.
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # 🔴 JOB ID MUST STAY `test`.
+  #
+  # The org ruleset "Required CI - Go test" (18965706) requires a status check
+  # literally named `test`. Renaming this job does not fail the ruleset — it
+  # leaves the required check permanently pending, or, if the ruleset is later
+  # relaxed, silently unenforced.
+  test:
+    # 🔴 HARDCODED ubuntu-latest, NOT fromJSON(vars.RUNNER_LABELS).
+    #
+    # RUNNER_LABELS is set org-wide to the self-hosted dgx-spark fleet. This
+    # repository is PUBLIC: routing its jobs onto self-hosted hardware would let
+    # any fork PR execute on our runners. Public repos never join the fleet.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test (unit)
+        run: go test -race -count=1 ./...
+
+      # Cross-compilation parity with the publish workflow: a change that only
+      # builds on the runner's own arch must fail here, not in Publish, where
+      # main is already carrying it.
+      - name: Build (linux/arm64 cross-compile)
+        run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...

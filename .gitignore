@@ -1,0 +1,7 @@
+/bin/
+/dist/
+*.exe
+.env
+.env.local
+.DS_Store
+tmp/

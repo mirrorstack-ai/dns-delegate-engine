@@ -1,0 +1,7 @@
+[build]
+cmd = "go build -buildvcs=false -o /tmp/dns-delegate-api ./cmd/dns-delegate-api"
+bin = "/tmp/dns-delegate-api"
+include_ext = ["go"]
+exclude_dir = ["tmp"]
+poll = true
+poll_interval = 2000

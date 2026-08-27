@@ -1,0 +1,23 @@
+# Local Postgres for development. This service ships NO migrations: the tables
+# it reads live in api-platform's ms_organizations schema and api-platform owns
+# their DDL. Point DATABASE_URL at an api-platform dev database rather than
+# creating a second source of truth for the same tables.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: mirrorstack
+      POSTGRES_PASSWORD: mirrorstack
+      POSTGRES_DB: mirrorstack
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mirrorstack"]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pg_data:
