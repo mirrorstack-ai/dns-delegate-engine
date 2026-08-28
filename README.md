@@ -13,20 +13,49 @@ instead of by trusting a support reply.
 
 ---
 
+## Status, before anything else
+
+This service is **being rebuilt**, and the reason is a defect in what it does
+today rather than a feature we want.
+
+Today it takes a list of DNS records from MirrorStack's private half and
+publishes them, refusing anything outside the anchor. That bounds **where** we
+can write. It does not bound **what** — inside your domain, the private half
+picks the record and its value, and a record's value is not something containment
+can constrain. So a reader of this repository cannot currently answer the
+question it exists to answer.
+
+[`docs/DESIGN.md`](docs/DESIGN.md) is the shape being built: MirrorStack's private
+half sends an intent and a domain and can no longer name a record at all, the
+derivation moves here, and **the record that proves you own the domain becomes
+one you publish rather than one we write.**
+
+Everything below describes what runs **today**. Where this file and the design
+disagree, this file is the truth.
+
+---
+
 ## The short version
 
 | Question | Answer | Where to check |
 |---|---|---|
-| Can it delete a DNS record? | **No.** There is no delete call anywhere in this service. | [`internal/dnsprovider/provider.go`](internal/dnsprovider/provider.go) — the `Provider` interface has four methods and none of them removes anything |
+| Can it delete a DNS record? | **No.** There is no delete call anywhere in this service. | [`internal/dnsprovider/provider.go`](internal/dnsprovider/provider.go) — the `Provider` interface has eight methods, four of which reach the network, and none of them removes anything |
 | Can it touch a name you didn't see? | **No.** Every record must sit at or under the anchor — the exact hostname you proved you own — or the whole plan is refused. | [`internal/dnsplan/plan.go`](internal/dnsplan/plan.go), `NewSnapshot` and `Contains` |
 | Can it touch `www`, your apex, or your MX? | **No**, unless the domain you connected *is* that name. Connecting `shop.example.com` cannot reach `example.com`, `www.example.com`, or your mail records. | [`TestContainmentInACustomerZone`](internal/dnsplan/plan_test.go) asserts exactly this |
 | Can it write an A record or an MX record? | **No.** The plan vocabulary is `CNAME` and `TXT` only. | `NormalizeRecords`, and [`TestNormalizeRecordsRejectsUnsupportedTypes`](internal/dnsplan/plan_test.go) |
-| Can what gets written differ from what you approved? | **No.** A SHA-256 over the exact record set is taken before you authorize and re-checked before anything is written. | `Snapshot.Digest`, `Snapshot.Validate` |
-| How long does the credential live? | A platform-domain grant is held at most **24 hours**. An app-domain grant is **standing**, because every new app you deploy needs a record created for it — you can revoke it at your provider at any time. | See *Grant lifetimes* below |
+| Can it take over a name you're already using? | **No.** If something already answers there and it isn't ours, the publish is refused and names what it found. You delete it yourself and authorize again. | [`ErrNameInUse`](internal/reconcile/reconcile.go) |
+| Can what gets written differ from what you approved? | **Not on the pass you authorized** — a SHA-256 over the record set is taken before you consent and re-checked before anything is written. Later passes publish records that did not exist yet, so there was nothing to approve; those are bounded by the anchor. And the check is **skipped if the caller omits the digest**, so it defends against a bug in the private half, not against the private half. | `Snapshot.Digest`, `Snapshot.Validate` |
+| **Can the private half write a record you did not ask for?** | 🔴 **Yes, today, inside your domain.** Containment bounds a record's name, never its value. This is the defect the rebuild exists to fix. | [`docs/DESIGN.md`](docs/DESIGN.md) |
+| How long does the credential live? | A platform-domain grant is held **24 hours**, and is not cut short when the last record lands. An app-domain grant is **standing**, because every new app you deploy needs a record created for it — you can revoke it at your provider at any time. | See *Grant lifetimes* below |
 
 If you want to check one thing, check `Contains` in
 [`internal/dnsplan/plan.go`](internal/dnsplan/plan.go). It is six lines, and it is
-the boundary.
+the boundary — and then read [`docs/DESIGN.md`](docs/DESIGN.md) for why six lines
+bounding a *name* is not enough, and what replaces it.
+
+For the complete list of what lands in your zone, including the two records that
+are relayed verbatim from AWS and Cloudflare rather than chosen by anyone at
+MirrorStack, see [`docs/RECORDS.md`](docs/RECORDS.md).
 
 ---
 
@@ -130,14 +159,26 @@ dns-delegate-engine/
 │   ├── provider/cloudflare/    the first adapter
 │   ├── grant/                  the RPC surface: authorize, publish, revoke
 │   └── shared/                 the OAuth client, the sealing keyset, the JSON envelope
+├── docs/DESIGN.md              the shape this is being rebuilt into
+├── docs/RECORDS.md             every record we can write, in full
 └── Makefile                    make check — vet, build, race tests, arm64 cross-build
 ```
 
 **There is no database.** This service owns no table, opens no connection, and
-ships no migration. MirrorStack stores every row — including your held grant,
-as ciphertext it holds no key for. This service holds the key and the OAuth
-client, and has nowhere to persist anything. Neither half can act alone, and
-you do not have to reason about a schema to audit what can reach your zone.
+ships no migration. MirrorStack stores every row — including your held grant, as
+ciphertext — and this service holds the key and the OAuth client with nowhere to
+persist anything. You do not have to reason about a schema to audit what can
+reach your zone.
+
+🔴 **One correction to that, because an earlier version of this file overstated
+it.** It said MirrorStack holds the ciphertext "as ciphertext it holds no key
+for". That is a property of the **code** and not yet of the **permissions**: the
+private half's account role still has read access to both the sealing keyset and
+the OAuth client, left behind by the pre-cutover in-process path that this
+service replaced. No code uses it — the delegated path runs entirely here — but a
+granted capability is not the same as an unused one, and this repository is not
+the place to describe a permission as absent because nothing exercises it.
+Removing those grants is the outstanding half of the cutover.
 
 ## Running the checks yourself
 

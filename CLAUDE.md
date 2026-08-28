@@ -18,13 +18,29 @@ holds a customer's DNS-provider grant.
 3. **Never retry an ambiguous write.** Re-read instead. `IsAmbiguous` must fail
    TOWARD ambiguous for any error an adapter does not recognise.
 
+## 🔴 Derivation IS moving here — this reverses an earlier instruction
+
+This file used to say plan derivation must stay in `api-platform`, on the grounds
+that containment bounds the blast radius without it. **That was wrong, and the
+owner overruled it on 2026-08-28.**
+
+Containment bounds a record's NAME. It cannot bound its VALUE, so the private
+half can still choose a routing target or an ACME token inside the customer's own
+domain — and a reader of this repository cannot see what we write, only where.
+A record-list API cannot be fixed with better documentation.
+
+`docs/DESIGN.md` is the target shape. When you touch this repository, build
+toward it: an intent-level API where the caller names a domain and never a
+record, derivation here, and the ownership proof published by the CUSTOMER rather
+than by us.
+
 ## Do not put here
 
-- Plan derivation. Working out *which* records a domain needs is MirrorStack edge
-  topology — sibling roles, ACM lifecycle, the orange/grey decision — and it stays
-  in `api-platform`. The public claim survives that split because containment,
-  not derivation, is what bounds the blast radius. Moving derivation here would
-  move exactly the topology this repository exists to leave behind.
+- The proxy decision, the shard topology, the authorizer header and its transform
+  rule. A customer-zone record is never proxied, so this service ships a one-line
+  rule and refuses to publish into a MirrorStack suffix at all. The 61-line
+  version, and everything it couples to, is genuinely internal and genuinely
+  irrelevant to the question this repository answers.
 - A database. This service is STATELESS by design: it owns no table, opens no
   connection, and ships no migration. api-platform holds every row, including
   sealed grants as ciphertext it has no key for. Adding a database here would
