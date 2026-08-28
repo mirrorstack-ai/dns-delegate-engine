@@ -497,43 +497,127 @@ func TestHTTPHealthzIsUngatedAndReadyzIsNot(t *testing.T) {
 
 // ─── the consent page route ─────────────────────────────────────────────────
 
-func TestConsentPageIsGatedLikeEveryOtherRoute(t *testing.T) {
+// 🔴 THE CONSENT PAGE IS SERVED WITHOUT THE INTERNAL SECRET, AND IT IS THE ONLY
+// ROUTE THAT IS.
+//
+// A page only MirrorStack can read is not a disclosure: no customer's browser
+// holds that header, so the gate guaranteed the one party who must read the page
+// never could. The sealed registration is the gate instead — ciphertext under
+// this deployment's own keyset, unforgeable, and held only by someone the flow
+// handed it to.
+//
+// The pairing is the test. Reachable without the header, and everything else on
+// the transport still refusing without it, is one property; either half alone
+// would pass while the other regressed.
+func TestOnlyTheConsentPageIsServedWithoutTheInternalSecret(t *testing.T) {
 	d, sealer := intentDispatcher(t)
 	h := d.httpHandler("s3cret")
 
-	target := consentURL(registrationFor(t, sealer, lane.OrgAppDomain, "example.net"))
+	page := visit(h, consentURL(registrationFor(t, sealer, lane.OrgAppDomain, "example.net")))
+	if page.Code != http.StatusOK {
+		t.Fatalf("a customer's browser must reach the consent page: want 200, got %d: %s",
+			page.Code, page.Body.String())
+	}
+
+	// 🔴 One deliberate exception, not a relaxation. /readyz reports what this
+	// deployment is configured with, "/" is the catch-all, and a case difference
+	// or a trailing slash must not slip past the mux into the ungated half.
+	for _, target := range []string{"/readyz", "/anything", "/consent/", "/CONSENT"} {
+		if got := visit(h, target).Code; got != http.StatusUnauthorized {
+			t.Errorf("🔴 %q answered without the internal secret: want 401, got %d", target, got)
+		}
+	}
+	// And a method the consent route does not serve falls through to the gate
+	// rather than into it.
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/consent", nil))
 	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("the consent page must be behind the internal secret, got %d", rec.Code)
+		t.Errorf("PUT /consent must not be ungated: want 401, got %d", rec.Code)
 	}
 }
 
-func TestConsentPageRefusalsAreSeparatedByAudience(t *testing.T) {
+// 🔴 EVERY REFUSAL A REQUESTER CAN CAUSE IS ONE ANSWER, BYTE FOR BYTE.
+//
+// The route is unauthenticated, so a refusal that distinguished "this envelope
+// does not open" from "it opens and its lane has no page" would let anyone
+// holding a candidate learn whether it names a registration — a disclosure page
+// turned into a probe of what MirrorStack has been asked to connect. The cause
+// goes to the log instead.
+func TestEveryRequesterRefusalOnTheConsentRouteIsTheSameAnswer(t *testing.T) {
 	d, sealer := intentDispatcher(t)
 	h := d.httpHandler("s3cret")
 
-	if got := gatedGet(h, "/consent").Code; got != http.StatusBadRequest {
-		t.Errorf("a request with no registration is the caller's fault: want 400, got %d", got)
-	}
-	if got := gatedGet(h, consentURL("not-an-envelope")).Code; got != http.StatusBadRequest {
-		t.Errorf("an envelope this deployment cannot open is the caller's fault: want 400, got %d", got)
-	}
-	// 🔴 The closed lanes publish a listable set, so a console can show it and
-	// this page must refuse. Rendering it would tell a customer their
-	// four-record, 24-hour grant is a standing wildcard.
+	registration := registrationFor(t, sealer, lane.OrgAppDomain, "example.net")
+	// The closed lanes publish a listable set a console can show, so this page
+	// refuses them: rendering one would tell a customer their four-record,
+	// 24-hour grant is a standing wildcard.
 	closed := registrationFor(t, sealer, lane.OrgPlatformDomain, "example.com")
-	if got := gatedGet(h, consentURL(closed)).Code; got != http.StatusBadRequest {
-		t.Errorf("org_platform_domain has no consent page: want 400, got %d", got)
+	// A lane-2 envelope from a build without this control. Rendering it would take
+	// an agreement no acknowledgement could ever be verified against.
+	unreferenced := sealRegistration(t, sealer, lane.OrgAppDomain, "example.net", "")
+
+	var answers []string
+	for _, target := range []string{
+		"/consent",                       // absent
+		consentURL(""),                   // empty
+		consentURL("not-an-envelope"),    // malformed
+		consentURL(registration + "aQ="), // a real envelope, tampered with
+		consentURL(closed),               // a registration on a lane with no page
+		consentURL(unreferenced),         // one carrying no sealed reference
+	} {
+		rec := visit(h, target)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%q: want 404, got %d", target, rec.Code)
+		}
+		answers = append(answers, rec.Body.String())
+	}
+	for i, body := range answers {
+		if body != answers[0] {
+			t.Errorf("🔴 refusal %d differs from the first: %q vs %q", i, body, answers[0])
+		}
+	}
+	// It must not echo what it was sent, either: a message quoting the anchor out
+	// of an envelope reports that the envelope opened.
+	if strings.Contains(answers[0], "example.net") || strings.Contains(answers[0], "lane") {
+		t.Errorf("🔴 the refusal describes what was wrong: %q", answers[0])
 	}
 
-	// A deployment that cannot open envelopes at all is OURS, not the caller's.
-	unwired := &dispatcher{intents: &intent.Service{}}
-	if got := gatedGet(unwired.httpHandler("s3cret"), consentURL("anything")).Code; got != http.StatusServiceUnavailable {
-		t.Errorf("a deployment with no keyset is unavailable, not a bad request: got %d", got)
+	// The POST half answers on the same rule, with its own shape.
+	var posts []string
+	for _, target := range []string{"/consent", consentURL("not-an-envelope"), consentURL(closed)} {
+		rec := submit(h, target, url.Values{"challenge": {"mschal1-x"}})
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("POST %q: want 404, got %d", target, rec.Code)
+		}
+		posts = append(posts, rec.Body.String())
 	}
-	if got := gatedGet((&dispatcher{}).httpHandler("s3cret"), consentURL("anything")).Code; got != http.StatusServiceUnavailable {
+	// A challenge that does not redeem against a REAL registration is the same
+	// answer as a registration that does not exist. Otherwise the difference
+	// between them is the oracle.
+	posts = append(posts, submit(h, consentURL(registration),
+		url.Values{"challenge": {"mschal1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}).Body.String())
+	for i, body := range posts {
+		if body != posts[0] {
+			t.Errorf("🔴 POST refusal %d differs from the first: %q vs %q", i, body, posts[0])
+		}
+	}
+}
+
+// A deployment that cannot serve consent pages at all says so, and that is the
+// one split this route may make out loud: it is true of every reference alike,
+// so it reveals nothing about the one that was sent — and answering "no consent
+// page for this reference" would send a customer back to look for a better link
+// that does not exist.
+func TestADeploymentThatCannotServeConsentPagesSaysSo(t *testing.T) {
+	unwired := &dispatcher{intents: &intent.Service{}}
+	if got := visit(unwired.httpHandler("s3cret"), consentURL("anything")).Code; got != http.StatusServiceUnavailable {
+		t.Errorf("a deployment with no keyset is unavailable, not a missing page: got %d", got)
+	}
+	if got := visit((&dispatcher{}).httpHandler("s3cret"), consentURL("anything")).Code; got != http.StatusServiceUnavailable {
 		t.Errorf("no intent surface wired must be 503, got %d", got)
+	}
+	if got := submit((&dispatcher{}).httpHandler("s3cret"), consentURL("anything"), nil).Code; got != http.StatusServiceUnavailable {
+		t.Errorf("the acknowledgement half must answer 503 too, got %d", got)
 	}
 }
 
@@ -541,7 +625,7 @@ func TestConsentPageRendersTheWildcardGrant(t *testing.T) {
 	d, sealer := intentDispatcher(t)
 	h := d.httpHandler("s3cret")
 
-	rec := gatedGet(h, consentURL(registrationFor(t, sealer, lane.OrgAppDomain, "example.net")))
+	rec := visit(h, consentURL(registrationFor(t, sealer, lane.OrgAppDomain, "example.net")))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -562,19 +646,48 @@ func TestConsentPageRendersTheWildcardGrant(t *testing.T) {
 	}
 
 	header := rec.Result().Header
-	// The page loads nothing, and this header is what makes a browser enforce it.
-	if csp := header.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
-		t.Errorf("want a default-src 'none' policy, got %q", csp)
-	}
 	if ct := header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Errorf("want text/html, got %q", ct)
+	}
+	assertConsentHeaders(t, header)
+
+	// 🔴 THE FORM POSTS ONLY TO ITSELF, ENFORCED TWICE. It carries no `action`, so
+	// a browser targets the exact URL it was served from — which is what keeps the
+	// registration on the redemption — and form-action 'self' stops an injected
+	// one reaching another origin. A page a customer can now open directly is one
+	// a rewritten action would exfiltrate an agreement from.
+	form := regexp.MustCompile(`(?i)<form[^>]*>`).FindString(body)
+	if form == "" {
+		t.Fatal("the served page carries no form, so nobody could acknowledge it")
+	}
+	if strings.Contains(strings.ToLower(form), "action") {
+		t.Errorf("🔴 the form names a target of its own: %q", form)
+	}
+}
+
+// assertConsentHeaders pins the set every answer on this route carries, refusals
+// included: the route is unauthenticated now, so a header set only on the
+// successful render leaves the refusals bare.
+func assertConsentHeaders(t *testing.T, header http.Header) {
+	t.Helper()
+	csp := header.Get("Content-Security-Policy")
+	// The page loads nothing and is framed by nobody; these are what make a
+	// browser enforce it.
+	for _, want := range []string{"default-src 'none'", "form-action 'self'", "frame-ancestors 'none'"} {
+		if !strings.Contains(csp, want) {
+			t.Errorf("want %q in the policy, got %q", want, csp)
+		}
 	}
 	if header.Get("X-Content-Type-Options") != "nosniff" {
 		t.Error("want nosniff")
 	}
+	// 🔴 The URL carries the sealed registration; a Referer would carry it onward.
+	if header.Get("Referrer-Policy") != "no-referrer" {
+		t.Errorf("want no-referrer, got %q", header.Get("Referrer-Policy"))
+	}
 	// 🔴 The page names the anchor and every value we would write beneath it.
 	if cc := header.Get("Cache-Control"); cc != "no-store" {
-		t.Errorf("a shared cache holding this page would serve somebody else's zone: got %q", cc)
+		t.Errorf("a shared cache holding this would serve somebody else's zone: got %q", cc)
 	}
 }
 
@@ -595,7 +708,7 @@ func TestConsentPageReferenceIsSealedAndUnchoosable(t *testing.T) {
 	h := d.httpHandler("s3cret")
 	registration := registrationFor(t, sealer, lane.OrgAppDomain, "example.net")
 
-	rec := gatedGet(h, consentURL(registration))
+	rec := visit(h, consentURL(registration))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -606,35 +719,20 @@ func TestConsentPageReferenceIsSealedAndUnchoosable(t *testing.T) {
 	// Stable across renders: it is sealed, not minted per request. A customer who
 	// reloads the screen must not be agreeing to a different reference than the
 	// one Authorize will verify their acknowledgement against.
-	if first, second := gatedGet(h, consentURL(registration)).Body.String(),
-		gatedGet(h, consentURL(registration)).Body.String(); first != second {
+	if first, second := visit(h, consentURL(registration)).Body.String(),
+		visit(h, consentURL(registration)).Body.String(); first != second {
 		t.Error("the sealed reference must not change between renders")
 	}
 
 	// 🔴 And a reference on the URL must not be honoured. This is the exact
 	// regression: `?nonce=` used to select it.
 	chosen := "00112233445566778899aabbccddeeff"
-	body := gatedGet(h, consentURL(registration)+"&nonce="+chosen).Body.String()
+	body := visit(h, consentURL(registration)+"&nonce="+chosen).Body.String()
 	if strings.Contains(body, chosen) {
 		t.Error("🔴 the route honoured a requester-chosen reference: one acknowledgement would replay forever")
 	}
 	if !strings.Contains(body, testConsentReference) {
 		t.Error("the sealed reference must survive a nonce on the query string")
-	}
-}
-
-// 🔴 A LANE-2 REGISTRATION WITH NO SEALED REFERENCE IS REFUSED, NOT RENDERED.
-//
-// Such an envelope was minted by a build without this control. Rendering it
-// would show a customer the disclosure, take their agreement, and then refuse
-// the acknowledgement at Authorize with nothing anywhere saying why.
-func TestConsentPageRefusesARegistrationWithNoSealedReference(t *testing.T) {
-	d, sealer := intentDispatcher(t)
-	h := d.httpHandler("s3cret")
-
-	unreferenced := sealRegistration(t, sealer, lane.OrgAppDomain, "example.net", "")
-	if got := gatedGet(h, consentURL(unreferenced)).Code; got != http.StatusBadRequest {
-		t.Errorf("a registration carrying no consent reference must be refused: want 400, got %d", got)
 	}
 }
 
@@ -700,11 +798,11 @@ func consentURL(registration string) string {
 	return "/consent?" + url.Values{"registration": {registration}}.Encode()
 }
 
-func gatedGet(h http.Handler, target string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodGet, target, nil)
-	req.Header.Set("X-MS-Internal-Secret", "s3cret")
+// visit and submit send NO internal secret: what a customer's browser sends, and
+// the only shape of request this route is designed to answer.
+func visit(h http.Handler, target string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
 	return rec
 }
 
@@ -844,7 +942,7 @@ func TestOnlyTheChallengeOffTheServedPageMintsAnAcknowledgement(t *testing.T) {
 	h := d.httpHandler("s3cret")
 	registration := registrationFor(t, sealer, lane.OrgAppDomain, "example.net")
 
-	page := gatedGet(h, consentURL(registration))
+	page := visit(h, consentURL(registration))
 	if page.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", page.Code, page.Body.String())
 	}
@@ -857,12 +955,12 @@ func TestOnlyTheChallengeOffTheServedPageMintsAnAcknowledgement(t *testing.T) {
 		{"challenge": {""}},
 		{"challenge": {"mschal1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
 	} {
-		if got := gatedPost(h, consentURL(registration), form).Code; got != http.StatusBadRequest {
-			t.Errorf("the form %v must not acknowledge: want 400, got %d", form, got)
+		if got := submit(h, consentURL(registration), form).Code; got != http.StatusNotFound {
+			t.Errorf("the form %v must not acknowledge: want 404, got %d", form, got)
 		}
 	}
 
-	rec := gatedPost(h, consentURL(registration), url.Values{"challenge": {challenge}})
+	rec := submit(h, consentURL(registration), url.Values{"challenge": {challenge}})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -878,26 +976,9 @@ func TestOnlyTheChallengeOffTheServedPageMintsAnAcknowledgement(t *testing.T) {
 	if !answer.OK || !consent.Verify(sealer, testConsentReference, "example.net", answer.Response.ConsentToken) {
 		t.Fatalf("the acknowledgement must be the one IntentAuthorize checks: %q", answer.Response.ConsentToken)
 	}
-	// 🔴 It is credential-shaped, and a shared cache holding it would hand
-	// somebody else's agreement to the next request.
-	if cc := rec.Result().Header.Get("Cache-Control"); cc != "no-store" {
-		t.Errorf("want no-store on the acknowledgement, got %q", cc)
-	}
-}
-
-func TestAcknowledgingIsGatedLikeEveryOtherRoute(t *testing.T) {
-	d, sealer := intentDispatcher(t)
-	h := d.httpHandler("s3cret")
-	target := consentURL(registrationFor(t, sealer, lane.OrgAppDomain, "example.net"))
-
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, target, strings.NewReader("challenge=x")))
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("acknowledging must be behind the internal secret, got %d", rec.Code)
-	}
-	if got := gatedPost(h, "/consent", url.Values{"challenge": {"x"}}).Code; got != http.StatusBadRequest {
-		t.Errorf("a POST with no registration is the caller's fault: want 400, got %d", got)
-	}
+	// 🔴 The acknowledgement is credential-shaped: a shared cache holding it would
+	// hand somebody else's agreement to the next request.
+	assertConsentHeaders(t, rec.Result().Header)
 }
 
 // 🔴 NEITHER HALF OF THE CONSENT FLOW IS A WIRE ACTION, AND NEITHER MAY BECOME
@@ -953,18 +1034,25 @@ func TestTheGatewayServesTheConsentPathAndProbesEverythingElse(t *testing.T) {
 	if probe["statusCode"] != http.StatusOK || probe["body"] != `{"ok":true}` {
 		t.Fatalf("the health probe must keep its static answer, got %#v", probe)
 	}
-	// And the gate rides along: a gateway route is not a way around it.
-	unsecreted := &dispatcher{intents: d.intents, web: d.httpHandler("s3cret")}
-	got := unsecretedGatewayCall(t, unsecreted, "/dns-delegate/consent",
+	// 🔴 And on the transport a real customer arrives over, the page is reachable
+	// with no internal secret at all — the whole point of removing the gate. The
+	// rest of the transport is unaffected: /readyz is behind d.web's gate, and
+	// every other path is the static probe above.
+	got := unsecretedGatewayCall(t, d, "/dns-delegate/consent",
 		url.Values{"registration": {registration}}.Encode())
-	if got["statusCode"] != http.StatusUnauthorized {
-		t.Fatalf("the internal secret must gate the gateway route too, got %#v", got)
+	if got["statusCode"] != http.StatusOK {
+		t.Fatalf("a customer's browser must reach the consent page through the gateway, got %#v", got)
+	}
+	if ready := unsecretedGatewayCall(t, d, "/dns-delegate/readyz", ""); ready["statusCode"] != http.StatusOK {
+		// /readyz does not suffix-match the consent path, so it never reaches
+		// d.web: it is the static probe. Named here so the day it is routed, this
+		// test says what must be re-checked.
+		t.Fatalf("every other gateway path keeps the static probe, got %#v", ready)
 	}
 }
 
-func gatedPost(h http.Handler, target string, form url.Values) *httptest.ResponseRecorder {
+func submit(h http.Handler, target string, form url.Values) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(form.Encode()))
-	req.Header.Set("X-MS-Internal-Secret", "s3cret")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)

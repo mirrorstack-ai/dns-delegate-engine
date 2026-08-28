@@ -6,9 +6,11 @@
 //     {ok, response | error} envelope out. IAM gates the invoke; this service is
 //     NOT exposed through API Gateway, and api-platform reaches it by
 //     alias-qualified ARN.
-//   - HTTP (local dev): a mux on DNS_DELEGATE_API_PORT (default 8093), gated by
-//     X-MS-Internal-Secret on every route except /healthz, fail-closed (empty
-//     secret → 503).
+//   - HTTP (local dev and, through API Gateway, production): a mux on
+//     DNS_DELEGATE_API_PORT (default 8093), gated by X-MS-Internal-Secret on
+//     every route except /healthz and /consent, fail-closed (empty secret →
+//     503). /consent is gated on the sealed reference instead — see
+//     serveConsent for why that is the whole gate it can have.
 //
 // # Two surfaces, one binary, and the older one is on its way out
 //
@@ -47,7 +49,6 @@ import (
 
 	"github.com/aws/aws-lambda-go/lambda"
 
-	"github.com/mirrorstack-ai/dns-delegate-engine/internal/consent"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/derive"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/grant"
@@ -670,8 +671,9 @@ func (d *dispatcher) serveGateway(ctx context.Context, req gatewayRequest) map[s
 	for name, value := range req.Headers {
 		r.Header.Set(name, value)
 	}
-	// The internal-secret gate rides along: it is inside d.web, so a gateway
-	// route to this function is not a way around it.
+	// One handler, so the gate is whatever d.web says it is: the internal secret
+	// on every route it covers, and the sealed reference on /consent. A gateway
+	// route to this function is not a way around either.
 	rec := &capture{header: http.Header{}, status: http.StatusOK}
 	d.web.ServeHTTP(rec, r)
 	return gatewayResponse(rec.status, rec.header, rec.body.String())
@@ -711,6 +713,13 @@ func (d *dispatcher) httpHandler(secret string) http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		httputil.WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	})
+	// 🔴 THE CONSENT PAGE IS THE ONE ROUTE OUTSIDE THE GATE, AND IT IS AN
+	// EXCEPTION RATHER THAN A RELAXATION. Everything else on this transport —
+	// /readyz below and every path that does not match — stays behind
+	// X-MS-Internal-Secret. serveConsent carries the argument.
+	mux.HandleFunc("GET "+consentPath, d.serveConsent)
+	mux.HandleFunc("POST "+consentPath, d.acknowledgeConsent)
+
 	gated := http.NewServeMux()
 	gated.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		health := d.health(r.Context())
@@ -720,8 +729,6 @@ func (d *dispatcher) httpHandler(secret string) http.Handler {
 		}
 		httputil.WriteJSON(w, status, health)
 	})
-	gated.HandleFunc("GET "+consentPath, d.serveConsent)
-	gated.HandleFunc("POST "+consentPath, d.acknowledgeConsent)
 	mux.Handle("/", auth.InternalSecret(secret)(gated))
 	return mux
 }
@@ -729,6 +736,26 @@ func (d *dispatcher) httpHandler(secret string) http.Handler {
 // serveConsent renders the wildcard lane's consent page: the disclosure, plus
 // the one form that can acknowledge it, carrying a challenge over the
 // disclosure's bytes.
+//
+// 🔴 THE SEALED REGISTRATION IS THE WHOLE GATE, AND THE INTERNAL SECRET WAS
+// REMOVED FROM THIS ROUTE ON PURPOSE. A page only MirrorStack can read is not a
+// disclosure: the one party who has to read it is the customer, and no
+// customer's browser holds that header.
+//
+// What the page discloses is the derived plan for one registration, and the only
+// way to name that registration is the envelope this deployment sealed — AEAD
+// ciphertext under its own keyset, carrying a 128-bit reference (sealed.NewNonce)
+// — which cannot be guessed and cannot be forged, so holding it means having been
+// handed it by the flow. The secret protected nothing that does not, while
+// guaranteeing the reader the page exists for could never arrive.
+//
+// It costs nothing the acknowledgement had either: the control was always over
+// SEQUENCE and CONTENT, never over presence (internal/consent's package comment,
+// docs/DESIGN.md §4), and the private half proxying the page was never excluded.
+// This is the SAME control, finally reachable by the person it is for.
+//
+// 🔴 IT IS THE ONLY EXCEPTION. Every other route on this transport keeps the
+// gate; see httpHandler.
 //
 // 🔴 IT RENDERS; IT DOES NOT ACKNOWLEDGE. No consent.Token is minted here, and
 // the challenge it prints is not one — internal/consent namespaces the two values
@@ -740,10 +767,6 @@ func (d *dispatcher) httpHandler(secret string) http.Handler {
 // comment states what this separation does and does not prove — and it does NOT
 // prove a human was present.
 //
-// The internal-secret gate stays on both halves: in production a deployment's own
-// gateway route reaches this (serveGateway) and the private half proxies the
-// page, so the header is the proxy's to send and not the browser's.
-//
 // 🔴 THE PAGE'S REFERENCE IS NOT A QUERY PARAMETER AND MUST NOT BECOME ONE. The
 // only input is the sealed registration; the reference an acknowledgement would
 // be MACed over comes out of that envelope. A reference supplied on the URL is
@@ -753,45 +776,22 @@ func (d *dispatcher) httpHandler(secret string) http.Handler {
 // docs/DESIGN.md §5 and internal/sealed's Registration.ConsentNonce carry the
 // reasoning in full.
 func (d *dispatcher) serveConsent(w http.ResponseWriter, r *http.Request) {
+	consentHeaders(w)
 	if d.intents == nil {
-		http.Error(w, "the intent surface is not wired in this build", http.StatusServiceUnavailable)
+		http.Error(w, "this deployment cannot serve consent pages", http.StatusServiceUnavailable)
 		return
 	}
-	registration := r.URL.Query().Get("registration")
-	if registration == "" {
-		http.Error(w, "?registration= is required: the sealed envelope AddOrgAppDomain returned",
-			http.StatusBadRequest)
-		return
-	}
-	page, err := d.intents.ConsentPage(r.Context(), registration)
+	page, err := d.intents.ConsentPage(r.Context(), r.URL.Query().Get("registration"))
 	if err != nil {
-		// Safe to echo, checked rather than assumed: ConsentPage opens an
-		// envelope, computes a proof and derives a plan, reaching no DNS provider
-		// on any path — so no refusal here carries a provider response body,
-		// which httputil.Error warns can quote zone contents. http.Error writes
-		// text/plain with nosniff, so a message quoting a caller-supplied domain
-		// cannot be sniffed as markup.
-		status, _ := consentRefusal(err)
-		http.Error(w, err.Error(), status)
+		if consentIsOurs(err) {
+			http.Error(w, "this deployment cannot serve consent pages", http.StatusServiceUnavailable)
+			return
+		}
+		logConsentRefusal("page", err)
+		http.Error(w, noConsentPage, http.StatusNotFound)
 		return
 	}
-
-	// The page loads nothing: no script, no external stylesheet, no font, no
-	// image — one inline <style>. internal/consent asserts that in a test; this
-	// header makes a BROWSER enforce it, so an edit adding a remote asset breaks
-	// visibly here instead of quietly widening what a customer's consent screen
-	// depends on. Whatever proxies the page in production sends its own.
-	//
-	// form-action is 'self' rather than 'none': the page carries the one form that
-	// acknowledges it, posting back to the URL it was served from.
-	w.Header().Set("Content-Security-Policy",
-		"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	// 🔴 The page names the anchor and every value we would write beneath it. A
-	// shared cache holding it would serve the next request somebody else's zone.
-	w.Header().Set("Cache-Control", "no-store")
 	if _, err := io.WriteString(w, page); err != nil {
 		slog.Error("dns-delegate-api: write consent page", "error", err)
 	}
@@ -807,56 +807,100 @@ func (d *dispatcher) serveConsent(w http.ResponseWriter, r *http.Request) {
 // registration here would be the `ConsentAck` action this design exists to not
 // have.
 //
-// The answer is JSON rather than a page: it is read by whatever proxies the form
-// to the customer — the private half in production — which stores the token and
-// sends it to IntentAuthorize. The screen a person reads is the GET.
+// The answer is JSON rather than a page: it is read by whatever posted the form.
+// In the production flow that is the private half proxying it, which stores the
+// token and sends it to IntentAuthorize; a customer who opened the page directly
+// gets the token itself, which grants nothing until it reaches that call. The
+// screen a person reads is the GET.
 func (d *dispatcher) acknowledgeConsent(w http.ResponseWriter, r *http.Request) {
+	consentHeaders(w)
 	if d.intents == nil {
 		httputil.WriteError(w, http.StatusServiceUnavailable, "unavailable",
-			"the intent surface is not wired in this build")
-		return
-	}
-	registration := r.URL.Query().Get("registration")
-	if registration == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid_request",
-			"?registration= is required: the sealed envelope AddOrgAppDomain returned")
+			"this deployment cannot serve consent pages")
 		return
 	}
 	// A form this service rendered is a few hundred bytes; the bound is here so a
 	// redemption cannot be turned into an allocation before anything is checked.
+	// It is the second of the two this route has — internal/sealed bounds the
+	// envelope at 4096 before attempting to open it — and between them they are
+	// the only rate-shaping a service with no database can do. Request-rate limits
+	// belong to whatever fronts this deployment.
 	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	if err := r.ParseForm(); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid_request", "malformed form body")
+		logConsentRefusal("acknowledgement", err)
+		httputil.WriteError(w, http.StatusNotFound, codeNoConsentPage, noConsentPage)
 		return
 	}
-	token, err := d.intents.AcknowledgeConsent(r.Context(), registration, r.PostForm.Get("challenge"))
+	token, err := d.intents.AcknowledgeConsent(
+		r.Context(), r.URL.Query().Get("registration"), r.PostForm.Get("challenge"))
 	if err != nil {
-		status, code := consentRefusal(err)
-		httputil.WriteError(w, status, code, err.Error())
+		if consentIsOurs(err) {
+			httputil.WriteError(w, http.StatusServiceUnavailable, "unavailable",
+				"this deployment cannot serve consent pages")
+			return
+		}
+		logConsentRefusal("acknowledgement", err)
+		httputil.WriteError(w, http.StatusNotFound, codeNoConsentPage, noConsentPage)
 		return
 	}
-	// 🔴 The acknowledgement is a credential-shaped value. A shared cache holding
-	// it would hand somebody else's agreement to the next request.
-	w.Header().Set("Cache-Control", "no-store")
 	httputil.WriteJSON(w, http.StatusOK, struct {
 		ConsentToken string `json:"consentToken"`
 	}{token})
 }
 
-// consentRefusal splits a refusal on this route by AUDIENCE, as errorCode does
-// for the RPC surface: a deployment that cannot open envelopes is ours, an
-// envelope or a challenge that does not check out is the requester's. It is not
-// errorCode, because these two are different contracts — errorCode's codes are
-// what api-platform branches on for a lifecycle call, and a page route answering
-// into that vocabulary would tie them together.
-func consentRefusal(err error) (int, string) {
-	switch {
-	case errors.Is(err, intent.ErrUnavailable):
-		return http.StatusServiceUnavailable, "unavailable"
-	case errors.Is(err, intent.ErrInvalidRequest), errors.Is(err, consent.ErrConsent):
-		return http.StatusBadRequest, "invalid_request"
-	}
-	return http.StatusInternalServerError, "internal"
+// noConsentPage and codeNoConsentPage are the ONE answer this route gives to
+// every refusal that is not the deployment's own fault: no reference, a
+// malformed one, one this deployment did not mint, one whose lane has no page,
+// one carrying no sealed reference, and a challenge that does not redeem.
+//
+// 🔴 THEY MUST STAY ONE ANSWER, BECAUSE THE ROUTE IS NO LONGER GATED. A refusal
+// that said which of those it was would let anyone holding a candidate learn
+// whether it names a registration, turning a disclosure page into a probe of
+// what MirrorStack has been asked to connect. The specific cause goes to the
+// log, where an operator reads it and a requester does not.
+const (
+	noConsentPage     = "no consent page for this reference"
+	codeNoConsentPage = "no_consent_page"
+)
+
+// consentIsOurs reports whether a refusal is the DEPLOYMENT's fault rather than
+// the requester's — no keyset, an unreadable routing configuration — which is the
+// one split this route may make out loud, because it is true of every reference
+// alike and so reveals nothing about the one that was sent. intent.ErrUnavailable
+// already carries derive.ErrConfig (intent.deriveError), so this is one test and
+// not two.
+func consentIsOurs(err error) bool { return errors.Is(err, intent.ErrUnavailable) }
+
+// logConsentRefusal keeps the cause an operator needs on the side a requester
+// cannot read. Info rather than Error: a stale link is normal traffic here.
+func logConsentRefusal(half string, err error) {
+	slog.Info("dns-delegate-api: consent refused", "half", half, "error", err)
+}
+
+// consentHeaders are set on EVERY answer this route gives, refusals included,
+// which is why they are here and not beside the successful write.
+//
+// The URL carries the sealed registration and the page names an anchor with every
+// value we would write beneath it: no-store keeps a shared cache from handing one
+// customer's zone to the next request, and no-referrer keeps the envelope out of
+// any Referer.
+//
+// The CSP makes a BROWSER enforce what the page already is. It loads nothing —
+// no script, external stylesheet, font or image, one inline <style>, which
+// internal/consent asserts in a test — so an edit adding a remote asset breaks
+// visibly here rather than quietly widening what a consent screen depends on.
+// form-action is 'self' rather than 'none' because the page carries the one form
+// that acknowledges it, posting back to the URL it was served from.
+// frame-ancestors is the header this route gained when the gate came off: a
+// disclosure a customer's browser can now reach is one that can now be framed
+// under a decoy button, and the agreement is a click on a form.
+func consentHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Security-Policy",
+		"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "+
+			"frame-ancestors 'none'; base-uri 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Cache-Control", "no-store")
 }
 
 // errorCode maps an engine error onto the caller's contract.

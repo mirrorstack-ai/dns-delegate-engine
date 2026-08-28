@@ -76,7 +76,10 @@ as a Lambda function error — at the caller a function error is indistinguishab
 from the engine being unreachable, and the grant lifecycle treats those
 differently: one is a retry, the other can release a live customer credential.
 
-Local: HTTP on `:8093`, gated by `X-MS-Internal-Secret` (fail-closed on empty).
+Local: HTTP on `:8093`, gated by `X-MS-Internal-Secret` (fail-closed on empty)
+— except `/healthz` and `/consent`. The consent page is gated on the sealed
+reference alone, on BOTH transports, because a page only MirrorStack can read
+is not a disclosure. It is the one exception; do not add a second.
 
 ## CI
 

@@ -79,6 +79,18 @@ Five more things this file would rather you heard from us than found yourself:
   content, not presence**, and [`docs/DESIGN.md`](docs/DESIGN.md) §4 says so in
   the same words. Nothing this repository can build closes it — a Lambda gated by
   IAM cannot authenticate a browser its own caller is standing in front of.
+- **The page is now yours to open, and that changed nothing else.** `/consent` is
+  served without the internal secret — the only route that is — because a page
+  only MirrorStack can read is not a disclosure. It is gated on the sealed
+  registration alone — ciphertext under this deployment's own keyset, carrying a
+  128-bit reference, which you hold because the flow handed it to you and which
+  nobody can guess or forge. Read as a control, this is **exactly what it was
+  before**;
+  what is new is that the person it was written for can reach it, and can compare
+  the words with the code in this repository rather than with a console's account
+  of them. An absent, malformed, unknown or wrong-lane reference all answer the
+  same `404`, so the page is not a way to ask what MirrorStack has been asked to
+  connect.
 - **And no deployment serves that page yet.** The route exists on both
   transports; what is missing is infrastructure — a gateway route to this
   function's `/consent` path, and the edge check on whatever proxies it. Until
@@ -215,7 +227,7 @@ service at all. Read the one you are doing.
 | routing records | one per sibling host, ×4 | **one wildcard**, `*.example.net` | one, for that hostname |
 | AWS certificate records | `account` `api` `apps` — not `cdn` | **none** | **none** |
 | the credential | held **24 hours** | **standing** | held **24 hours** |
-| consent page | not required | **required**, and 🔴 not yet routed in any deployment | not required |
+| consent page | not required | **required** — customer-reachable, and 🔴 not yet routed in any deployment | not required |
 
 The lane 1 and lane 2 diagrams below are the **legacy record-list flow** — what
 production calls today, defect included. Under each one is what the intent
@@ -305,13 +317,14 @@ reason this lane's credential behaves differently.
 > 🔴 **On the intent surface this lane is authorized by acknowledging a page
 > this service served, and no deployment serves that page yet.** `GET /consent`
 > renders the disclosure with a challenge over its bytes; posting the challenge
-> back mints the acknowledgement `IntentAuthorize` requires. Neither half is an
-> RPC action, so MirrorStack's private half cannot do both from the surface it
-> calls — but it *can* fetch the page, which is why the honest claim is about
-> sequence and content and not about a person having read it
-> ([`docs/DESIGN.md`](docs/DESIGN.md) §4). Until a deployment routes that path,
-> `IntentAuthorize` answers `consent_required` for `org_app_domain` and the
-> legacy path below is what runs.
+> back mints the acknowledgement `IntentAuthorize` requires. The route is served
+> without the internal secret, gated on the sealed registration alone, so it is a
+> page your own browser can open. Neither half is an RPC action, so MirrorStack's
+> private half cannot do both from the surface it calls — but it *can* fetch the
+> page, which is why the honest claim is about sequence and content and not about
+> a person having read it ([`docs/DESIGN.md`](docs/DESIGN.md) §4). Until a
+> deployment routes that path, `IntentAuthorize` answers `consent_required` for
+> `org_app_domain` and the legacy path below is what runs.
 
 ```mermaid
 sequenceDiagram

@@ -36,6 +36,15 @@
 // that same caller. The control is over SEQUENCE and CONTENT, not over presence;
 // docs/DESIGN.md §4 says so in the same words rather than in weaker ones.
 //
+// 🔴 THE PAGE IS CUSTOMER-REACHABLE, AND THAT DID NOT MAKE THIS CONTROL
+// STRONGER. cmd/dns-delegate-api serves /consent outside the internal secret,
+// gated on the sealed reference alone — because a page only MirrorStack can read
+// discloses nothing to the one party it is written for. It is the SAME control,
+// finally reachable by that party: presence was never proven and still is not,
+// and the private half proxying the page was never excluded and still is not.
+// What changed is that a customer can now fetch the disclosure from the service
+// that will do the writing, instead of reading a console's account of it.
+//
 // Nothing here talks to a DNS provider, a resolver, a database or the network,
 // and nothing reads a clock. Page is a pure function of a plan and a nonce; the
 // other five are pure functions of those plus this deployment's keyset.

@@ -90,11 +90,20 @@ func Redeem(s *grantcrypto.Sealer, nonce, anchor, page, candidate string) (strin
 			match = true
 		}
 	}
+	// 🔴 THE ACKNOWLEDGEMENT IS MINTED BEFORE THE COMPARISON IS ACTED ON, so a
+	// refused redemption costs what an accepted one costs. Minting after the check
+	// would make a success one HMAC dearer than a failure, and the route this runs
+	// behind is unauthenticated: a timing difference there answers "was that the
+	// challenge off the page" to anyone who asks.
+	token, err := Token(s, nonce, anchor)
+	if err != nil {
+		return "", err
+	}
 	if !match {
 		return "", fmt.Errorf(
 			"%w: this challenge was not printed on a page this service served for this registration", ErrConsent)
 	}
-	return Token(s, nonce, anchor)
+	return token, nil
 }
 
 // challengeMessage is the exact byte string every challenge is a MAC over.

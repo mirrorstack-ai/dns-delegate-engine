@@ -306,11 +306,37 @@ the anchor, and the SHA-256 of the disclosure that was rendered. `POST` the
 challenge back to the same URL and this service mints the acknowledgement
 `authorize` requires.
 
+**That route is served without the internal secret, and it is the only one that
+is.** A page only MirrorStack can read is not a disclosure — no customer's
+browser sends `X-MS-Internal-Secret`, so the gate guaranteed the one party who
+has to read the page never could. What the page discloses is the derived plan for
+one registration, and the only way to name that registration is **the envelope
+this service sealed** — ciphertext under its own keyset, carrying a 128-bit
+reference — which can be neither guessed nor forged. Holding it already means
+having been handed it by the flow, so the secret protected nothing it does not.
+Every other route on the transport keeps the gate.
+
+That envelope is therefore the whole gate, and the route is shaped for that: an
+absent, malformed, unknown, wrong-lane or unreferenced registration all get one
+identical `404` so the page cannot be used to probe what MirrorStack has been
+asked to connect (the cause goes to the log); a refused redemption mints the
+acknowledgement before it acts on the comparison, so it costs what an accepted
+one costs; the answers carry `no-store`, `no-referrer`, and a policy that lets
+the page load nothing, post only to itself and be framed by nobody. There is no
+request-rate limit and cannot be one — this service owns no database (§7) — only
+the two size bounds, 4096 bytes of envelope and 8 KB of form.
+
 **Neither half is an RPC action, and neither may become one.** This Lambda is
 IAM-gated, so its only callers are MirrorStack's own services; "serve the page"
 and "acknowledge it" as two actions would let the private half call both, and the
 control would evaporate into a flag it sets for itself. Both live on the page's
 own HTTP route instead, which a deployment reaches through API Gateway.
+
+🔴 **Removing that gate did not make this control stronger.** It is the same
+control, finally reachable by the person it exists for. Presence was never proven
+and still is not; the private half proxying the page was never excluded and still
+is not. What changed is that you can now fetch the disclosure from the service
+that will do the writing, rather than reading a console's account of it.
 
 🔴 **What this proves, and what it does not.** An acknowledgement exists only
 because this deployment served *this* registration's page showing *these exact
@@ -329,9 +355,9 @@ this code will act on, and they were served by the code that will do the writing
 — not as *a person definitely read them*.
 
 The remaining deployment step is infrastructure, not code: a route to this
-function's `/consent` path, and the internal secret on whatever proxies it. Until
-one exists, the page is served in local development only and `IntentAuthorize`
-answers `consent_required` for `org_app_domain`.
+function's `/consent` path. Until one exists, the page is served in local
+development only and `IntentAuthorize` answers `consent_required` for
+`org_app_domain`.
 
 ### `complete(state, code, codeVerifier, expectDigest)`
 
