@@ -90,6 +90,28 @@ The check is redundant defence-in-depth with a better error message. Nothing to
 close. It is listed because a survivor with no explanation beside it reads as an
 open hole, and this one is not.
 
+## What fuzzing found that mutation did not
+
+The two methods are complementary and it showed. Mutation testing asks *"is this
+invariant guarded?"*; fuzzing asks *"is this invariant true?"* — and the second
+question had four answers nobody expected. All four are fixed in the parent
+branch, and the targets that found them are in this one:
+
+| found by | defect |
+|---|---|
+| `FuzzDigestIsStableAndBinding` | 🔴 **the digest did not bind record bytes.** `json.Marshal` silently folds invalid UTF-8 to U+FFFD, so `"token-\xff"` and `"token-\xfe"` produced one SHA-256 |
+| `FuzzContainsNeverEscapesTheAnchor`, plus three targets in `observe` and `relay` | `NormalizeName` was not idempotent — the root-dot trim uncovered a space the space-trim had already run past, so a plan accepted at authorize time was refused at publish time |
+| `FuzzNewSnapshotRefusesEveryEscape` | `MaxRecordIdentity` was enforced on read and not on write — the same accept-then-refuse stranding, reachable with plain ASCII |
+| `FuzzEveryDerivedPlanIsSafe` (as an observation, not a failure) | a reserved suffix written with a **leading dot** passed the malformed-list guard and then matched nothing |
+
+Note what mutation testing could not have caught here. Every one of these is a
+case where the code does what its tests ask **and the invariant is still false**
+— there was no line to break, because the missing check was never written. A
+mutation pass over the same code returns a clean sheet.
+
+The reverse also held: fuzzing would never have found the decorative test in
+finding 1, because the property it failed to guard was true the whole time.
+
 ## Finding 3 · what mutation testing cannot tell you
 
 Mutation 12 replaces the constant-time comparison with `==`. Every test passes,
