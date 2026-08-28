@@ -100,24 +100,26 @@ MirrorStack, see [`docs/RECORDS.md`](docs/RECORDS.md).
 
 ---
 
-## Two lanes, and they are not the same
+## Three lanes, and they are not the same
 
-They write different records, wait on different things, and — the part worth your
-attention — hold the credential for very different lengths of time. Read the one
-you are doing.
+They write different records, wait on different things, and hold the credential
+for very different lengths of time. One of them does not come through this
+service at all. Read the one you are doing.
 
-| | platform domain | app domain |
-|---|---|---|
-| you connect | `example.com`, for your console | `example.app`, a parent for your apps |
-| routing records | one per sibling host — `account.` `api.` `apps.` `cdn.` | **one wildcard**, `*.example.app` |
-| certificate records | per host, from AWS **and** Cloudflare | per app, from Cloudflare |
-| the credential | held **24 hours**, then revoked | **standing** — see lane 2 |
+| | 1 · org platform domain | 2 · org app domain | 3 · each app domain |
+|---|---|---|---|
+| example | `example.com` | `example.net` | `example.org` |
+| what it is | your console, on your own hostname | a parent under which every app is **auto-routed** at `<app-slug>.example.net` | one arbitrary domain bound to **one app** |
+| who owns it | the org | the org | the app — **including a personal app, with no org** |
+| routing records | one per sibling host, ×4 | **one wildcard**, `*.example.net` | one, for that hostname |
+| AWS certificate records | `account` `api` `apps` — not `cdn` | **none** | **none** |
+| the credential | held **24 hours** | **standing** | **standing**, for renewals |
 
-Both diagrams below are today's flow, defect included.
+The diagrams below are today's flow, defect included.
 
 ---
 
-## What happens: a custom platform domain
+## Lane 1 · an org platform domain
 
 Your MirrorStack console, on a hostname you own. The record set is known up front
 and finite, so the credential is held only long enough for the two certificate
@@ -174,7 +176,7 @@ Three things this diagram makes obvious, and which the rebuild changes:
 
 ---
 
-## What happens: a custom app domain
+## Lane 2 · an org app domain
 
 One parent, and every app you deploy gets a hostname under it. The record set is
 **not** known up front, because the apps do not exist yet — which is the whole
@@ -189,13 +191,13 @@ sequenceDiagram
     participant CF as Your DNS provider
     participant Edge as MirrorStack edge
 
-    You->>Console: connect example.app as an app domain
+    You->>Console: connect example.net as an app domain
     Console->>Console: derive the record list
     Console-->>You: here are the records, and their SHA-256
 
     You->>CF: authorize (zone.read, dns.write — one zone)
     CF-->>Engine: authorization code
-    Engine->>CF: *.example.app + _mirrorstack-challenge.example.app
+    Engine->>CF: *.example.net + _mirrorstack-challenge.example.net
     Engine-->>Console: sealed credential, STANDING
 
     loop every app you deploy, from now on
@@ -204,7 +206,7 @@ sequenceDiagram
         Edge-->>Console: DV challenge + ownership proof
         Console->>Console: re-derive the record list
         Console->>Engine: publish what is new
-        Engine->>CF: _acme-challenge.blog.example.app,<br/>_cf-custom-hostname.blog.example.app
+        Engine->>CF: _acme-challenge.blog.example.net,<br/>_cf-custom-hostname.blog.example.net
         Note over Engine: the credential's expiry slides forward
     end
 
@@ -214,8 +216,8 @@ sequenceDiagram
 Two differences from the platform lane that matter:
 
 - **One wildcard is all the routing you ever publish — but it is not all the
-  DNS.** `*.example.app` matches exactly one label, so it covers
-  `blog.example.app` and never `_acme-challenge.blog.example.app`. Each app still
+  DNS.** `*.example.net` matches exactly one label, so it covers
+  `blog.example.net` and never `_acme-challenge.blog.example.net`. Each app still
   owes a certificate record of its own. A wildcard *custom hostname*, which would
   remove that, is an Enterprise-only feature on the account this runs against. It
   is a real requirement, not a shortcut we took.
@@ -231,8 +233,73 @@ delegated; the refusal to take over any name already in use inside it; and your
 provider's own revocation, which works whether or not we are involved and takes
 effect immediately.
 
-[`docs/DESIGN.md`](docs/DESIGN.md) has both diagrams for the shape being built,
-where the loop, the derivation and the proof all move.
+[`docs/DESIGN.md`](docs/DESIGN.md) describes the shape being built, where the
+loop, the derivation and the proof all move — and explains each function of the
+intent-based API that replaces the record list.
+
+---
+
+## Lane 3 · a domain on a single app
+
+An app attaches an arbitrary domain of its own — `example.org`, on one app, not
+under any org parent. **It works for a personal app too**, one owned by a person
+with no organization anywhere in the picture, which is why this lane takes an app
+rather than an organization.
+
+It is authorized exactly like the other two: a Cloudflare grant, scoped by your
+provider to one zone, held by this service. There is no separate mechanism and no
+pasted API token.
+
+This is also the tightest of the three anchors. The anchor **is** the hostname,
+so nothing is derived beneath it and nothing beside it is reachable — connecting
+`example.org` to an app cannot touch `www.example.org` or anything else in that
+zone.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant App as MirrorStack app settings
+    participant Engine as dns-delegate-engine<br/>(this repository)
+    participant CF as Your DNS provider
+    participant Edge as MirrorStack edge
+
+    App->>Engine: app_add_custom_domain(app, example.org)
+    Engine-->>App: proof TXT + the full record list + digest
+    App-->>You: publish this one TXT yourself
+
+    You->>CF: _mirrorstack-challenge.example.org
+    App->>Engine: authorize
+    Engine->>Engine: verify — public DNS only
+    Engine-->>App: consent URL + sealed state
+
+    You->>CF: authorize (zone.read, dns.write — one zone)
+    CF-->>Engine: code, redeemed against the sealed state
+    Engine->>CF: example.org CNAME
+
+    loop advance, until serving and at every renewal
+        Engine->>Engine: re-derive, and re-check the proof TXT
+        Engine->>Edge: has the custom hostname minted its proofs?
+        Engine->>CF: _acme-challenge.example.org,<br/>_cf-custom-hostname.example.org
+    end
+
+    Note over You,CF: delete the proof TXT and every write stops within one tick
+```
+
+Two differences from the org lanes:
+
+- **No AWS certificate record**, for the same reason as lane 2 — it is a
+  Cloudflare-for-SaaS hostname that never reaches AWS from your edge.
+- **The grant is standing rather than 24 hours**, because a certificate renews
+  months later against a freshly minted challenge. Same trade as lane 2, and the
+  same two stop controls: delete the proof TXT, or revoke at your provider.
+
+> **Not migrated yet.** Today this lane still runs on an older path in
+> MirrorStack's private half, where you paste a Cloudflare API token instead —
+> no anchor, no digest, and nothing in this repository bounds it. The shape above
+> is what it becomes, and the migration is
+> [`docs/DESIGN.md`](docs/DESIGN.md)'s third intent. Until it ships, treat this
+> page's claims as covering lanes 1 and 2.
 
 ---
 

@@ -4,9 +4,10 @@ The complete reference. If a record is not described here, no code path in this
 service can produce it — the vocabulary is `CNAME` and `TXT` only, and every
 record must sit at or under the anchor.
 
-**The two lanes are listed separately**, because they do not write the same
+**The three lanes are listed separately**, because they do not write the same
 records. An app domain never gets an AWS certificate record; a platform domain
-never gets a wildcard. Read the one you are doing.
+never gets a wildcard; and a domain attached to a single app gets the tightest
+anchor of the three. Read the one you are doing.
 
 Each entry says **who writes it**, because that is changing. See
 [`DESIGN.md`](DESIGN.md) for the shape being built; where the two disagree, this
@@ -23,7 +24,8 @@ delegated write can reach:
 |---|---|---|---|
 | `example.com` | `example.com` | `example.com`, `account.example.com`, `_acme-challenge.api.example.com` | anything not ending `.example.com` |
 | `shop.example.com` | `shop.example.com` | `shop.example.com` and below | `example.com`, `www.example.com`, `mail.example.com` |
-| `example.app` | `example.app` | `*.example.app`, `_acme-challenge.blog.example.app` | anything outside `example.app` |
+| `example.net` | `example.net` | `*.example.net`, `_acme-challenge.blog.example.net` | anything outside `example.net` |
+| `example.org` on one app | `example.org` | `example.org` only | `www.example.org`, and everything else in that zone |
 
 The suffix is matched with a leading dot, so `evilexample.com` is not under
 `example.com`. A wildcard `*.<anchor>` is under it and is allowed.
@@ -35,7 +37,7 @@ is re-checked on every pass.
 
 ---
 
-## A custom platform domain
+## Lane 1 · an org platform domain
 
 Your MirrorStack console on a hostname you own. Connecting `example.com`
 registers up to four sibling hosts, and this is everything that lands:
@@ -65,17 +67,19 @@ Three things that table is saying quietly:
 
 ---
 
-## A custom app domain
+## Lane 2 · an org app domain
 
-One parent, and every app you deploy gets a hostname under it. Connecting
-`example.app` and deploying an app called `blog`:
+One parent the org delegates once, under which **every app is auto-routed** at
+`<app-slug>.example.net`. Nobody picks those hostnames per app — the slug
+decides them and the single wildcard routes them all. Connecting `example.net`
+with an app whose slug is `blog`:
 
 | record | type | for | count |
 |---|---|---|---|
-| `*.example.app` | CNAME | routing | **one, ever** |
-| `_mirrorstack-challenge.example.app` | TXT | ownership | one |
-| `_acme-challenge.blog.example.app` | TXT | certificate | **one per app** |
-| `_cf-custom-hostname.blog.example.app` | TXT | serving | one per app, when asked for |
+| `*.example.net` | CNAME | routing | **one, ever** |
+| `_mirrorstack-challenge.example.net` | TXT | ownership | one |
+| `_acme-challenge.blog.example.net` | TXT | certificate | **one per app** |
+| `_cf-custom-hostname.blog.example.net` | TXT | serving | one per app, when asked for |
 
 - **No AWS certificate records on this lane, at all.** An app custom domain is a
   pure Cloudflare-for-SaaS hostname: it stays DNS-only and hands the request
@@ -83,14 +87,44 @@ One parent, and every app you deploy gets a hostname under it. Connecting
   `_<token>.<host>` → `acm-validations.aws` row above simply has no counterpart
   here.
 - **One wildcard is all the routing you ever publish — but it is not all the
-  DNS.** `*.example.app` matches exactly one label, so it covers
-  `blog.example.app` and never `_acme-challenge.blog.example.app`. Each app
-  still owes certificate records of its own. A wildcard *custom hostname*, which
+  DNS.** `*.example.net` matches exactly one label, so it covers the auto-routed
+  `blog.example.net` and never `_acme-challenge.blog.example.net`. Each app still
+  owes certificate records of its own. A wildcard *custom hostname*, which
   would remove that, is Enterprise-only on the account this runs against. It is a
   real requirement, not a shortcut.
 - **The credential is standing**, because the records it exists to write are for
   apps that do not exist yet, and its expiry slides forward each time it
   publishes. That is the trade to think hardest about on this repository.
+
+---
+
+## Lane 3 · a domain on a single app
+
+An arbitrary domain bound to **one app** — `example.org` — not under any org
+parent, and available to a **personal app** with no organization at all.
+
+Authorized the same way as the other two, and with the tightest anchor of the
+three: the anchor **is** the hostname, so nothing is derived beneath it and
+nothing beside it in that zone is reachable.
+
+| record | type | for | count |
+|---|---|---|---|
+| `_mirrorstack-challenge.example.org` | TXT | ownership | one |
+| `example.org` | CNAME | routing | one |
+| `_acme-challenge.example.org` | TXT | certificate | one, re-minted at renewal |
+| `_cf-custom-hostname.example.org` | TXT | serving | one, when asked for |
+
+- **No AWS certificate record**, for the same reason as lane 2: it is a
+  Cloudflare-for-SaaS hostname that never reaches AWS from your edge.
+- **The identity is the app and its owner**, which may be a person rather than an
+  org. That is why this lane cannot be folded into lane 2.
+- **The grant is standing**, because the certificate renews months later against
+  a freshly minted challenge.
+
+> **Not migrated yet.** Today this lane runs on an older path in MirrorStack's
+> private half, where you paste a Cloudflare API token — no anchor, no ownership
+> proof, no digest, and nothing in this repository bounds it. The table above is
+> what it becomes; see [`DESIGN.md`](DESIGN.md).
 
 ---
 
@@ -212,10 +246,12 @@ permissions. Removing those grants is the outstanding half of the cutover.
 
 ### Lifetimes
 
-| | platform domain | app domain |
-|---|---|---|
-| held for | **24 hours** | **standing** |
-| ends when | the window closes — **not** when the last record lands | you revoke, or stop deploying for long enough |
-| why | the record set is finite and known up front | the records it exists to write are for apps that do not exist yet |
+| | 1 · org platform | 2 · org app domain | 3 · each app domain |
+|---|---|---|---|
+| held for | **24 hours** | **standing** | **standing** |
+| ends when | the window closes — **not** when the last record lands | you revoke, or stop deploying for long enough | you revoke, or remove the domain |
+| why | the record set is finite and known up front | the records it exists to write are for apps that do not exist yet | the certificate renews months later |
 
-Both are revocable at your provider at any time, independently of MirrorStack.
+All three are revocable at your provider at any time, independently of
+MirrorStack, and all three stop within one tick if you delete the ownership
+proof.
