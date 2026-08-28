@@ -215,6 +215,12 @@ sequenceDiagram
 
 Two differences from the platform lane that matter:
 
+- **Each app is bound at deploy time, and it may or may not be automatic.** When
+  you deploy an app, MirrorStack asks this service to mint that app's
+  certificate records. If the parent still holds a live authorization they are
+  published for you; if it does not — you never authorized, or you revoked —
+  **nothing is written and you get the two records to add yourself**. Revoking
+  does not break deploys; it turns them manual.
 - **One wildcard is all the routing you ever publish — but it is not all the
   DNS.** `*.example.net` matches exactly one label, so it covers
   `blog.example.net` and never `_acme-challenge.blog.example.net`. Each app still
@@ -303,6 +309,21 @@ Two differences from the org lanes:
 > is what it becomes, and the migration is
 > [`docs/DESIGN.md`](docs/DESIGN.md)'s third intent. Until it ships, treat this
 > page's claims as covering lanes 1 and 2.
+
+---
+
+## Doing it by hand
+
+Every lane can be done manually: you add the records in your own provider and
+grant MirrorStack nothing. No credential of yours then exists anywhere in
+MirrorStack, and none of the machinery on this page runs.
+
+Worth knowing anyway — **the list you are asked to add is derived here**, by the
+same code that would have written it. So the records on your screen and the
+records a grant would publish cannot drift apart, and you can read what you will
+be asked for before you agree to anything.
+
+Revoking a grant returns you to this path. It does not break the domain.
 
 ---
 

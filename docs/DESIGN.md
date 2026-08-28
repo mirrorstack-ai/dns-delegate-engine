@@ -80,10 +80,11 @@ nothing beside it in that zone is reachable.
 
 ---
 
-## The three intents
+## The intents
 
-These are the only entry points. Each takes a name and an identity, and returns
-the proof you must publish before anything else happens.
+These are the only entry points. Three register a domain, and each takes a name
+and an identity and returns the proof you must publish before anything else
+happens. The fourth runs later, per app.
 
 ### `org_add_custom_platform_domain(orgId, domain)`
 
@@ -102,7 +103,8 @@ one routing record, the wildcard, plus the ownership proof.
 
 Individual apps are not named here and never need to be: the slug decides the
 hostname and the wildcard routes it. What each app still owes is its own
-certificate records, which arrive later through `advance`.
+certificate records, and those are minted per app by
+`org_app_domain_bind_app` below, at deploy time.
 
 ### `app_add_custom_domain(appId, hostname)`
 
@@ -116,6 +118,39 @@ under it is derived, and nothing beside it is reachable.
 **This lane is a migration, not a new feature** — see the migration note above.
 This intent is what brings it onto the same footing as the other two: the same
 provider grant, the same proof at the anchor, the same refusals.
+
+### `org_app_domain_bind_app(parent, slug)`
+
+The one intent that runs at **deploy time** rather than at registration.
+
+An org registered `example.net` once with `org_add_custom_app_domain`. Every app
+it deploys is then routed at `<slug>.example.net` — but the wildcard covers only
+routing, and each app still owes the certificate records the wildcard cannot
+match. This is the call that mints them.
+
+`parent` is the sealed registration from the org lane; `slug` is the app's, and
+it is **the one caller-chosen string anywhere in this design**. It selects
+*which* name under a parent already proven, never *what* is written there — and
+it is validated as a single LDH label, so it cannot spell `_acme-challenge`,
+`_dmarc`, a leading underscore, a dot, or `*`.
+
+**It has two outcomes, and the second is not a failure:**
+
+| the parent's grant | what happens | what comes back |
+|---|---|---|
+| live | the records are published for you | `published`, and the app is serving once the edge validates |
+| absent, expired or revoked | **nothing is written** | `manual`, with the exact records to add yourself |
+
+That second row is the whole reason this is one call rather than two. A customer
+who never authorized — or who revoked, which they are entitled to do at any
+moment — gets a working answer instead of an error: here are two records, add
+them, and the app comes up. The private half does not decide which path is
+taken and cannot ask for the first one; whether a usable credential exists is a
+fact this service establishes by opening the sealed grant and refreshing it.
+
+The same rule holds everywhere else in this document. `advance` on any lane
+degrades the same way, so losing a credential never becomes a stuck domain — it
+becomes a list of records and an instruction.
 
 ---
 
@@ -184,6 +219,43 @@ Two more exist and write nothing: `capabilities()`, which publishes the routing
 targets and scopes this deployment actually uses, and `health()`, which publishes
 the deployed commit so every other property here is verifiable rather than merely
 readable.
+
+---
+
+## The manual path moves here too — the derivation, not the writing
+
+Every lane can be done by hand. You add the records in your own provider and
+never grant MirrorStack anything. That path has no credential, so nothing in this
+service writes on it — but the **list you are told to add comes from here all the
+same**, through `describe`.
+
+That is not a technicality, it is the point:
+
+- **One derivation, two paths.** Today the console renders its list from one
+  place in the private half and the delegated writer builds its own from another.
+  Two implementations of the same question drift, and the loose one is the one
+  that matters. After this, the records you are asked to add by hand are the same
+  bytes we would have written — because they are produced by the same function.
+- **A customer who grants nothing still gets this repository.** If you never
+  authorize, no credential of yours exists anywhere in MirrorStack, and you can
+  still read exactly what you will be asked to publish, and why each record is
+  there, before you type any of it.
+- **`describe` also reports what it observes** — present, absent, conflicting, or
+  the wrong type — so "I added it and nothing happened" has an answer that does
+  not require a support reply.
+
+So the split is by capability rather than by path:
+
+| | manual | delegated |
+|---|---|---|
+| who derives the records | this service | this service |
+| who writes them | **you** | this service, under your grant |
+| credential held | none, anywhere | one, here |
+| what a failure looks like | a record reported absent | a refusal with a reason |
+
+The delegated path is the manual path plus a credential and a writer. Nothing
+else about it differs, which is what makes revoking safe: it does not break the
+domain, it returns you to the path everyone starts on.
 
 ---
 

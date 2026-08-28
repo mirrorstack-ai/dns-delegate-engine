@@ -81,6 +81,10 @@ with an app whose slug is `blog`:
 | `_acme-challenge.blog.example.net` | TXT | certificate | **one per app** |
 | `_cf-custom-hostname.blog.example.net` | TXT | serving | one per app, when asked for |
 
+- **The per-app rows appear when that app is deployed**, not when you connect
+  the parent. If the parent holds a live authorization they are written for you;
+  if not, they are handed back for you to add by hand. Either way the wildcard
+  already routes the app, so what is outstanding is only its certificate.
 - **No AWS certificate records on this lane, at all.** An app custom domain is a
   pure Cloudflare-for-SaaS hostname: it stays DNS-only and hands the request
   straight to MirrorStack's own zone, never reaching AWS from your edge. So the
