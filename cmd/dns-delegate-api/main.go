@@ -100,8 +100,11 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, payload json.R
 
 	// ─── the intent surface (docs/DESIGN.md) ─────────────────────────────────
 	//
-	// The four intents. Each registers a domain and writes nothing; the fourth
-	// runs at deploy time and is the only one that can publish on its own.
+	// The four intents. Each of the FIRST THREE registers a domain and writes
+	// nothing — it computes the proof the customer must publish, derives the
+	// records and seals a registration, and reaches no provider at all. The
+	// fourth runs at deploy time and is the only one of the four that can
+	// publish on its own.
 
 	case "AddOrgPlatformDomain":
 		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
@@ -118,6 +121,16 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, payload json.R
 
 	// The lifecycle. Identical on all three lanes, which is why there is one
 	// set of these and not three.
+	//
+	// 🔴 THREE ACTIONS ON THIS SURFACE WRITE TO A CUSTOMER'S ZONE: "Complete",
+	// "Advance", and "BindAppToOrgAppDomain" in the group above. All three reach
+	// reconcile.Publisher.Publish through internal/intent's `write`, and the
+	// last two share one code path (`pass`) so that "a later pass degrades the
+	// same way on every lane" is true by construction rather than by intent.
+	// Every other intent action derives, reads, seals or revokes, and puts no
+	// record in front of a provider. If you are tracing what can change a zone,
+	// those three are it — plus the deprecated "Publish" below, which is the
+	// only one that takes its records from the caller.
 
 	case "Verify":
 		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
@@ -146,6 +159,24 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, payload json.R
 	// particular "Authorize" must not be re-routed to the intent service as a
 	// migration convenience: the caller's request shape is what selects the
 	// weaker check, not the action name it happens to be behind.
+	//
+	// 🔴 LANE 2 (org_app_domain) CANNOT BE AUTHORIZED ON THIS TRANSPORT, AND
+	// THAT IS A KNOWN GAP RATHER THAN A DECISION.
+	//
+	// The wildcard lane also requires this service's own consent page to have
+	// been served AND acknowledged, and an acknowledgement is a consent.Token
+	// minted under this deployment's keyset. Nothing in this binary mints one:
+	// the /consent route below renders the page and deliberately stops there,
+	// and there is no other call to consent.Token outside the tests. A caller
+	// cannot mint one either — that is the whole point of it being a MAC under a
+	// key that never leaves here. So IntentAuthorize refuses org_app_domain with
+	// `consent_required`, every time, on every deployment of this build.
+	//
+	// It ships that way because the refusal is the safe end of the failure. The
+	// alternative is minting the acknowledgement somewhere the customer was not,
+	// which is exactly the claim-with-nothing-behind-it the consent page exists
+	// to replace. It stays refused until the customer-facing consent route is
+	// settled: where it is served, and which event counts as the agreement.
 	case "IntentAuthorize":
 		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
 			(*intent.Service).Authorize)
@@ -210,12 +241,29 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, payload json.R
 	// every later one. This is the action that takes a record list, and so it is
 	// the one defect 1 lives in: it bounds where we write and nothing bounds
 	// what.
+	//
+	// 🔴 SO THE SURFACE AS A WHOLE IS NOT YET BOUNDED, AND ANY CLAIM OTHERWISE
+	// IS ABOUT THE INTENT ACTIONS ALONE. While this case is routed, what
+	// MirrorStack can put in a customer's zone is the UNION of what the intent
+	// surface derives and whatever record list the private half hands to this
+	// one — so somebody auditing the blast radius has to read both halves, and
+	// the weaker half is the one that decides.
+	//
+	// Deleting this case is what turns the bound into a property of the
+	// DEPLOYMENT rather than of the intent surface, and it is the next step.
+	// "Complete" is what api-platform moves to; the retirement is a change to
+	// two repositories in the order the package doc gives, caller first.
 	case "Publish":
 		return decodeAnd(ctx, payload, d.grants, grant.ErrUnavailable,
 			(*grant.Service).Publish)
 
-	// DEPRECATED — replaced by "Release", which refreshes the credential before
-	// revoking it so a rotated-out token cannot strand a live grant.
+	// DEPRECATED — replaced by "Release", which opens the sealed grant itself
+	// and revokes the REFRESH token rather than the access token: revoking the
+	// refresh token kills the whole grant, where revoking only the access token
+	// leaves a credential that can mint another. It does NOT refresh first —
+	// there is nothing a refresh would add once the whole grant is going — and
+	// an envelope this deployment cannot open is reported unreadable and logged
+	// REVOKE BY HAND rather than guessed at.
 	case "Revoke":
 		return decodeAnd(ctx, payload, d.grants, grant.ErrUnavailable,
 			(*grant.Service).Revoke)
@@ -266,8 +314,42 @@ func decodeAnd[Svc any, Req any, Res any](
 	return run(svc, ctx, req)
 }
 
+// commit is the git SHA this binary was built from. .github/workflows/publish.yml
+// stamps it with `-X main.commit=$GITHUB_SHA` at the one build that produces a
+// deployed artifact; every other build leaves it at the default below.
+//
+// 🔴 EVERY OTHER CLAIM IN THIS REPOSITORY RESTS ON IT. Containment at the
+// anchor, a provider interface with no delete, record values derived rather
+// than accepted: each of those is a fact about SOURCE. A reader can only carry
+// one across to the service actually holding their credential if they can tell
+// that the code they read is the code answering them. Without a commit on this
+// surface there is no step from "I audited this repository" to "this is what
+// holds my credential", and every property here degrades from checkable to
+// merely stated.
+//
+// 🔴 AN UNSTAMPED BUILD SAYS "unknown" AND NEVER SOMETHING PLAUSIBLE. No zero
+// sha, no "dev", no build timestamp dressed up as a version. A well-formed but
+// wrong answer is worse than none: it is a value somebody looks up, fails to
+// find, and then either writes off the whole surface over or — far worse —
+// matches against the wrong tree and audits code that is not running. "unknown"
+// is checkable and true, and it is what a local `make run` reports.
+//
+// 🔴 AND IT IS PUBLISHED ON AN INTERNAL SURFACE, NOT A PUBLIC ONE. Health is
+// reached by IAM-gated lambda.Invoke in production and behind the internal
+// secret locally, so today it is MirrorStack's own operators and the private
+// half that can read this, not a customer's developer directly. That makes the
+// deployment auditable by whoever is asked; it does not yet make it
+// self-serve-auditable by the customer. Publishing it on the unauthenticated
+// gateway probe is a separate decision and this file deliberately does not take
+// it.
+var commit = "unknown"
+
 type healthResponse struct {
 	OK bool `json:"ok"`
+	// Commit is the build stamp above. It is reported on every answer, healthy
+	// or not: a deployment that is refusing traffic is exactly when somebody
+	// needs to know which code is doing the refusing.
+	Commit string `json:"commit"`
 	// Delegation reports whether this deployment can actually offer delegated
 	// DNS: "ready" (client and keyset), "no-keyset" (client only — grants can be
 	// published but not held), or "unconfigured".
@@ -276,13 +358,15 @@ type healthResponse struct {
 
 // health is the arming check for a deploy. It resolves the credentials the same
 // way a real request does — through the runtime loaders, so a secret filled in
-// after this Lambda started counts — without contacting the provider.
+// after this Lambda started counts — without contacting the provider. It also
+// publishes the deployed commit, which is what docs/DESIGN.md §4 means by every
+// other property here being verifiable rather than merely readable; see the
+// `commit` var for why an unstamped build must say so.
 //
-// 🔴 IT READS WHICHEVER SURFACE IS WIRED, PREFERRING THE INTENT ONE.
-//
-// Both surfaces resolve the same two credentials from the same two loaders, so
-// today the branch is a no-op and the answers are identical. It exists for the
-// day the deprecated service is deleted: without it, removing d.grants would
+// It reads whichever surface is wired, preferring the intent one. Both surfaces
+// resolve the same two credentials from the same two loaders, so today that
+// branch is a no-op and the answers are identical. It exists for the day the
+// deprecated service is deleted: without it, removing d.grants would
 // leave a perfectly healthy deployment answering "unconfigured", and
 // mirrorstack-infra's health check would read the service as down. A retirement
 // that presents as an outage is the kind of thing that gets rolled back and
@@ -305,11 +389,11 @@ func (d *dispatcher) health(ctx context.Context) healthResponse {
 	}
 	switch {
 	case !available:
-		return healthResponse{Delegation: "unconfigured"}
+		return healthResponse{Commit: commit, Delegation: "unconfigured"}
 	case !canHold:
-		return healthResponse{OK: true, Delegation: "no-keyset"}
+		return healthResponse{OK: true, Commit: commit, Delegation: "no-keyset"}
 	default:
-		return healthResponse{OK: true, Delegation: "ready"}
+		return healthResponse{OK: true, Commit: commit, Delegation: "ready"}
 	}
 }
 
@@ -389,10 +473,13 @@ func main() {
 // it.
 //
 // A nil return is supported rather than fatal, and the reason is the same one
-// internal/intent gives for treating a relay failure as a warning: record 6, the
-// DCV pointer, is DERIVED and is what actually gets a certificate issued.
-// Refusing to start over an unreadable relay would couple the fast path to the
-// slow one and leave every domain unrouted over a permission problem on our
+// internal/intent gives for treating a relay failure as a warning: record 6 —
+// the DCV pointer — is DERIVED here and is what gets the CLOUDFLARE EDGE
+// certificate issued, so a lane still gets TLS at the edge while ACM is
+// unreadable. Lane 1's AWS certificate does not validate until record 5 is
+// relayed, and until then that lane is served at the edge and is not complete.
+// Refusing to start over an unreadable relay would couple that slow path to the
+// fast one and leave every domain unrouted over a permission problem on our
 // side. The failure is logged at Error precisely because the alternative —
 // wiring a reader pointed at the wrong region — answers "no records, no error",
 // which is indistinguishable from an ACM that has not filled them in yet, and
@@ -486,6 +573,16 @@ func (d *dispatcher) httpHandler(secret string) http.Handler {
 // A customer's browser sends no such header. In production this Lambda has no
 // API Gateway route at all and the page is proxied by the private half; this
 // file deliberately adds no wiring for that.
+//
+// 🔴 THE PAGE'S REFERENCE IS NOT A QUERY PARAMETER AND MUST NOT BECOME ONE. The
+// only input this route takes is the sealed registration; the reference an
+// acknowledgement would be MACed over comes out of that envelope. A reference
+// supplied on the URL is a value the requester chooses, which makes it a pair
+// they hold both halves of: one agreement, given once by one customer on one
+// screen, would then satisfy every later authorization on that anchor forever.
+// internal/sealed's Registration.ConsentNonce carries that reasoning in full.
+// Adding `?nonce=` back here would reintroduce the replay silently, because a
+// page rendered against a chosen reference looks exactly like a correct one.
 func (d *dispatcher) serveConsent(w http.ResponseWriter, r *http.Request) {
 	if d.intents == nil {
 		http.Error(w, "the intent surface is not wired in this build", http.StatusServiceUnavailable)
@@ -497,21 +594,7 @@ func (d *dispatcher) serveConsent(w http.ResponseWriter, r *http.Request) {
 			http.StatusBadRequest)
 		return
 	}
-	// A reference may be supplied so the same page can be rendered twice and
-	// diffed. Minting one when it is absent is safe because a nonce ALONE
-	// authorizes nothing — it is only the index an acknowledgement would be
-	// bound to, and this route mints no acknowledgement.
-	nonce := r.URL.Query().Get("nonce")
-	if nonce == "" {
-		minted, err := sealed.NewNonce()
-		if err != nil {
-			http.Error(w, "could not mint a page reference", http.StatusInternalServerError)
-			return
-		}
-		nonce = minted
-	}
-
-	page, err := d.intents.ConsentPage(r.Context(), registration, nonce)
+	page, err := d.intents.ConsentPage(r.Context(), registration)
 	if err != nil {
 		status := http.StatusInternalServerError
 		switch {

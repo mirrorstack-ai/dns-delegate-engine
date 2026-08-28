@@ -176,11 +176,19 @@ type AuthorizeRequest struct {
 	// reaches no record.
 	CodeChallenge string `json:"codeChallenge"`
 
-	// ConsentNonce and ConsentToken are the receipt of this service's own
-	// consent page, required on the org_app_domain lane only. The token is
-	// ciphertext this service issued and the nonce is the index into it; a
-	// caller can echo both and can mint neither.
-	ConsentNonce string `json:"consentNonce,omitempty"`
+	// ConsentToken is the receipt of this service's own consent page, required
+	// on the org_app_domain lane only. It is a MAC under this deployment's
+	// keyset; a caller can echo one and can mint none.
+	//
+	// 🔴 THERE IS NO consentNonce FIELD, AND ITS ABSENCE IS THE CONTROL. The
+	// reference the token is a MAC over is minted when the domain is registered
+	// and sealed into the registration, so Authorize checks the token against a
+	// value THIS service issued for THIS domain. When the caller supplied both
+	// halves it was supplying a statement and its own signature over it, and one
+	// acknowledgement authorized every later wildcard grant on the anchor. One
+	// fewer caller-supplied field moves this surface toward DESIGN §5 rather
+	// than away from it. What remains — an acknowledgement scoped to the
+	// registration rather than to one attempt — is stated in consent.Token.
 	ConsentToken string `json:"consentToken,omitempty"`
 }
 
@@ -388,6 +396,20 @@ type VerifyResponse struct {
 	Verified bool   `json:"verified"`
 	Name     string `json:"name"`
 
+	// Unresolved means the LOOKUP did not complete, so Verified being false is
+	// not a statement about the customer's zone at all.
+	//
+	// 🔴 IT IS THE DIFFERENCE BETWEEN "YOU HAVE NOT PUBLISHED IT" AND "WE COULD
+	// NOT LOOK", AND SHOWING THE FIRST FOR THE SECOND SENDS A CUSTOMER TO EDIT A
+	// RECORD THAT IS ALREADY CORRECT. Proof.State carries the same distinction
+	// in internal/observe's vocabulary (unknown, never absent); this field is
+	// here so a caller cannot miss it by reading only the boolean it branches
+	// on. A resolver failure is a fact about the world rather than a fault in
+	// the request, so it is reported here and not as an RPC error — which is
+	// also what keeps the observation, the name and the expected value in front
+	// of whoever has to act.
+	Unresolved bool `json:"unresolved,omitempty"`
+
 	// Expected is the value to publish TODAY — the MAC under the active key.
 	//
 	// Verification accepts one value per key in the keyset, so a proof published
@@ -542,9 +564,10 @@ type OrphansResponse struct {
 
 	// ReadThrough is "provider" when the customer's own zone was read with their
 	// grant, and "public-dns" when it was not — no grant was supplied, it could
-	// not be opened, or the provider refused. The distinction matters to the
-	// person acting on the report: public DNS is cached and shows what the world
-	// sees, while the provider shows what is actually in the zone.
+	// not be opened, the provider refused, or the refreshed grant could not be
+	// held. The distinction matters to the person acting on the report: public
+	// DNS is cached and shows what the world sees, while the provider shows what
+	// is actually in the zone.
 	ReadThrough string `json:"readThrough"`
 
 	// Records are the names this service would have written, with what is at
@@ -560,11 +583,25 @@ type OrphansResponse struct {
 	// it, and claiming otherwise would be the more comfortable lie.
 	Incomplete bool `json:"incomplete"`
 
-	SealedToken string   `json:"sealedToken,omitempty"`
-	KeyID       string   `json:"keyId,omitempty"`
-	Rotated     bool     `json:"rotated"`
-	Failure     *Failure `json:"failure,omitempty"`
-	Warnings    []string `json:"warnings,omitempty"`
+	// SealedToken, KeyID and Rotated mean exactly what they mean on
+	// PassResponse: reading the zone with the customer's grant REFRESHES it, so
+	// the caller's stored copy is already dead and the replacement here must be
+	// persisted. An empty SealedToken never means "discard the one you hold".
+	SealedToken string `json:"sealedToken,omitempty"`
+	KeyID       string `json:"keyId,omitempty"`
+	Rotated     bool   `json:"rotated"`
+
+	// Revoked is the ONLY field that means "discard the credential you hold",
+	// and a report is a place it can genuinely happen: the refresh rotates the
+	// grant, and if the replacement cannot be sealed there is nothing to hand
+	// back — a live grant at the provider that nothing will ever release. So it
+	// is ended here rather than stranded, the same choice write() makes on the
+	// publishing path, and Failure.Code says reseal_failed. Nothing else in
+	// Orphans revokes: reporting is not mutating.
+	Revoked bool `json:"revoked"`
+
+	Failure  *Failure `json:"failure,omitempty"`
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // ReleaseResponse reports the end of a grant.

@@ -231,29 +231,50 @@ func TestAuthorizeRefusesTheWildcardLaneWithoutAnAcknowledgedConsentPage(t *test
 	}); !errors.Is(err, ErrConsentRequired) {
 		t.Fatalf("want ErrConsentRequired with no token, got %v", err)
 	}
-	// A token for a DIFFERENT anchor is not a token for this one.
-	nonce, err := sealed.NewNonce()
-	if err != nil {
-		t.Fatalf("nonce: %v", err)
+
+	// The reference the acknowledgement is a MAC over is the REGISTRATION's,
+	// minted when the domain was registered. There is no request field for it.
+	reference := h.open(t, out.Registration).ConsentNonce
+	if reference == "" {
+		t.Fatal("a wildcard registration must carry the reference its consent page is printed with")
 	}
-	elsewhere, err := consent.Token(h.sealer, nonce, platformDomain)
+
+	// A token for a DIFFERENT anchor is not a token for this one.
+	elsewhere, err := consent.Token(h.sealer, reference, platformDomain)
 	if err != nil {
 		t.Fatalf("consent.Token: %v", err)
 	}
 	if _, err := h.svc.Authorize(t.Context(), AuthorizeRequest{
-		Registration: out.Registration, CodeChallenge: "chal",
-		ConsentNonce: nonce, ConsentToken: elsewhere,
+		Registration: out.Registration, CodeChallenge: "chal", ConsentToken: elsewhere,
 	}); !errors.Is(err, ErrConsentRequired) {
 		t.Fatalf("a consent token for another anchor must not authorize this one, got %v", err)
 	}
 
-	token, err := consent.Token(h.sealer, nonce, appParent)
+	// 🔴 AND A TOKEN OVER A REFERENCE THIS SERVICE NEVER SEALED INTO THIS
+	// REGISTRATION IS REFUSED, however well formed it is and whatever key minted
+	// it. This is the whole of the control: the caller supplies one half of the
+	// MAC and never both, so an acknowledgement cannot be a signature on a
+	// statement the caller wrote for itself.
+	invented, err := sealed.NewNonce()
+	if err != nil {
+		t.Fatalf("nonce: %v", err)
+	}
+	forged, err := consent.Token(h.sealer, invented, appParent)
+	if err != nil {
+		t.Fatalf("consent.Token: %v", err)
+	}
+	if _, err := h.svc.Authorize(t.Context(), AuthorizeRequest{
+		Registration: out.Registration, CodeChallenge: "chal", ConsentToken: forged,
+	}); !errors.Is(err, ErrConsentRequired) {
+		t.Fatalf("a token over a reference nobody issued for this registration must not authorize it, got %v", err)
+	}
+
+	token, err := consent.Token(h.sealer, reference, appParent)
 	if err != nil {
 		t.Fatalf("consent.Token: %v", err)
 	}
 	authorized, err := h.svc.Authorize(t.Context(), AuthorizeRequest{
-		Registration: out.Registration, CodeChallenge: "chal",
-		ConsentNonce: nonce, ConsentToken: token,
+		Registration: out.Registration, CodeChallenge: "chal", ConsentToken: token,
 	})
 	if err != nil {
 		t.Fatalf("Authorize with an acknowledged page: %v", err)
@@ -267,6 +288,94 @@ func TestAuthorizeRefusesTheWildcardLaneWithoutAnAcknowledgedConsentPage(t *test
 		if consent.Required(l) {
 			t.Fatalf("%s must not require this service's consent page", l)
 		}
+	}
+}
+
+// 🔴 AN ACKNOWLEDGEMENT IS SCOPED TO ONE REGISTRATION, AND THAT IS BOTH HALVES
+// OF THE CLAIM consent.Token MAKES.
+//
+// It does not carry to a second registration of the same domain: re-registering
+// mints a new reference, so the earlier agreement — given about an earlier
+// derivation, possibly by an earlier person — authorizes nothing. And within one
+// registration it IS replayable, because a service that stores nothing cannot
+// count. The second half is asserted here rather than left implied: consent.Token
+// says the limit out loud, and a documented limit nobody exercises is a sentence,
+// not a property.
+func TestAnAcknowledgementIsScopedToOneRegistrationAndNotToOneAttempt(t *testing.T) {
+	h := newHarness(t)
+	first := h.register(t, lane.OrgAppDomain, testOrg, appParent)
+	h.publishProof(t, first)
+
+	firstReference := h.open(t, first.Registration).ConsentNonce
+	ack, err := consent.Token(h.sealer, firstReference, appParent)
+	if err != nil {
+		t.Fatalf("consent.Token: %v", err)
+	}
+	if _, err := h.svc.Authorize(t.Context(), AuthorizeRequest{
+		Registration: first.Registration, CodeChallenge: "chal", ConsentToken: ack,
+	}); err != nil {
+		t.Fatalf("the acknowledgement must authorize its own registration: %v", err)
+	}
+
+	// The same domain connected a second time is a second consent.
+	second := h.register(t, lane.OrgAppDomain, testOrg, appParent)
+	if reference := h.open(t, second.Registration).ConsentNonce; reference == firstReference {
+		t.Fatal("each registration must mint its own reference, or one screen agrees for all of them")
+	}
+	if _, err := h.svc.Authorize(t.Context(), AuthorizeRequest{
+		Registration: second.Registration, CodeChallenge: "chal", ConsentToken: ack,
+	}); !errors.Is(err, ErrConsentRequired) {
+		t.Fatalf("an acknowledgement of one registration must not authorize another, got %v", err)
+	}
+
+	// The limit that remains, exercised so it cannot quietly stop being true.
+	if _, err := h.svc.Authorize(t.Context(), AuthorizeRequest{
+		Registration: first.Registration, CodeChallenge: "chal", ConsentToken: ack,
+	}); err != nil {
+		t.Fatalf("consent.Token documents the acknowledgement as replayable within its registration: %v", err)
+	}
+}
+
+// The consent page is printed with the registration's own reference, and there
+// is no way to ask for another one — a page rendered with a reference Authorize
+// will not check collects an agreement that can never be verified.
+func TestTheConsentPageIsPrintedWithTheSealedReference(t *testing.T) {
+	h := newHarness(t)
+	out := h.register(t, lane.OrgAppDomain, testOrg, appParent)
+
+	page, err := h.svc.ConsentPage(t.Context(), out.Registration)
+	if err != nil {
+		t.Fatalf("ConsentPage: %v", err)
+	}
+	reference := h.open(t, out.Registration).ConsentNonce
+	if !strings.Contains(page, reference) {
+		t.Fatal("the page must print the reference the acknowledgement is bound to")
+	}
+	// Rendering it twice is the same page: the reference is a property of the
+	// registration, not of the request that asked for it.
+	again, err := h.svc.ConsentPage(t.Context(), out.Registration)
+	if err != nil || again != page {
+		t.Fatalf("two renders of one registration must be the same page: %v", err)
+	}
+
+	// A registration sealed by a build without this control has no reference,
+	// and is refused rather than served a page nobody could act on. The proof is
+	// published first so the refusal below is reached at the consent gate rather
+	// than at the ownership one.
+	h.publishProof(t, out)
+	stale, _, err := sealed.SealRegistration(h.sealer, sealed.Registration{
+		Lane: lane.OrgAppDomain, Identity: testOrg, Anchor: appParent, IssuedAt: nowUnix(),
+	})
+	if err != nil {
+		t.Fatalf("SealRegistration: %v", err)
+	}
+	if _, err := h.svc.ConsentPage(t.Context(), stale); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("want ErrInvalidRequest for a registration with no reference, got %v", err)
+	}
+	if _, err := h.svc.Authorize(t.Context(), AuthorizeRequest{
+		Registration: stale, CodeChallenge: "chal", ConsentToken: "msack1-anything",
+	}); !errors.Is(err, ErrConsentRequired) {
+		t.Fatalf("a registration with no reference must fail closed at Authorize too, got %v", err)
 	}
 }
 
@@ -310,8 +419,17 @@ func TestCompleteRefusesAStateSealedForADifferentAnchor(t *testing.T) {
 	_, err := h.svc.Complete(t.Context(), CompleteRequest{
 		State: state, Code: "auth-code", CodeVerifier: "verifier", ExpectDigest: first.Digest,
 	})
-	if !errors.Is(err, dnsplan.ErrPlanInvalid) {
-		t.Fatalf("want a digest refusal, got %v", err)
+	// 🔴 AND IT IS ErrPlanChanged, NOT ErrPlanInvalid. plan_invalid's contract is
+	// "the plan is wrong and retrying cannot help", which is the wrong sentence
+	// for a well-formed plan whose digest simply no longer reproduces — a routing
+	// target or a DCV identifier moved under a consent screen rendered minutes
+	// ago. The remedy is to re-render and authorize again, and a caller shown
+	// "this is a bug" may abandon the domain permanently instead.
+	if !errors.Is(err, dnsplan.ErrPlanChanged) {
+		t.Fatalf("want ErrPlanChanged for a digest that no longer reproduces, got %v", err)
+	}
+	if errors.Is(err, dnsplan.ErrPlanInvalid) {
+		t.Fatal("a stale reviewed digest must not be reported as a malformed plan")
 	}
 	if h.oauth.tokenCalls != 0 || h.provider.writes != 0 {
 		t.Fatal("nothing may be exchanged or written for a plan that does not reproduce the reviewed digest")
@@ -909,9 +1027,11 @@ func TestRelayedRecordsArePublishedWithoutMovingTheReviewedDigest(t *testing.T) 
 }
 
 // 🔴 A relay failure is a WARNING, not a refusal. Record 6 is derived here and is
-// what actually gets a certificate issued; blocking it on an ACM permission
-// problem on our side would leave a customer's domain unrouted for a reason that
-// has nothing to do with them.
+// what gets the CLOUDFLARE EDGE certificate issued, so the lane still gets TLS
+// at the edge when the relay is unreadable — lane 1's AWS certificate is a
+// second one, and it stays unvalidated until record 5 is relayed. Blocking
+// record 6 on an ACM permission problem on our side would leave a customer's
+// domain unrouted for a reason that has nothing to do with them.
 func TestARelayFailureWarnsAndStillPublishesWhatIsDerived(t *testing.T) {
 	h := newHarness(t)
 	out := h.register(t, lane.OrgPlatformDomain, testOrg, platformDomain)
@@ -1213,6 +1333,91 @@ func TestTheOrphansProviderViewCannotWrite(t *testing.T) {
 	}
 }
 
+// 🔴 THE 2026-08-24 FAILURE, IN THE FUNCTION THAT ONLY READS. Reading the zone
+// through the customer's grant REFRESHES it, so the caller's stored token is
+// dead the moment Orphans touches the provider. If the replacement cannot be
+// sealed there is nothing to hand back, and a report that returned rotated:true
+// with an empty sealedToken and no failure would leave a live grant at
+// Cloudflare that nothing in MirrorStack could ever release.
+func TestOrphansRevokesARotatedGrantItCannotHold(t *testing.T) {
+	h := newHarness(t)
+	out := h.register(t, lane.OrgPlatformDomain, testOrg, platformDomain)
+	h.publishProof(t, out)
+	held := h.seal(t, "refresh-1", h.open(t, out.Registration))
+
+	keys := &vanishingKeys{sealer: h.sealer}
+	h.svc.Keys = keys
+	h.oauth.nextRefresh = "refresh-2"
+	// The keyset disappears while the refresh is in flight: everything before it
+	// opened normally, and the rotated token then cannot be sealed.
+	h.oauth.onToken = func() { keys.gone = true }
+
+	report, err := h.svc.Orphans(t.Context(), OrphansRequest{
+		Registration: out.Registration, SealedToken: held,
+	})
+	if err != nil {
+		t.Fatalf("a grant that cannot be held is an outcome, not an RPC error: %v", err)
+	}
+	if !report.Rotated || report.SealedToken != "" {
+		t.Fatalf("the grant rotated and could not be sealed: %#v", report)
+	}
+	if report.Failure == nil || report.Failure.Code != FailureResealFailed || report.Failure.Retry {
+		t.Fatalf("the caller must be told the grant is gone and why: %#v", report.Failure)
+	}
+	if !report.Revoked {
+		t.Fatal("a grant nobody can record must not be left alive at the provider")
+	}
+	if len(h.oauth.revokedHints) == 0 || h.oauth.revokedHints[0] != "refresh_token" {
+		t.Fatalf("the refresh token must be revoked first: %v", h.oauth.revokedHints)
+	}
+	// The report itself still answers, from public DNS, and still writes nothing.
+	if report.ReadThrough != "public-dns" || len(report.Records) == 0 {
+		t.Fatalf("the report must degrade to public DNS rather than disappear: %#v", report)
+	}
+	if h.provider.writes != 0 {
+		t.Fatal("no path through Orphans writes")
+	}
+}
+
+// 🔴 A FAILED LOOKUP IS A FACT ABOUT THE WORLD, NOT A FAULT IN THE REQUEST.
+// observe.Proof populates the observation on the error path precisely so a
+// caller can render what was seen; returning an RPC error throws it away at the
+// transport and answers the customer's question with "internal".
+func TestVerifyReportsAFailedLookupInsteadOfDiscardingTheObservation(t *testing.T) {
+	h := newHarness(t)
+	out := h.register(t, lane.AppDomain, testApp, appHostname)
+	h.publishProof(t, out)
+
+	// The proof IS published; our resolver simply cannot answer right now.
+	h.resolver.fail[proof.Prefix+appHostname] = &net.DNSError{
+		Err: "server misbehaving", Name: proof.Prefix + appHostname, IsTemporary: true,
+	}
+
+	got, err := h.svc.Verify(t.Context(), VerifyRequest{Registration: out.Registration})
+	if err != nil {
+		t.Fatalf("a resolver failure is an answer about the world: %v", err)
+	}
+	if got.Verified {
+		t.Fatal("nothing may report a proof as present on an answer that never arrived")
+	}
+	if !got.Unresolved {
+		t.Fatal("verified=false must be distinguishable from \"we could not look\"")
+	}
+	if got.Proof.State != string(observe.StateUnknown) {
+		t.Fatalf("an unread proof is unknown, never absent: %#v", got.Proof)
+	}
+	if got.Name == "" || got.Expected == "" || got.Proof.Explain == "" {
+		t.Fatalf("the name, the value to publish and what was seen must survive: %#v", got)
+	}
+
+	// A deployment that could not look at all is still an RPC error: a report
+	// about a customer's zone from a service in no position to look is not one.
+	h.svc.Resolver = nil
+	if _, err := h.svc.Verify(t.Context(), VerifyRequest{Registration: out.Registration}); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("want ErrUnavailable when this deployment has no resolver, got %v", err)
+	}
+}
+
 // ─── harness ────────────────────────────────────────────────────────────────
 
 type harness struct {
@@ -1338,6 +1543,26 @@ type stubKeys struct{ sealer *grantcrypto.Sealer }
 
 func (s stubKeys) Sealer(context.Context) *grantcrypto.Sealer { return s.sealer }
 
+// vanishingKeys stops handing out a sealer once gone is set.
+//
+// It is the only way to make sealing FAIL: a Sealer holding a key cannot fail to
+// seal a non-empty value, so the failure has to come from the keyset not being
+// there. That is a real state rather than a contrivance — the loaders are
+// per-request and re-read their secret on a TTL, so a key retired, a secret
+// store that starts refusing, or a rotation mid-pass all look exactly like this
+// from inside one call.
+type vanishingKeys struct {
+	sealer *grantcrypto.Sealer
+	gone   bool
+}
+
+func (v *vanishingKeys) Sealer(context.Context) *grantcrypto.Sealer {
+	if v.gone {
+		return nil
+	}
+	return v.sealer
+}
+
 type stubOAuth struct{ cfg *cfoauth.Config }
 
 func (s stubOAuth) Config(context.Context) *cfoauth.Config { return s.cfg }
@@ -1443,6 +1668,11 @@ type oauthServer struct {
 	nextRefresh  string
 	tokenStatus  int
 	tokenBody    string
+
+	// onToken fires while a token or refresh request is being served, which is
+	// the only place a test can change the world at the exact moment a pass has
+	// consumed a credential and not yet stored the replacement.
+	onToken func()
 }
 
 func (o *oauthServer) start(t *testing.T) (oauthLoader, *http.Client) {
@@ -1458,6 +1688,9 @@ func (o *oauthServer) start(t *testing.T) (oauthLoader, *http.Client) {
 		o.tokenCalls++
 		if r.Form.Get("grant_type") == "refresh_token" {
 			o.refreshCalls++
+		}
+		if o.onToken != nil {
+			o.onToken()
 		}
 		if o.tokenStatus != 0 {
 			w.Header().Set("Content-Type", "application/json")

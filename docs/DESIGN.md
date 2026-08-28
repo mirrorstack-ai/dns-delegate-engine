@@ -1,13 +1,41 @@
 # The intent-based API
 
 The shape this service is being rebuilt into: MirrorStack's private half names a
-**domain and an intent**, and can no longer name a DNS record at all.
+**domain and an intent**, and on this surface cannot name a DNS record at all.
+It is a surface rather than the whole deployment, and the difference is the
+first thing below.
 
-> **Status: design. Not built.** What runs today is described in
-> [`../README.md`](../README.md), and where the two disagree, the README is the
-> truth. This is here first, and in public, because the design is the part your
-> developers most need to argue with — after it ships is too late to tell us it
-> is wrong.
+> **Status: built, and not finished.** This file described a proposal until
+> 2026-08-28 and describes the deployed surface now. Everything below is
+> implemented and dispatched: the four intents, all seven lifecycle functions,
+> `capabilities` and `health`.
+>
+> Three parts do not, and each is marked where it belongs:
+>
+> - **Record 7, Cloudflare's serving proof, is never produced by this build.**
+>   The relay is written and nothing wires it, so every lane can answer 526 with
+>   a certificate that reads active. §6.
+> - **Lane 2 cannot be authorized at all.** Nothing in the deployed binary mints
+>   the consent acknowledgement its `authorize` requires, so that lane is
+>   refused every time. §4.
+> - **The rate floor in `internal/schedule` is declared and enforced nowhere.**
+>   §8.
+>
+> 🔴 **And the surface §1 is about is still routed in the same binary, behind
+> the same OAuth client.** `publish(records)` and the legacy `authorize` that
+> takes a caller-supplied state are both live, and MirrorStack's private half
+> still calls them. They are reachable with the credential this flow obtains:
+> run the intent flow, get your genuine consent on your provider's screen, and
+> then redeem the resulting authorization code against `publish` with a record
+> list instead of against `complete` — and you get exactly the two records §1
+> opens with, in your zone. **Until that action is deleted, your answer to
+> "could MirrorStack break our website?" is unchanged by everything below
+> it.** Deleting it is the next step and it is a change to two repositories,
+> caller first.
+>
+> [`../README.md`](../README.md) opens with the same status, shorter, and then
+> walks the code. [`RECORDS.md`](RECORDS.md) lists every record, on both
+> surfaces, and says which surface writes it.
 
 ---
 
@@ -119,11 +147,48 @@ domain, it returns you to the path everyone starts on.
 
 ## 3 · What MirrorStack can ask for
 
-These are the only entry points. Three register a domain, and each takes a name
-and an identity and returns the proof you must publish before anything else
-happens. The fourth runs later, per app.
+These are the entry points on the intent surface — not the only entry points
+on the deployment, which still routes the legacy actions the status block names.
+Three of them register a domain, and each takes a name and an identity and
+returns the proof you must publish before anything else happens. The fourth runs
+later, per app.
 
-### `org_add_custom_platform_domain(orgId, domain)`
+**The wire action names are these**, and they are what you will see in a log,
+a trace or an IAM policy:
+
+| wire action | what it is | writes to your zone |
+|---|---|---|
+| `AddOrgPlatformDomain` | lane 1 registration | no |
+| `AddOrgAppDomain` | lane 2 registration | no |
+| `AddAppDomain` | lane 3 registration | no |
+| `BindAppToOrgAppDomain` | the deploy-time intent, below | **yes** |
+| `Verify` | §4 | no |
+| `IntentAuthorize` | `authorize`, §4 | no |
+| `Complete` | §4 | **yes** |
+| `Advance` | §4 | **yes** |
+| `Describe` | §4 | no |
+| `Orphans` | §4 | no — it is a report |
+| `Release` | §4 | no — it revokes at the provider |
+| `IntentCapabilities` | `capabilities`, §4 | no |
+| `Health` | `health`, §4 | no |
+
+So **three actions can change your zone**: `Complete`, `Advance` and
+`BindAppToOrgAppDomain`. Everything else derives, reads, seals or revokes. The
+legacy `Publish` is a fourth, and it is the one that takes its records from the
+caller.
+
+🔴 **`IntentAuthorize` and `IntentCapabilities` are spelled apart from the
+legacy `Authorize` and `Capabilities` deliberately, and the two pairs must never
+become aliases.** The legacy `Authorize` takes the OAuth `state` as a request
+field; this one mints it. A caller that reached the wrong one would be
+authorized with none of the checks in §4 and would receive no error saying so —
+the quietest way to lose the property this surface exists to add. Two distinct
+names turn that mistake into an `unknown_action` refusal. It is the caller's
+request *shape* that selects the weaker check, not the name it happens to be
+behind, so neither name may ever be pointed at the other implementation as a
+migration convenience.
+
+### `AddOrgPlatformDomain(orgId, domain)`
 
 Registers the org's console domain. Derives the four sibling hostnames from a
 fixed label table — `account` `api` `apps` `cdn` — so the caller cannot add a
@@ -133,7 +198,7 @@ Returns the anchor, the derived hostnames, the ownership proof to publish, the
 full record list, and the plan digest. **Touches no credential and writes
 nothing.**
 
-### `org_add_custom_app_domain(orgId, domain)`
+### `AddOrgAppDomain(orgId, domain)`
 
 Registers the parent under which the org's apps are auto-routed. Derives exactly
 one routing record, the wildcard, plus the ownership proof.
@@ -141,9 +206,9 @@ one routing record, the wildcard, plus the ownership proof.
 Individual apps are not named here and never need to be: the slug decides the
 hostname and the wildcard routes it. What each app still owes is its own
 certificate records, and those are minted per app by
-`org_app_domain_bind_app` below, at deploy time.
+`BindAppToOrgAppDomain` below, at deploy time.
 
-### `app_add_custom_domain(appId, hostname)`
+### `AddAppDomain(appId, hostname)`
 
 Registers one arbitrary domain against one app. **Takes an app, not an org** —
 the owner may be a person, and this lane has to work with no organization
@@ -156,16 +221,17 @@ under it is derived, and nothing beside it is reachable.
 This intent is what brings it onto the same footing as the other two: the same
 provider grant, the same proof at the anchor, the same refusals.
 
-### `org_app_domain_bind_app(parent, slug)`
+### `BindAppToOrgAppDomain(registration, slug)`
 
 The one intent that runs at **deploy time** rather than at registration.
 
-An org registered `example.net` once with `org_add_custom_app_domain`. Every app
+An org registered `example.net` once with `AddOrgAppDomain`. Every app
 it deploys is then routed at `<slug>.example.net` — but the wildcard covers only
 routing, and each app still owes the certificate records the wildcard cannot
 match. This is the call that mints them.
 
-`parent` is the sealed registration from the org lane; `slug` is the app's, and
+`registration` is the sealed registration from the org lane; `slug` is the
+app's, and
 it is **the one caller-chosen string anywhere in this design**. It selects
 *which* name under a parent already proven, never *what* is written there — and
 it is validated as a single LDH label, so it cannot spell `_acme-challenge`,
@@ -180,8 +246,10 @@ it is validated as a single LDH label, so it cannot spell `_acme-challenge`,
 
 That second row is the whole reason this is one call rather than two. A customer
 who never authorized — or who revoked, which they are entitled to do at any
-moment — gets a working answer instead of an error: here are two records, add
-them, and the app comes up. The private half does not decide which path is
+moment — gets a working answer instead of an error: here are the records, add
+them, and the app comes up. (On this build that list is **one** record, not the
+two [`RECORDS.md`](RECORDS.md) shows for this lane, because record 7 is not
+produced — see the status block.) The private half does not decide which path is
 taken and cannot ask for the first one; whether a usable credential exists is a
 fact this service establishes by opening the sealed grant and refreshing it.
 
@@ -220,6 +288,18 @@ from here rather than from a console this repository cannot vouch for. The other
 two lanes keep the console's screen: their record sets are closed and listed in
 full below.
 
+🔴 **Which means lane 2 cannot be authorized on this build at all, and that is
+a gap rather than a decision.** An acknowledgement is a MAC minted under this
+deployment's key, over a reference sealed into the registration — and nothing in
+the deployed binary mints one. The consent page is rendered and the flow
+deliberately stops there, because where that page is served and which event
+counts as the agreement are not settled. So `IntentAuthorize` refuses
+`org_app_domain` with `consent_required`, every time, on every deployment of
+this build. It ships that way because the refusal is the safe end of the
+failure: the alternative is minting the acknowledgement somewhere the customer
+was not, which is precisely the claim-with-nothing-behind-it the consent page
+exists to replace.
+
 ### `complete(state, code, codeVerifier, expectDigest)`
 
 Exchanges the authorization code, seals the resulting credential, and publishes
@@ -228,12 +308,38 @@ the records that are knowable at this moment.
 **Takes no identity, no lane and no domain** — all three come from the sealed
 `state`. That is what makes `authorize` and `complete` cryptographically the same
 act, rather than two requests whose fields are checked against each other.
-`expectDigest` is **required**; an empty value is refused, because an optional
-integrity check is a claim rather than a control.
+`expectDigest` is **required**; an empty value is refused, because an
+integrity check a caller can switch off by omitting a field is a claim rather
+than a control. Three things it is *not*, and they matter more than the
+requirement does:
+
+- **It defends against a bug in the private half, not against the private
+  half.** The value the caller sends is one this service handed it, and this
+  service re-derives the plan from the sealed registration and compares. That is
+  `derive(reg)` against `derive(reg)`. It catches a plan that moved between the
+  screen and the write, and a caller that mangled one in between. It cannot
+  catch a caller that faithfully echoes what it was given, because echoing is
+  the correct behaviour — so this is not a cross-boundary integrity control, and
+  a claim that it is one would be the strongest false claim in this document.
+- **It covers the DERIVED records only.** Records 5 and 7 are relayed and their
+  bytes do not exist when you review the plan, so they are merged in afterwards
+  and checked with a *superset* test — the write set may have grown, never
+  shrunk or mutated. They are therefore written with no digest coverage at all.
+  What bounds them instead is anchor containment and `internal/relay`'s
+  value check, which is the thing to read if that is the part you care about.
+- **`advance` takes no digest**, for the same reason: a later pass publishes
+  records nobody could have approved, because they did not exist to approve.
+
+Each of those is defensible on its own. The sentence built on top of them —
+"the customer's digest is what stops a hostile private half" — is not, which is
+why it is not made here.
 
 ### `advance(registration, grant)`
 
-One pass of the loop, and the only function that writes after the first publish.
+One pass of the loop, and the only function *here* that writes after the first
+publish — `BindAppToOrgAppDomain` in §3 is the other writer, and it runs this
+same code path so that "a later pass degrades the same way on every lane" is
+true by construction rather than by intent.
 
 Re-derives the record set, re-checks the ownership proof still resolves, asks AWS
 and Cloudflare whether the records they owe have appeared, and publishes whatever
@@ -259,24 +365,44 @@ write rather than clobbering an edit you made a second ago.
 Revokes at the provider, refresh token first. An envelope that cannot be opened
 is reported as such and never guessed at.
 
-Two more exist and write nothing: `capabilities()`, which publishes the routing
-targets and scopes this deployment actually uses, and `health()`, which publishes
-the deployed commit so every other property here is verifiable rather than merely
-readable.
+Two more exist and write nothing: `capabilities()` (`IntentCapabilities`),
+which publishes the routing targets, the DCV delegation identifier, the declared
+cadence, the per-lane grant lifetimes and whether a lane needs a consent page —
+none of them secret, every one of them a value that ends up in your own zone or
+on your own clock — and `health()` (`Health`), which publishes the git SHA this
+binary was built from. The publish workflow stamps it at the one build that
+produces a deployed artifact; any other build reports `unknown`, so a missing
+stamp is visible rather than silent.
+
+The commit is what turns "I read this repository" into "this is the revision
+holding my credential", and that step is worth one honest caveat: `Health` sits
+behind the same IAM-gated transport as everything else, so today it is auditable
+**on request** rather than by your developers unaided.
 
 ---
 
 ## 5 · What the caller can send, in full
 
-Across every function above, the private half supplies these and nothing else:
+Across every function above, the private half supplies these and nothing else.
+(Above, meaning on this surface. The legacy `publish(records)` in the status
+block takes a record list, an anchor and a target id of the caller's choosing,
+and none of the following bounds it.)
 
-| field | validation |
-|---|---|
-| `orgId` / `appId` | canonical 36-character hyphenated UUID, strict |
-| `lane` | one of three |
-| `domain` | one DNS name, ≤253, LDH labels, refused if under a MirrorStack suffix |
-| `code` / `codeVerifier` / `codeChallenge` | provider and PKCE; reach no record |
-| sealed envelopes | ciphertext this service issued |
+| field | where | validation |
+|---|---|---|
+| `orgId` / `appId` | the three registrations | canonical 36-character hyphenated UUID, strict |
+| `domain` | lanes 1 and 2 | one DNS name, ≤253, LDH labels, refused if under a MirrorStack suffix |
+| `hostname` | lane 3 — the field is **not** called `domain` | as `domain` above |
+| `slug` | `BindAppToOrgAppDomain` | one LDH label. No dot, no leading underscore, no `*` — so it cannot spell `_acme-challenge`, `_dmarc` or a name of its own |
+| `code` / `codeVerifier` / `codeChallenge` | `authorize`, `complete` | provider and PKCE; reach no record |
+| `expectDigest` | `complete` | required, non-empty, hex. Compared against a plan re-derived here — see §4 for what that does and does not prove |
+| `consentToken` | `authorize`, lane 2 only | a MAC under this deployment's key. **Not "ciphertext this service issued"** — it is a signature, over a reference sealed into the registration when the domain was registered. The caller can echo one and can mint none, and there is deliberately no `consentNonce` field beside it: supplying both halves is supplying a statement and your own signature over it |
+| `reason` | `release` | **free text, unvalidated.** It is written to this deployment's log and reaches no provider call and no record. It exists so an operator holding a support ticket can tell a domain that was deleted from one whose window simply closed |
+| sealed envelopes | everywhere | ciphertext this service issued, opened under associated data naming the lane, the identity and the anchor |
+
+There is no `lane` field, though the lane is inside every envelope: each intent
+is its own function, so the lane is a constant at the call site and a caller
+cannot get it wrong.
 
 There is **no records field, no value, no target, no proxy flag, no certificate
 id, no hostname id, no ownership token, no expiry, no stage.**
@@ -289,6 +415,10 @@ having been thought of.
 
 ## 6 · What lands in your zone
 
+This is the intent surface. Record 1 is the one that changes hands: on the
+legacy action it is written by us, which is the second defect in §1.
+[`RECORDS.md`](RECORDS.md) gives every row on both surfaces, per lane.
+
 | # | name | type | value | lane | written by |
 |---|---|---|---|---|---|
 | 1 | `_mirrorstack-challenge.<anchor>` | TXT | `HMAC(K, lane‖id‖anchor)` | all three | 🔴 **you, by hand** |
@@ -297,12 +427,23 @@ having been thought of.
 | 4 | `<hostname>` | CNAME | the app routing target | 3 | this service |
 | 5 | `_<token>.<host>` | CNAME | `….acm-validations.aws` | 1 only | relayed from AWS |
 | 6 | `_acme-challenge.<host>` | CNAME | `<host>.<uuid>.dcv.cloudflare.com` | all three | this service — **derived** |
-| 7 | `_cf-custom-hostname.<host>` | TXT | the serving proof | all three | relayed from Cloudflare |
+| 7 | `_cf-custom-hostname.<host>` | TXT | the serving proof | all three | relayed from Cloudflare — 🔴 **not produced by this build** |
 
 **Records 5 and 7 are relayed, not derived.** This service derives *that* a proof
 must exist and *why*; their bytes come from AWS and Cloudflare. "The engine
 derives the record set" is true of which proofs exist and false of every byte,
 and both halves of that belong in public.
+
+🔴 **Record 7 never appears, on any lane, on this build.** The relay exists in
+`internal/relay` and nothing wires it: it needs MirrorStack's own Cloudflare API
+token and the id of the SaaS zone the custom hostname sits in, and that zone
+differs between the org lane and the app lane while the field does not. Both
+have to be settled first. The consequence is not cosmetic — Cloudflare withholds
+routing until that TXT exists, so a lane can answer **526 while its certificate
+reads active**, which is the hardest shape of this failure to diagnose.
+[`RECORDS.md`](RECORDS.md) describes it. It is left unwired rather than faked
+because an absent row is visibly incomplete and an invented one is confidently
+wrong.
 
 **Record 6 is the exception, and it is the most consequential choice here.** It
 carries no token — it is a *pointer* at Cloudflare's delegated DCV location, and
@@ -346,10 +487,20 @@ you proved.
 
 Two controls, and both are yours alone.
 
-**Delete the ownership proof.** Every write from this service stops within one
-tick — it is re-checked on every pass, so there is no window in which we are
-still writing and you have already said no. Nothing needs to reach MirrorStack
-for this to take effect.
+**Delete the ownership proof.** Every write from this service stops on the
+first pass after the deletion becomes visible in public DNS — your record's TTL,
+then up to one interval plus the jitter, which is five minutes and one more with
+the numbers this build declares. Nothing needs to reach MirrorStack for it to
+take effect.
+
+🔴 **A pass that cannot reach a resolver at all does not stop.** It publishes,
+and records a warning. That is deliberate and it is the one place in this
+repository where a failure does not fail closed: folding "I could not look" into
+"you deleted it" would let a nameserver blip on our side release a live
+credential and strand a working domain, so the stop is on an **answer** — the
+name resolved and the proof was not among its values — never on the absence of
+one. `internal/intent`'s `checkProof` is where that asymmetry lives, in about
+five lines, and it is worth reading before you rely on this control.
 
 **Revoke at your provider.** Works whether or not we cooperate, takes effect
 immediately, and returns you to the manual path above rather than breaking the
@@ -357,16 +508,41 @@ domain. Deploys keep working; they just hand you records to add instead of
 adding them.
 
 Everything else in this document is a bound we enforce on ourselves and you can
-read. These two are bounds you enforce on us and we cannot read.
+read — with the two exceptions this file admits rather than omits: the rate
+floor, which is declared here and enforced nowhere, and the legacy record-list
+action, which none of this bounds. These two controls are different in kind:
+they are bounds *you* enforce on *us*, and we cannot read them.
 
-### What runs, and when, is public as well
+### What runs, and when, is declared here — and enforced nowhere
 
 It is not enough for this repository to own every *decision* about your zone if
-the schedule that fires them lives somewhere you cannot see. The loop that
-re-derives, re-checks your proof and publishes what is missing runs from here, on
-a clock that is declared here — so "how often could MirrorStack touch my zone,
-and under what conditions" is answerable from this repository rather than from a
-support reply.
+the schedule that fires them lives somewhere you cannot see. So the clock is
+declared here, in `internal/schedule`: the interval, the jitter, the floor and
+the backoff, as executable constants, and published again as fields on the
+`capabilities()` answer so the two can be compared without cloning anything.
+
+🔴 **The declaration is not a control.** This service holds neither the list of
+registrations nor a clock to walk it with. MirrorStack's private half decides
+when to call, and `advance` publishes as fast as it is invoked — nothing here
+slows a caller that loops.
+
+That cannot be fixed from inside this repository without giving up something
+worth more. Enforcing a floor means remembering when a registration was last
+touched. That is either a database — the one thing this service does not have,
+and the property that lets you read it end to end in an afternoon — or a
+timestamp in a sealed envelope the caller stores and hands back. The second is
+worse than nothing: an envelope the caller keeps can be replayed from an older
+copy, and rolling back a "last touched" grants *more* frequency, not less. It is
+the same rollback argument the unsolved problem below turns on, pointed the same
+way.
+
+What the declaration does buy is falsifiability. The numbers are published, so a
+repair that runs more often than they say is a breach of something written down
+rather than an argument about what is reasonable — and where your provider logs
+API *access* and not only changes, you can check the rate against your own logs
+instead of against our word. Where it logs changes only, the part you cannot
+check is the quiet pass: one that finds everything correct writes nothing and
+leaves no trace in your zone at all.
 
 ### The one we have not solved
 

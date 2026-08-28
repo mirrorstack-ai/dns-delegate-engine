@@ -156,14 +156,34 @@ func Required(l lane.Lane) bool {
 // printed on the page. It deliberately does NOT bind the identity — a
 // derive.Plan carries none, so the page never shows one, and a token asserting
 // the customer acknowledged something they were not shown would claim more than
-// it can support. The identity binding comes from the caller instead, and it is
-// the caller's obligation:
+// it can support. The identity binding comes from the sealed registration the
+// reference was minted into, and reaching it is the caller's obligation:
 //
-// 🔴 VERIFY AGAINST THE NONCE OUT OF THE SEALED STATE, NEVER ONE THE CALLER
-// SENT. internal/sealed's AuthState carries the lane, the identity, the anchor
-// and the nonce together, under a ten-minute TTL. Checking the token against
-// that nonce is what makes this an agreement to one authorization attempt rather
-// than a value that can be kept and replayed against a different one.
+// 🔴 VERIFY AGAINST THE NONCE OUT OF THE SEALED REGISTRATION, NEVER ONE THE
+// CALLER SENT. sealed.Registration.ConsentNonce is minted when the domain is
+// registered and sealed in with the lane, the identity and the anchor. A
+// reference that arrives beside the token is a pair whose halves are both the
+// caller's, and a MAC over two values the caller chose is a signature on its own
+// statement: one acknowledgement would then satisfy every later authorization on
+// that anchor, forever, with the customer shown nothing again.
+//
+// 🔴 AND THE LIMIT THAT REMAINS, BECAUSE IT IS REAL AND CHECKABLE. Bound to the
+// registration, an acknowledgement is scoped to ONE REGISTRATION — not to one
+// authorization attempt. The same token verifies for every authorization of that
+// same domain, on that same lane, for as long as the registration exists. A
+// customer who agreed once and then abandoned the connect can have the grant
+// authorized later without seeing the page again.
+//
+// It is not an oversight and it cannot be closed here. Single use needs a
+// counter, and a counter has to live somewhere: this service owns no database
+// (CLAUDE.md, DESIGN §7), and putting one inside a sealed envelope would not
+// help, because the private half hands the envelope back and could hand back the
+// EARLIER one — a rollback in the direction that grants more authority, which is
+// the one direction sealed's replay note says the stateless design must never
+// depend on. The bounds that do hold are the registration's: re-registering the
+// domain mints a new reference and invalidates every acknowledgement for the old
+// one, and the two controls that actually stop a live grant are the customer's —
+// delete the ownership proof, or revoke at the provider (DESIGN §8).
 func Token(s *grantcrypto.Sealer, nonce, anchor string) (string, error) {
 	if s == nil {
 		// No keyset means no acknowledgement — never an acknowledgement under an

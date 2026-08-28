@@ -53,12 +53,28 @@ jobs:
           role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
           aws-region: ap-northeast-1
 
+      # 🔴 -X main.commit IS WHAT MAKES THE DEPLOYMENT AUDITABLE, AND THIS IS THE
+      # ONLY PLACE IT IS SET.
+      #
+      # health() reports this sha, which is the step a reader takes from "I
+      # audited this repository" to "this is the code answering me" — every other
+      # property the repository claims is a fact about source until that step
+      # exists. A build without the flag reports "unknown", which is honest and
+      # useless; dropping the flag therefore breaks nothing loudly and quietly
+      # makes docs/DESIGN.md §4 false. cmd/dns-delegate-api asserts this line.
+      #
+      # $GITHUB_SHA is the commit this workflow checked out, and so the commit
+      # whose artifact the next steps upload under that same sha. Never a tag,
+      # never a short sha, never a value from an input — the stamp and the
+      # artifact path have to name the same thing or neither can be looked up.
       - name: Build service zips
         run: |
           mkdir -p dist
           for name in dns-delegate-api; do
             GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
-              go build -tags lambda.norpc -ldflags="-s -w" -o bootstrap "./cmd/$name"
+              go build -tags lambda.norpc \
+                -ldflags="-s -w -X main.commit=$GITHUB_SHA" \
+                -o bootstrap "./cmd/$name"
             zip -j "dist/$name.zip" bootstrap
             rm bootstrap
           done

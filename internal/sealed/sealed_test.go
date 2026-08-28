@@ -22,6 +22,7 @@ const (
 	otherIdentity = "b41d9e02-6c53-4a1f-9b7e-2d8c4f6a0e15"
 	testIssuedAt  = int64(1756000000)
 	testNonce     = "00112233445566778899aabbccddeeff"
+	testReference = "ffeeddccbbaa99887766554433221100"
 	testKeyID     = "test-k1"
 )
 
@@ -93,6 +94,13 @@ func TestRegistrationRoundTripsOnEveryLane(t *testing.T) {
 	for _, wire := range laneWireValues {
 		t.Run(wire, func(t *testing.T) {
 			want := testRegistration(t, wire)
+			// The consent reference rides along on the lane that has a page, and
+			// it is the value an acknowledgement is a MAC over — a round trip
+			// that dropped it would leave every wildcard authorization refusing
+			// a token the customer genuinely gave.
+			if wire == "org_app_domain" {
+				want.ConsentNonce = testReference
+			}
 			envelope, keyID, err := SealRegistration(sealer, want)
 			if err != nil {
 				t.Fatalf("seal: %v", err)
@@ -273,6 +281,13 @@ func TestSealRefusesEveryValueOpenWouldRefuse(t *testing.T) {
 		}},
 		{"no issue time", func(r *Registration) { r.IssuedAt = 0 }},
 		{"a negative issue time", func(r *Registration) { r.IssuedAt = -1 }},
+		// Absent is legitimate — two lanes have no consent page. Present and
+		// malformed is not: it would be MACed into an acknowledgement over a
+		// value this service never issued.
+		{"a short consent reference", func(r *Registration) { r.ConsentNonce = "abcd" }},
+		{"a consent reference that is not hex", func(r *Registration) {
+			r.ConsentNonce = strings.Repeat("z", 2*nonceBytes)
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			broken := valid
@@ -322,6 +337,7 @@ func TestOpenRefusesADecryptableEnvelopeThatNoLongerValidates(t *testing.T) {
 		// this API. A field this build does not recognise is refused rather
 		// than dropped, so adding one without bumping Version fails loudly.
 		{"a field this build does not know", `{"version":1,"lane":"org_platform_domain","identity":"` + testIdentity + `","anchor":"example.com","issuedAt":1756000000,"stage":"published"}`},
+		{"a malformed consent reference", `{"version":1,"lane":"org_app_domain","identity":"` + testIdentity + `","anchor":"example.com","consentNonce":"not-hex","issuedAt":1756000000}`},
 		{"two values in one plaintext", `{"version":1,"lane":"org_platform_domain","identity":"` + testIdentity + `","anchor":"example.com","issuedAt":1756000000}{"version":1}`},
 		{"not JSON at all", `example.com`},
 	} {
@@ -381,6 +397,26 @@ func TestGoldenEnvelopePlaintext(t *testing.T) {
 		`","issuedAt":1756000000,"consentAck":true}`
 	if got != want {
 		t.Fatalf("auth state plaintext\n got: %s\nwant: %s", got, want)
+	}
+
+	// A wildcard registration carries one more field, and its position in the
+	// plaintext is part of the same contract. It is `omitempty` on purpose: the
+	// two lanes that owe no acknowledgement seal exactly the bytes above, so
+	// adding this control did not restate every stored registration.
+	withConsent := testRegistration(t, "org_app_domain")
+	withConsent.ConsentNonce = testReference
+	consentEnvelope, _, err := SealRegistration(sealer, withConsent)
+	if err != nil {
+		t.Fatalf("seal registration with a consent reference: %v", err)
+	}
+	got, err = sealer.Open(consentEnvelope, registrationAAD)
+	if err != nil {
+		t.Fatalf("open registration plaintext: %v", err)
+	}
+	want = `{"version":1,"lane":"org_app_domain","identity":"` + testIdentity +
+		`","anchor":"example.com","consentNonce":"` + testReference + `","issuedAt":1756000000}`
+	if got != want {
+		t.Fatalf("registration plaintext\n got: %s\nwant: %s", got, want)
 	}
 
 	// The wire lane values are half of that contract, so pin them too: the Go

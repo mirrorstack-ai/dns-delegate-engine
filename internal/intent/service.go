@@ -1,6 +1,7 @@
 package intent
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -277,9 +278,29 @@ func (s *Service) register(ctx context.Context, l lane.Lane, identity, domain st
 			"%w: the derived anchor %q is not the validated anchor %q", ErrInvalidRequest, plan.Anchor, anchor)
 	}
 
+	// 🔴 THE CONSENT REFERENCE IS MINTED HERE, AND SEALED IN.
+	//
+	// The acknowledgement a customer gives on this service's own consent page is
+	// a MAC over (reference, anchor). If the reference travelled beside the token
+	// on the authorize request, the caller would hold both halves — a MAC over
+	// two values it chose — and one acknowledgement would authorize every future
+	// wildcard grant on the anchor, forever, with the customer shown nothing
+	// again. Minting it at registration is what makes it a value THIS service
+	// issued for THIS domain. consent.Required is the one rule for which lanes
+	// have a page at all, so an unrecognised lane gets a reference rather than
+	// silently getting none.
+	consentNonce := ""
+	if consent.Required(l) {
+		consentNonce, err = sealed.NewNonce()
+		if err != nil {
+			return RegisteredResponse{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
+		}
+	}
+
 	sealer := s.sealer(ctx)
 	envelope, keyID, err := sealed.SealRegistration(sealer, sealed.Registration{
-		Lane: l, Identity: canonical, Anchor: anchor, IssuedAt: time.Now().Unix(),
+		Lane: l, Identity: canonical, Anchor: anchor,
+		ConsentNonce: consentNonce, IssuedAt: time.Now().Unix(),
 	})
 	if err != nil {
 		return RegisteredResponse{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
@@ -386,9 +407,25 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (VerifyResponse
 			Explain: check.observation.Explain,
 		},
 	}
-	// A lookup that did not complete is an error, not a negative. Reporting it as
-	// "not verified" would make a resolver blip indistinguishable from a customer
-	// who never published, and the two have opposite answers.
+	// 🔴 A LOOKUP THAT DID NOT COMPLETE IS NOT A NEGATIVE — AND IT IS NOT AN RPC
+	// ERROR EITHER.
+	//
+	// Reporting it as "not verified" would make a resolver blip indistinguishable
+	// from a customer who never published, and the two have opposite remedies. But
+	// returning it as an error throws the observation away at the transport, which
+	// answers the customer's question with `{"ok":false,"code":"internal"}` — the
+	// name, the value to publish and what was actually seen all discarded, and a
+	// fault implied on our side or theirs when neither was at fault. A failed
+	// lookup is a fact about the world; observe.Proof populates the observation
+	// precisely so it can be rendered.
+	//
+	// So the RPC succeeds, Verified stays FALSE, and Unresolved says why. The two
+	// are set together, in that order, because the one thing this path must never
+	// do is report a proof as present on an answer that never arrived.
+	if lookupFailed(err) {
+		out.Verified, out.Unresolved = false, true
+		return out, nil
+	}
 	return out, err
 }
 
@@ -412,7 +449,14 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (VerifyResponse
 // minted one, everybody who could fetch the page — the private half included —
 // would hold a customer's agreement to a standing wildcard without a customer
 // having read a word of it.
-func (s *Service) ConsentPage(ctx context.Context, registration, nonce string) (string, error) {
+//
+// 🔴 IT TAKES NO REFERENCE EITHER. The reference printed on the page comes out
+// of the sealed registration, because that is the value Authorize checks the
+// acknowledgement against: a page rendered with any other reference would
+// collect an agreement that could never be verified, and a page whose reference
+// the caller chose would collect one that verifies against nothing this service
+// issued. There is one reference per registration and no way to supply another.
+func (s *Service) ConsentPage(ctx context.Context, registration string) (string, error) {
 	reg, err := s.openRegistration(ctx, registration)
 	if err != nil {
 		return "", err
@@ -425,6 +469,16 @@ func (s *Service) ConsentPage(ctx context.Context, registration, nonce string) (
 		return "", fmt.Errorf("%w: %s publishes a closed, listable record set and has no consent page",
 			ErrInvalidRequest, reg.Lane)
 	}
+	// Fail closed rather than rendering a page nobody could act on. A lane-2
+	// registration with no sealed reference is one minted by a build without
+	// this control; serving it would show a customer the disclosure, take their
+	// agreement, and then refuse the acknowledgement at Authorize with no way for
+	// anyone to tell why. Re-registering the domain mints one.
+	if reg.ConsentNonce == "" {
+		return "", fmt.Errorf(
+			"%w: this registration carries no consent reference, so no acknowledgement for it could ever be verified",
+			ErrInvalidRequest)
+	}
 	plan, err := s.derivedPlan(ctx, reg)
 	if err != nil {
 		return "", err
@@ -434,7 +488,7 @@ func (s *Service) ConsentPage(ctx context.Context, registration, nonce string) (
 	// deployment did not mint is the caller's, a plan shape the page cannot
 	// describe is ours — and flattening them would report a derivation fault as a
 	// bad request.
-	return consent.Page(plan, nonce)
+	return consent.Page(plan, reg.ConsentNonce)
 }
 
 // Authorize returns the provider's consent URL, and mints the OAuth state itself.
@@ -486,11 +540,19 @@ func (s *Service) Authorize(ctx context.Context, req AuthorizeRequest) (Authoriz
 	// for themselves: the other two lanes publish a closed, listable set of
 	// names, and this one publishes a rule that covers every name they have not
 	// otherwise defined. So the description they act on comes from here rather
-	// than from a console this repository cannot vouch for. The token is
-	// ciphertext this service issued; a caller can echo it and cannot mint it.
+	// than from a console this repository cannot vouch for. The token is a MAC
+	// under this deployment's keyset; a caller can echo it and cannot mint it.
+	//
+	// 🔴 BOTH SIDES OF THE COMPARISON COME OUT OF THE SEAL. The reference is the
+	// registration's, minted at register() and never a request field, so the
+	// caller supplies one half of a MAC and never both. A registration carrying
+	// no reference — sealed by a build without this control — refuses here as
+	// well, because consent.Verify rejects an empty component rather than MACing
+	// over one: the fail-closed direction, and the only safe one, since the
+	// alternative is a wildcard authorized against a value nobody issued.
 	acknowledged := false
 	if consent.Required(reg.Lane) {
-		if !consent.Verify(sealer, req.ConsentNonce, reg.Anchor, req.ConsentToken) {
+		if !consent.Verify(sealer, reg.ConsentNonce, reg.Anchor, req.ConsentToken) {
 			return AuthorizeResponse{}, fmt.Errorf(
 				"%w: %s requires this service's consent page to have been served and acknowledged for %q",
 				ErrConsentRequired, reg.Lane, reg.Anchor)
@@ -579,19 +641,38 @@ func (s *Service) Complete(ctx context.Context, req CompleteRequest) (PassRespon
 	if err != nil {
 		return PassResponse{}, err
 	}
-	// 🔴 THE CROSS-BOUNDARY INTEGRITY CHECK, AND IT RUNS BEFORE THE EXCHANGE.
-	// Validate re-derives every invariant and compares the digest, so a plan that
-	// does not reproduce what the customer reviewed is refused while the
-	// authorization code is still unspent and no credential exists.
-	if err := review.Validate(want); err != nil {
-		slog.Error("intent: refusing a plan that does not reproduce the reviewed digest",
+	// 🔴 THE CROSS-BOUNDARY INTEGRITY CHECK, AND IT RUNS BEFORE THE EXCHANGE. A
+	// plan that does not reproduce what the customer reviewed is refused while
+	// the authorization code is still unspent and no credential exists.
+	//
+	// 🔴 IT IS TWO CHECKS AND THEY ARE TWO DIFFERENT SCREENS. Validate is asked
+	// against the snapshot's OWN digest, so the only thing it can still refuse is
+	// the snapshot itself — a record outside the anchor, an unnormalized row, a
+	// broken envelope. That is plan_invalid: this is a bug and retrying cannot
+	// help. A well-formed plan whose digest no longer matches the one the
+	// customer reviewed is the opposite answer — a routing target or a DCV
+	// identifier changed under a consent screen that was rendered minutes ago —
+	// and the remedy is to re-render and ask again. Reporting that as
+	// plan_invalid tells a caller a stale screen is a defect, and a caller that
+	// believes it may give up on the domain permanently.
+	digest := review.Digest()
+	if err := review.Validate(digest); err != nil {
+		slog.Error("intent: refusing a plan that does not describe a publishable set",
 			"lane", reg.Lane, "anchor", reg.Anchor, "error", err)
 		return PassResponse{}, err
+	}
+	if !bytes.Equal(digest, want) {
+		slog.Warn("intent: the reviewed digest no longer reproduces",
+			"lane", reg.Lane, "anchor", reg.Anchor,
+			"reviewed", hex.EncodeToString(want), "derived", hex.EncodeToString(digest))
+		return PassResponse{}, fmt.Errorf(
+			"%w: the plan derived now does not reproduce the digest the customer reviewed; re-render the plan and authorize again",
+			dnsplan.ErrPlanChanged)
 	}
 
 	out := PassResponse{
 		Records:      recordViews(plan.Items),
-		Digest:       hex.EncodeToString(review.Digest()),
+		Digest:       hex.EncodeToString(digest),
 		GrantSeconds: grantSeconds(reg.Lane),
 	}
 	// The ownership proof is re-checked here too, not only at Authorize. The
@@ -824,8 +905,33 @@ func (s *Service) Orphans(ctx context.Context, req OrphansRequest) (OrphansRespo
 			// Seal before reading, for the same reason write() seals before
 			// publishing: the refresh already rotated the caller's copy, and a
 			// read that fails afterwards must not take the replacement with it.
-			if envelope, keyID, sealErr := s.sealGrant(ctx, token, reg); sealErr == nil {
+			envelope, keyID, sealErr := s.sealGrant(ctx, token, reg)
+			if sealErr == nil {
 				out.SealedToken, out.KeyID = envelope, keyID
+			} else {
+				// 🔴 A SEALING FAILURE HERE IS THE 2026-08-24 FAILURE, IN A
+				// FUNCTION THAT ONLY READS. The refresh above rotated the grant,
+				// so the caller's stored token is already dead; if the
+				// replacement cannot be sealed there is nothing to hand back,
+				// and a report that said rotated:true with an empty sealedToken
+				// and no failure would leave a LIVE grant at the provider that
+				// nothing in MirrorStack can ever release. Dropping sealErr is
+				// how that happens silently, so it is logged, the grant is ended
+				// where it lives, and the response says so — the same three
+				// steps write() takes, for the same reason.
+				slog.Warn("intent: could not seal the delegated grant while reporting orphans; revoking instead of holding",
+					"lane", reg.Lane, "anchor", reg.Anchor, "error", sealErr)
+				s.revokeToken(ctx, cfg, token, reg, "the grant could not be held")
+				out.Revoked = true
+				out.Failure = &Failure{
+					Code: FailureResealFailed, Retry: false,
+					Message: "the rotated grant could not be held, so it has been revoked; this report is from public DNS",
+				}
+				// And it is not used to read afterwards. A credential we have
+				// just ended is not one to spend a request on, and the public-DNS
+				// path below is a complete answer rather than a degraded one —
+				// it is what every customer who never authorized already gets.
+				token = nil
 			}
 		}
 	}
@@ -974,6 +1080,22 @@ func stopped(out PassResponse, check proofCheck) PassResponse {
 	return out
 }
 
+// lookupFailed reports an error that belongs to the RESOLVER rather than to us.
+//
+// Everything this service could have got wrong is one of three sentinels: no
+// keyset or no resolver wired (ErrUnavailable), an anchor too deep to carry a
+// proof (ErrInvalidRequest), or a malformed observation request — including a
+// keyset that produced no accepted value at all (observe.ErrObserve). Those stay
+// RPC errors, because a report about the customer's zone produced by a service
+// that was not in a position to look is not a report. What is left is a
+// well-formed lookup that did not come back, which is an answer about the world.
+func lookupFailed(err error) bool {
+	return err != nil &&
+		!errors.Is(err, ErrUnavailable) &&
+		!errors.Is(err, ErrInvalidRequest) &&
+		!errors.Is(err, observe.ErrObserve)
+}
+
 // ─── derivation, relay and the two snapshots ────────────────────────────────
 
 func (s *Service) openRegistration(ctx context.Context, envelope string) (sealed.Registration, error) {
@@ -1027,9 +1149,12 @@ func deriveError(err error) error {
 // relayInto merges the records AWS and Cloudflare owe into a derived plan.
 //
 // 🔴 A RELAY FAILURE IS A WARNING, NOT A REFUSAL. Record 6 — the DCV pointer — is
-// derived here and is what actually gets a certificate issued; blocking it on an
-// ACM read failure would couple the fast path to the slow one and leave a domain
-// unrouted over a permission problem on our side. So the pass publishes what it
+// derived here and is what gets the CLOUDFLARE EDGE certificate issued, so a
+// lane still gets TLS at the edge while ACM is unreadable. Lane 1's AWS
+// certificate is a SECOND certificate and does not validate until record 5 is
+// relayed; until then that lane is served at the edge and is not complete.
+// Blocking record 6 on an ACM read failure would couple the fast path to the
+// slow one and leave a domain unrouted over a permission problem on our side. So the pass publishes what it
 // can and says what it could not read. Swallowing the error instead would make a
 // relay that has been broken for a week indistinguishable from an upstream that
 // is merely slow, which is exactly the class of silence this repository exists to

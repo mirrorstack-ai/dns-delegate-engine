@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -109,6 +110,66 @@ func TestHealthIsTruthfulAboutDelegation(t *testing.T) {
 	// out of rotation over a capability it does not need for the console lane.
 	if got := readyDispatcher().health(context.Background()); !got.OK || got.Delegation != "no-keyset" {
 		t.Fatalf("a client without a keyset is healthy but cannot hold: %#v", got)
+	}
+}
+
+// 🔴 THE DEPLOYED COMMIT IS WHAT MAKES EVERY OTHER CLAIM CHECKABLE.
+//
+// docs/DESIGN.md §4 says health() publishes it, and the reason is that nothing
+// in this repository is a fact about a RUNNING service until a reader can tell
+// that the code they audited is the code answering them. So it must be on the
+// wire, on every answer — a deployment that is refusing traffic is exactly when
+// somebody needs to know which code is refusing — and it must degrade to
+// "unknown" rather than to something plausible. A wrong-but-well-formed sha is
+// worse than none: it gets looked up, missed, and either discredits the whole
+// surface or sends an auditor to the wrong tree.
+//
+// `go test` passes no -ldflags, so this binary IS the unstamped case, which is
+// the half of the contract Go can pin. TestPublishWorkflowStampsTheCommit pins
+// the other half.
+func TestHealthPublishesTheDeployedCommit(t *testing.T) {
+	if commit != "unknown" {
+		t.Fatalf("an unstamped build must report %q, got %q", "unknown", commit)
+	}
+
+	// Healthy and unhealthy alike.
+	for _, d := range []*dispatcher{{}, readyDispatcher()} {
+		if got := d.health(context.Background()).Commit; got != commit {
+			t.Errorf("health must carry the build stamp on every answer, got %q", got)
+		}
+	}
+
+	// On the WIRE, not merely on the struct: DESIGN §4's claim is about what a
+	// caller can read, and a field with no JSON tag publishes nothing.
+	body, err := json.Marshal(readyDispatcher().health(context.Background()))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded["commit"] != "unknown" {
+		t.Errorf("want commit on the health envelope, got %s", body)
+	}
+}
+
+// 🔴 THE STAMP IS ONLY REAL IF THE WORKFLOW PASSES IT, AND NOTHING IN GO CHECKS
+// THAT.
+//
+// `commit` defaults to "unknown" and is set by the linker at the one build that
+// produces a deployed artifact. Delete the -X from publish.yml and every test
+// above still passes, `make check` still passes, the deploy still succeeds — and
+// production reports "unknown" forever while docs/DESIGN.md §4 quietly becomes
+// false. This is the arming path, asserted from the only place it can be.
+func TestPublishWorkflowStampsTheCommit(t *testing.T) {
+	raw, err := os.ReadFile("../../.github/workflows/publish.yml")
+	if err != nil {
+		t.Fatalf("read publish.yml: %v", err)
+	}
+	if !strings.Contains(string(raw), "-X main.commit=$GITHUB_SHA") {
+		t.Error("publish.yml no longer stamps main.commit: the deployed build would report \"unknown\", " +
+			"and a reader could not tell that the code they audited is the code running")
 	}
 }
 
@@ -385,7 +446,7 @@ func TestConsentPageIsGatedLikeEveryOtherRoute(t *testing.T) {
 	d, sealer := intentDispatcher(t)
 	h := d.httpHandler("s3cret")
 
-	target := consentURL(registrationFor(t, sealer, lane.OrgAppDomain, "example.net"), "")
+	target := consentURL(registrationFor(t, sealer, lane.OrgAppDomain, "example.net"))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
 	if rec.Code != http.StatusUnauthorized {
@@ -400,23 +461,23 @@ func TestConsentPageRefusalsAreSeparatedByAudience(t *testing.T) {
 	if got := gatedGet(h, "/consent").Code; got != http.StatusBadRequest {
 		t.Errorf("a request with no registration is the caller's fault: want 400, got %d", got)
 	}
-	if got := gatedGet(h, consentURL("not-an-envelope", "")).Code; got != http.StatusBadRequest {
+	if got := gatedGet(h, consentURL("not-an-envelope")).Code; got != http.StatusBadRequest {
 		t.Errorf("an envelope this deployment cannot open is the caller's fault: want 400, got %d", got)
 	}
 	// 🔴 The closed lanes publish a listable set, so a console can show it and
 	// this page must refuse. Rendering it would tell a customer their
 	// four-record, 24-hour grant is a standing wildcard.
 	closed := registrationFor(t, sealer, lane.OrgPlatformDomain, "example.com")
-	if got := gatedGet(h, consentURL(closed, "")).Code; got != http.StatusBadRequest {
+	if got := gatedGet(h, consentURL(closed)).Code; got != http.StatusBadRequest {
 		t.Errorf("org_platform_domain has no consent page: want 400, got %d", got)
 	}
 
 	// A deployment that cannot open envelopes at all is OURS, not the caller's.
 	unwired := &dispatcher{intents: &intent.Service{}}
-	if got := gatedGet(unwired.httpHandler("s3cret"), consentURL("anything", "")).Code; got != http.StatusServiceUnavailable {
+	if got := gatedGet(unwired.httpHandler("s3cret"), consentURL("anything")).Code; got != http.StatusServiceUnavailable {
 		t.Errorf("a deployment with no keyset is unavailable, not a bad request: got %d", got)
 	}
-	if got := gatedGet((&dispatcher{}).httpHandler("s3cret"), consentURL("anything", "")).Code; got != http.StatusServiceUnavailable {
+	if got := gatedGet((&dispatcher{}).httpHandler("s3cret"), consentURL("anything")).Code; got != http.StatusServiceUnavailable {
 		t.Errorf("no intent surface wired must be 503, got %d", got)
 	}
 }
@@ -425,7 +486,7 @@ func TestConsentPageRendersTheWildcardGrant(t *testing.T) {
 	d, sealer := intentDispatcher(t)
 	h := d.httpHandler("s3cret")
 
-	rec := gatedGet(h, consentURL(registrationFor(t, sealer, lane.OrgAppDomain, "example.net"), ""))
+	rec := gatedGet(h, consentURL(registrationFor(t, sealer, lane.OrgAppDomain, "example.net")))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -462,28 +523,63 @@ func TestConsentPageRendersTheWildcardGrant(t *testing.T) {
 	}
 }
 
-// A supplied reference is used verbatim, so the same page can be rendered twice
-// and diffed; an absent one is minted, which is safe precisely because a nonce
-// alone authorizes nothing — it is only the index an acknowledgement would be
-// bound to, and this route mints no acknowledgement.
-func TestConsentPageUsesTheSuppliedReference(t *testing.T) {
+// 🔴 THE REFERENCE THE PAGE IS BOUND TO COMES OUT OF THE SEALED REGISTRATION,
+// AND THE REQUESTER CANNOT CHOOSE IT.
+//
+// An acknowledgement is a MAC over (reference, anchor). If the reference came
+// off the URL, the requester would hold both halves of that pair, and one
+// agreement — given once, by one customer, on one screen — would satisfy every
+// later authorization on that anchor forever. Sealing it makes the
+// acknowledgement specific to the registration this deployment minted.
+//
+// The failure mode is silent, which is why this is a test rather than a comment:
+// a page rendered against a chosen reference is byte-identical in shape to a
+// correct one, and every other assertion in this file would still pass.
+func TestConsentPageReferenceIsSealedAndUnchoosable(t *testing.T) {
 	d, sealer := intentDispatcher(t)
 	h := d.httpHandler("s3cret")
 	registration := registrationFor(t, sealer, lane.OrgAppDomain, "example.net")
 
-	const reference = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
-	rec := gatedGet(h, consentURL(registration, reference))
+	rec := gatedGet(h, consentURL(registration))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), reference) {
-		t.Error("the supplied reference must appear on the page an acknowledgement is bound to")
+	if !strings.Contains(rec.Body.String(), testConsentReference) {
+		t.Fatal("the page must print the reference sealed into the registration")
 	}
 
-	first := gatedGet(h, consentURL(registration, "")).Body.String()
-	second := gatedGet(h, consentURL(registration, "")).Body.String()
-	if first == second {
-		t.Error("a minted reference must be fresh per render")
+	// Stable across renders: it is sealed, not minted per request. A customer who
+	// reloads the screen must not be agreeing to a different reference than the
+	// one Authorize will verify their acknowledgement against.
+	if first, second := gatedGet(h, consentURL(registration)).Body.String(),
+		gatedGet(h, consentURL(registration)).Body.String(); first != second {
+		t.Error("the sealed reference must not change between renders")
+	}
+
+	// 🔴 And a reference on the URL must not be honoured. This is the exact
+	// regression: `?nonce=` used to select it.
+	chosen := "00112233445566778899aabbccddeeff"
+	body := gatedGet(h, consentURL(registration)+"&nonce="+chosen).Body.String()
+	if strings.Contains(body, chosen) {
+		t.Error("🔴 the route honoured a requester-chosen reference: one acknowledgement would replay forever")
+	}
+	if !strings.Contains(body, testConsentReference) {
+		t.Error("the sealed reference must survive a nonce on the query string")
+	}
+}
+
+// 🔴 A LANE-2 REGISTRATION WITH NO SEALED REFERENCE IS REFUSED, NOT RENDERED.
+//
+// Such an envelope was minted by a build without this control. Rendering it
+// would show a customer the disclosure, take their agreement, and then refuse
+// the acknowledgement at Authorize with nothing anywhere saying why.
+func TestConsentPageRefusesARegistrationWithNoSealedReference(t *testing.T) {
+	d, sealer := intentDispatcher(t)
+	h := d.httpHandler("s3cret")
+
+	unreferenced := sealRegistration(t, sealer, lane.OrgAppDomain, "example.net", "")
+	if got := gatedGet(h, consentURL(unreferenced)).Code; got != http.StatusBadRequest {
+		t.Errorf("a registration carrying no consent reference must be refused: want 400, got %d", got)
 	}
 }
 
@@ -513,10 +609,30 @@ func intentDispatcher(t *testing.T) (*dispatcher, *grantcrypto.Sealer) {
 	}}, sealer
 }
 
+// testConsentReference is a 32-hex-character reference, the only shape
+// sealed.Registration accepts. Fixed rather than minted so a test can assert the
+// page carries THIS value and not merely some value.
+const testConsentReference = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
+// registrationFor mirrors what the register intent seals: a consent reference on
+// the lane that has a consent page, and none on the lanes that publish a closed,
+// listable set. Sealing one on every lane would hide the refusal below.
 func registrationFor(t *testing.T, s *grantcrypto.Sealer, l lane.Lane, anchor string) string {
 	t.Helper()
+	reference := ""
+	if consent.Required(l) {
+		reference = testConsentReference
+	}
+	return sealRegistration(t, s, l, anchor, reference)
+}
+
+func sealRegistration(
+	t *testing.T, s *grantcrypto.Sealer, l lane.Lane, anchor, reference string,
+) string {
+	t.Helper()
 	envelope, _, err := sealed.SealRegistration(s, sealed.Registration{
-		Lane: l, Identity: testIdentity, Anchor: anchor, IssuedAt: time.Now().Unix(),
+		Lane: l, Identity: testIdentity, Anchor: anchor,
+		ConsentNonce: reference, IssuedAt: time.Now().Unix(),
 	})
 	if err != nil {
 		t.Fatalf("SealRegistration: %v", err)
@@ -526,12 +642,12 @@ func registrationFor(t *testing.T, s *grantcrypto.Sealer, l lane.Lane, anchor st
 
 // consentURL builds the route's query with proper escaping: a sealed envelope is
 // base64 and can carry characters a hand-built query string would corrupt.
-func consentURL(registration, nonce string) string {
-	values := url.Values{"registration": {registration}}
-	if nonce != "" {
-		values.Set("nonce", nonce)
-	}
-	return "/consent?" + values.Encode()
+//
+// It takes ONE argument on purpose. The reference an acknowledgement is MACed
+// over rides inside the registration, so there is no second parameter for a
+// caller to choose — see TestConsentPageReferenceIsSealedAndUnchoosable.
+func consentURL(registration string) string {
+	return "/consent?" + url.Values{"registration": {registration}}.Encode()
 }
 
 func gatedGet(h http.Handler, target string) *httptest.ResponseRecorder {

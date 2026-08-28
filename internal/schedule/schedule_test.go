@@ -72,9 +72,12 @@ func TestZeroCadenceIsNeverDue(t *testing.T) {
 //
 // This is the shape that matters: a Cadence whose Interval was set below
 // MinInterval — by a bug, a test double, or some future per-lane variation — is
-// exactly the input a caller would use to advance faster than declared. Due
-// takes the LARGER of the two, so the floor holds without anyone remembering to
-// check it at the call site.
+// exactly the input that would advance faster than declared. Due takes the
+// LARGER of the two, so a caller that asks cannot lose the floor by assembling
+// the struct wrong, and no call site has to remember to compare.
+//
+// It binds callers that ask. Nothing in this service makes one ask; see the
+// package comment for why that cannot be fixed from this side.
 func TestMinIntervalIsAHardFloor(t *testing.T) {
 	c := Cadence{Interval: time.Second, MinInterval: time.Minute}
 
@@ -240,12 +243,35 @@ func TestDeclaredSatisfiesItsOwnInvariants(t *testing.T) {
 	if c.Interval <= 0 || c.Jitter <= 0 {
 		t.Fatalf("Interval (%v) and Jitter (%v) must both be positive; the promised tick is their sum", c.Interval, c.Jitter)
 	}
+
+	// 🔴 THE NUMBER WE PUBLISH MUST BE THE NUMBER WE DECLARED. This cadence is
+	// the whole of what a customer can hold us to, and they read it from the
+	// capabilities response, where it is carried as whole seconds. A sub-second
+	// component here would be truncated on the way out, so the file and the API
+	// would state different clocks and the one they can check would be the
+	// weaker of the two — the exact failure this package exists to prevent.
+	for _, d := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"Interval", c.Interval},
+		{"Jitter", c.Jitter},
+		{"MinInterval", c.MinInterval},
+		{"Backoff.First", c.Backoff.First},
+		{"Backoff.Max", c.Backoff.Max},
+	} {
+		if d.value%time.Second != 0 {
+			t.Fatalf("%s is %v, which is not a whole number of seconds; it is published as int64 seconds and would be truncated",
+				d.name, d.value)
+		}
+	}
 }
 
 // Spread has to be bounded, non-negative, stable, and actually spread. The
 // non-negative half is the load-bearing one: an offset that could be negative
-// would be a route around MinInterval, which is the only bound in this package
-// a caller cannot otherwise weaken.
+// would put two published numbers in contradiction — a spread that pulled a pass
+// earlier than the declared floor would leave a customer unable to hold us to
+// either one.
 func TestSpreadIsBoundedStableAndSpreading(t *testing.T) {
 	c := Declared()
 
@@ -263,7 +289,7 @@ func TestSpreadIsBoundedStableAndSpreading(t *testing.T) {
 	for _, key := range keys {
 		got := c.Spread(key)
 		if got < 0 {
-			t.Fatalf("Spread(%q) = %v; a negative offset would pull a pass EARLIER and defeat MinInterval", key, got)
+			t.Fatalf("Spread(%q) = %v; a negative offset would pull a pass EARLIER than the declared floor", key, got)
 		}
 		if got >= c.Jitter {
 			t.Fatalf("Spread(%q) = %v, which is outside [0, Jitter=%v); the promised tick is Interval + Jitter", key, got, c.Jitter)

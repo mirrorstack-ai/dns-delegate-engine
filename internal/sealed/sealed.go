@@ -7,9 +7,9 @@
 // This service owns no table, opens no connection and ships no migration (see
 // CLAUDE.md, and docs/DESIGN.md §7). Every fact that has to survive between two
 // calls — which lane a domain is on, whose it is, which hostname the customer
-// proved — travels as ciphertext that MirrorStack's private half stores and
-// hands back. It can keep an envelope and it can withhold one. It cannot
-// author, edit or reorder one.
+// proved, which reference its consent page was printed with — travels as
+// ciphertext that MirrorStack's private half stores and hands back. It can keep
+// an envelope and it can withhold one. It cannot author, edit or reorder one.
 //
 // Neither envelope holds a secret. They are sealed for INTEGRITY, not
 // confidentiality: the private half already knows the org id and the domain it
@@ -160,6 +160,28 @@ type Registration struct {
 	// opened, exactly as dnsplan.NewSnapshot and dnsplan.Snapshot.Validate do
 	// it, so the two agree on what "the same anchor" means.
 	Anchor string `json:"anchor"`
+
+	// ConsentNonce is the reference printed on this service's own consent page,
+	// and the value an acknowledgement for this domain is a MAC over.
+	//
+	// 🔴 IT IS IN HERE BECAUSE AN ACKNOWLEDGEMENT MUST BE BOUND TO SOMETHING
+	// THE CALLER CANNOT CHOOSE. A reference supplied alongside the token is a
+	// pair the caller controls both halves of, so one acknowledgement — given
+	// once, by one customer, on one screen — would satisfy every later
+	// authorization on that anchor, forever. Sealed here it is a value this
+	// service minted for this registration, and the acknowledgement is scoped
+	// to that registration. What it still does NOT buy is single use; see
+	// consent.Token, which states that limit rather than implying it away.
+	//
+	// `omitempty`, unlike AuthState.ConsentAck below, and the asymmetry is not
+	// an oversight: a bool has an explicit false that an absent field would be
+	// confused with, while an absent reference and an empty one are the same
+	// answer — this lane has no consent page. Keeping it omitted also leaves
+	// the envelopes of the lanes that owe no acknowledgement byte-identical.
+	// WHICH lanes owe one is consent.Required's rule, asked where a
+	// registration is minted; this package only guarantees that the reference
+	// cannot be added, edited or chosen afterwards.
+	ConsentNonce string `json:"consentNonce,omitempty"`
 
 	// IssuedAt records when the domain was registered, in unix seconds. It
 	// bounds nothing: a registration is standing by design, so unlike an auth
@@ -357,21 +379,40 @@ func NewNonce() (string, error) {
 }
 
 func (r Registration) validate() error {
-	return validateSubject(r.Version, r.Lane, r.Identity, r.Anchor, r.IssuedAt)
+	if err := validateSubject(r.Version, r.Lane, r.Identity, r.Anchor, r.IssuedAt); err != nil {
+		return err
+	}
+	// Absent is legitimate — the two lanes that publish a closed, listable set
+	// have no consent page and no reference. Present-but-malformed is not: it
+	// would open, validate on every other field, and then be MACed into an
+	// acknowledgement over a value this service never issued.
+	if r.ConsentNonce == "" {
+		return nil
+	}
+	return validateNonce("consent reference", r.ConsentNonce)
 }
 
 func (a AuthState) validate() error {
 	if err := validateSubject(a.Version, a.Lane, a.Identity, a.Anchor, a.IssuedAt); err != nil {
 		return err
 	}
-	// The nonce is checked for shape because an envelope carrying an empty one
-	// would open, validate on every other field, and quietly have lost the only
-	// property the nonce exists to provide.
-	if len(a.Nonce) != hex.EncodedLen(nonceBytes) {
-		return fmt.Errorf("%w: nonce length", ErrInvalidEnvelope)
+	// Required here, because an envelope carrying an empty one would open,
+	// validate on every other field, and quietly have lost the only property
+	// the nonce exists to provide.
+	return validateNonce("nonce", a.Nonce)
+}
+
+// validateNonce is the shape both nonces share: exactly the hex NewNonce emits.
+// Checked rather than assumed, because both values arrive from a store this
+// service does not own, and both are load-bearing — one makes two
+// authorizations of a registration two different values, the other is what an
+// acknowledgement is bound to.
+func validateNonce(what, nonce string) error {
+	if len(nonce) != hex.EncodedLen(nonceBytes) {
+		return fmt.Errorf("%w: %s length", ErrInvalidEnvelope, what)
 	}
-	if _, err := hex.DecodeString(a.Nonce); err != nil {
-		return fmt.Errorf("%w: nonce encoding", ErrInvalidEnvelope)
+	if _, err := hex.DecodeString(nonce); err != nil {
+		return fmt.Errorf("%w: %s encoding", ErrInvalidEnvelope, what)
 	}
 	return nil
 }

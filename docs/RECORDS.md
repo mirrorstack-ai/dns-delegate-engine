@@ -1,17 +1,28 @@
 # Every record MirrorStack can write in your zone
 
-The complete reference. If a record is not described here, no code path in this
-service can produce it — the vocabulary is `CNAME` and `TXT` only, and every
-record must sit at or under the anchor.
+The complete reference for the intent surface: if a record is not described
+here, nothing on that surface can produce it.
+
+Two bounds hold on **both** surfaces, enforced in `internal/dnsplan` with no
+path around either — the vocabulary is `CNAME` and `TXT` only, and every record
+must sit at or under the anchor. But on the legacy `publish(records)` surface
+the name and the value *inside* those bounds are the caller's to choose, so that
+surface can put a record in your zone that this file does not list. That is the
+defect the rebuild exists to close, and it is why every entry below says which
+surface it is describing.
 
 **The three lanes are listed separately**, because they do not write the same
 records. An app domain never gets an AWS certificate record; a platform domain
 never gets a wildcard; and a domain attached to a single app gets the tightest
 anchor of the three. Read the one you are doing.
 
-Each entry says **who writes it**, because that is changing. See
-[`DESIGN.md`](DESIGN.md) for the shape being built; where the two disagree, this
-file describes what runs **today**.
+Each entry says **who writes it**, and today there are two surfaces to say it
+about. The intent surface [`DESIGN.md`](DESIGN.md) describes is deployed and
+running. The legacy `publish(records)` surface it replaces is **still routed in
+the same binary, behind the same OAuth client**, and MirrorStack's private half
+still calls it. Where a row differs between the two, both are given — and where
+they differ, the weaker one is what bounds the deployment until the legacy
+action is deleted.
 
 ---
 
@@ -30,10 +41,24 @@ delegated write can reach:
 The suffix is matched with a leading dot, so `evilexample.com` is not under
 `example.com`. A wildcard `*.<anchor>` is under it and is allowed.
 
-🔴 **Today the anchor is chosen by MirrorStack's private half, and the record
-that is supposed to prove it is one we write ourselves.** That is the defect
-[`DESIGN.md`](DESIGN.md) exists to fix: the proof becomes yours to publish, and
-is re-checked on every pass.
+Who chooses the anchor, and what proves it, is the one thing that differs most
+between the two surfaces:
+
+🔴 **On the legacy `publish(records)` surface the anchor is chosen by
+MirrorStack's private half, and the record that is supposed to prove it is one
+we write ourselves.** The gate on connecting a hostname is a public lookup for
+that same record, so the proof is satisfied by our own write and proves nothing.
+That surface is still routed.
+
+✅ **On the intent surface the proof is yours.** The anchor comes out of a
+registration this service sealed and the caller cannot edit; the TXT value is
+`HMAC(K, lane‖identity‖anchor)`, recomputed here rather than accepted from
+anyone; and it is re-resolved in public DNS before `authorize` will mint a
+consent URL and again on every later pass. That is what makes the anchor a bound
+you set rather than one we assert.
+
+Until the legacy action is deleted, the first of those is what your zone is
+actually bounded by. See [`DESIGN.md`](DESIGN.md)'s status block.
 
 ---
 
@@ -53,7 +78,7 @@ registers up to four sibling hosts, and this is everything that lands:
 | `_<token>.api.example.com` | CNAME | AWS certificate | ” |
 | `_<token>.apps.example.com` | CNAME | AWS certificate | ” |
 | `_acme-challenge.<host>` | CNAME | certificate | one per host, **permanent** |
-| `_cf-custom-hostname.<host>` | TXT | serving | one per host, when asked for |
+| `_cf-custom-hostname.<host>` | TXT | serving | one per host, when asked for — 🔴 **not produced by this build** |
 
 Three things that table is saying quietly:
 
@@ -79,12 +104,14 @@ with an app whose slug is `blog`:
 | `*.example.net` | CNAME | routing | **one, ever** |
 | `_mirrorstack-challenge.example.net` | TXT | ownership | one |
 | `_acme-challenge.blog.example.net` | CNAME | certificate | **one per app**, permanent |
-| `_cf-custom-hostname.blog.example.net` | TXT | serving | one per app, when asked for |
+| `_cf-custom-hostname.blog.example.net` | TXT | serving | one per app, when asked for — 🔴 **not produced by this build** |
 
 - **The per-app rows appear when that app is deployed**, not when you connect
   the parent. If the parent holds a live authorization they are written for you;
   if not, they are handed back for you to add by hand. Either way the wildcard
   already routes the app, so what is outstanding is only its certificate.
+  🔴 **On this build that hand-back is one record, not the two above**, because
+  the serving proof is not produced — see [serving](#serving--_cf-custom-hostnamehost-txt).
 - **No AWS certificate records on this lane, at all.** An app custom domain is a
   pure Cloudflare-for-SaaS hostname: it stays DNS-only and hands the request
   straight to MirrorStack's own zone, never reaching AWS from your edge. So the
@@ -116,7 +143,7 @@ nothing beside it in that zone is reachable.
 | `_mirrorstack-challenge.example.org` | TXT | ownership | one |
 | `example.org` | CNAME | routing | one |
 | `_acme-challenge.example.org` | CNAME | certificate | one, **permanent** |
-| `_cf-custom-hostname.example.org` | TXT | serving | one, when asked for |
+| `_cf-custom-hostname.example.org` | TXT | serving | one, when asked for — 🔴 **not produced by this build** |
 
 - **No AWS certificate record**, for the same reason as lane 2: it is a
   Cloudflare-for-SaaS hostname that never reaches AWS from your edge.
@@ -126,10 +153,15 @@ nothing beside it in that zone is reachable.
   is closed too. It is also the fastest of the three to finish, having no AWS leg
   to wait on.
 
-> **Not migrated yet.** Today this lane runs on an older path in MirrorStack's
-> private half, where you paste a Cloudflare API token — no anchor, no ownership
-> proof, no digest, and nothing in this repository bounds it. The table above is
-> what it becomes; see [`DESIGN.md`](DESIGN.md).
+> **Half migrated.** The engine side has shipped: `AddAppDomain` is a deployed
+> wire action, it registers this lane exactly as the table above describes, and
+> it feeds the same lifecycle — the same sealed registration, the same ownership
+> proof, the same refusals — that lanes 1 and 2 use. What has not moved is the
+> caller. MirrorStack's private half still runs this lane on the older path,
+> where you paste a Cloudflare API token: no anchor, no ownership proof, no
+> digest, and nothing in this repository bounds it. So the table above is what
+> you get once that switch is thrown, and the pasted token is what you get
+> today. See [`DESIGN.md`](DESIGN.md).
 
 ---
 
@@ -143,10 +175,27 @@ Proves the domain is yours. Everything downstream is gated on it: no custom
 hostname is created until a public lookup returns the token, and no certificate
 record can exist before a custom hostname does.
 
-**Written by** MirrorStack today; **by you, in the target design** — which also
-makes it a stop control: delete it and every write from this service stops.
+**Written by you on the intent surface**, and **by MirrorStack on the legacy
+one.** That difference is the whole point of the rebuild: a proof we write
+ourselves proves nothing.
 
-**Retained.** Deleting it does nothing today; a later re-check fails.
+**On the intent surface it is a stop control.** Delete it and every write from
+this service stops on the first pass after the deletion is visible in public DNS
+— your record's TTL, then up to one interval plus the jitter, which is five
+minutes and one more with the numbers this build declares. Nothing has to reach
+MirrorStack for that to take effect, and nobody has to agree to it.
+
+The limit, stated because it is the interesting case: **a pass that cannot reach
+a resolver at all does not stop.** It publishes and records a warning. A
+nameserver failure must not be read as you saying no — otherwise a blip on our
+side would release a live credential and strand a working domain — so the stop
+is on an answer, never on the absence of one.
+
+**On the legacy surface, deleting it does nothing.** Nothing re-checks it there;
+that is defect two in [`DESIGN.md`](DESIGN.md) §1.
+
+**Retained on both.** Nothing in this service deletes a record, this one
+included.
 
 ### routing · `<host>` or `*.<domain>` CNAME
 
@@ -212,6 +261,23 @@ resolves. Describing them with one word names the wrong blocker.
 
 **Written by** this service, verbatim from Cloudflare. **Retained.**
 
+🔴 **AND NOT PRODUCED BY THIS BUILD, ON ANY LANE.** The relay that would fetch
+it exists in `internal/relay` and nothing wires it: it needs MirrorStack's own
+Cloudflare API token and the id of the SaaS zone the custom hostname sits in,
+and that zone differs between the org lane and the app lane while the field that
+would hold it does not. Both have to be settled before it can be filled in.
+
+Two consequences worth being blunt about. **Every lane can therefore land in the
+526-with-a-healthy-certificate state above** — the row that makes this the
+hardest failure here to diagnose is the row that is missing. And a
+`BindAppToOrgAppDomain` that falls back to the manual path hands you **one**
+record where lane 2's table lists two; the `_acme-challenge` pointer is the one
+you get.
+
+It is left unwired rather than approximated because an absent row is visibly
+incomplete and an invented one is confidently wrong. Nothing else in a plan is
+affected: everything derivable is still published.
+
 ---
 
 ## When a name is already in use
@@ -227,11 +293,53 @@ the only sequence in which the change was ever yours to make.
 The one exception is a record that is **already ours**, same target, which we
 repair in place. That is what lets a half-finished connect converge.
 
+🔴 **And that repair can turn your proxy off.** "Already ours" is matched on the
+record's **value** alone, so a CNAME carrying our target with *your* proxy
+switched on is ours, and the repair rewrites it DNS-only. It is the one place in
+this service that overwrites a deliberate choice you made: "we only ever add" is
+true of names, and it is not true of this flag.
+
+It is also required for delegation to work at all. A proxied record in **your**
+zone is flattened at **your** edge — the name answers with addresses instead of
+following the delegation, so the request never reaches MirrorStack's zone, and
+issuance, or a renewal months later, fails with every dashboard on both sides
+still green. Cloudflare accepts `proxied: true` on these names without an error,
+which is what makes leaving it a silent failure rather than a rejected write.
+Nothing this service derives is ever proxied (`internal/derive` ships that as a
+one-line rule with no path around it), and the reconciler compares the flag in
+**both** directions rather than assuming grey is always right, so it repairs
+toward what the plan says rather than toward one preferred state.
+
+If you need one of these names proxied at your own edge, delegation cannot give
+you that on either path — the flattening is your edge's behaviour, not ours.
+
 Two honest limits: the check compares records of the **same type**, so an `A`
 record where the plan wants a `CNAME` is left for your provider to reject rather
 than caught here; and TXT records always **add** beside yours, never replacing
 them — which is why a TXT can never destroy an existing one, and also why
 containment cannot bound a TXT's value.
+
+---
+
+## Which zone we write into
+
+The zone is located by asking your provider which zone holds **the first record
+in the plan**, not by asking which zone holds the anchor. The most specific
+authorized zone wins.
+
+For almost every customer those are the same zone and nothing about this is
+visible. The case where they are not: you run `account.example.com` as its
+**own** delegated zone, separate from `example.com`. Lane 1's plan begins with a
+record under `account.`, so that zone is the one selected — and the writes for
+`api.`, `apps.` and `cdn.`, which live in the other zone, are then attempted
+where your credential is not authoritative, and fail.
+
+**That is a failure and not a compromise.** Nothing lands outside the anchor:
+containment is checked when the plan is built and re-checked inside the
+publisher, so the wrong zone means refused writes rather than writes in the
+wrong place. But it is a confusing failure — the error names a record and a
+provider response, not the split-zone setup that caused it — and it is worth
+knowing before you connect a domain whose subdomains are delegated separately.
 
 ---
 
@@ -244,9 +352,30 @@ containment cannot bound a TXT's value.
 | the OAuth client | — | ✅ |
 | a database | every row | **none** |
 
-The envelope is bound to the organization, the row and the anchor, so it cannot
-be moved to another organization, another domain, or a wider anchor. Any of those
-fails to authenticate, which releases the grant rather than widening it.
+The envelope is bound, by the AEAD's associated data, to what identifies whose
+grant it is — so it cannot be moved to another organization, another domain, or
+a wider anchor. Any of those fails to authenticate, which releases the grant
+rather than widening it. The bindings differ by surface:
+
+| surface | the sealed grant is bound to |
+|---|---|
+| legacy `publish(records)` | the organization, the row, the anchor |
+| intent | **the lane**, the identity — an org id on lanes 1 and 2, an **app** id on lane 3 — and the anchor |
+
+🔴 **The lane is the binding the legacy form had no way to express.** One org can
+connect the same domain on two lanes. Those are two separate consents, two
+separate ownership proofs and two separate grants — and without the lane inside
+the seal, a grant obtained for the wildcard lane would open in the platform
+lane's row and write there.
+
+What the intent form does **not** distinguish is two registrations with the same
+lane, identity and anchor: there is no row id in the seal, because this service
+holds no rows and [`DESIGN.md`](DESIGN.md) §5 gives it no field to receive one.
+Re-registering a domain you already registered on the same lane therefore
+produces an envelope your existing grant opens. That is deliberate — it is what
+lets a half-finished connect converge instead of stranding the credential — but
+it is a binding to a domain rather than to an attempt, and it is better said
+than implied.
 
 Cloudflare rotates the refresh token on every use, so each publish replaces the
 stored envelope. A publish that fails *after* that rotation still returns the new
@@ -274,8 +403,11 @@ either secret, and the sentence above is true of the IAM as well.
 | why | the record set is closed and knowable up front | the records it exists to write are for apps that **do not exist yet** | the record set is closed, and smaller than lane 1 |
 
 All three are revocable at your provider at any time, independently of
-MirrorStack, and all three stop within one tick if you delete the ownership
-proof.
+MirrorStack. And on the intent surface all three stop on the first pass after a
+deleted ownership proof becomes visible in public DNS — your record's TTL, then
+up to one interval plus the jitter — with the one exception described under
+[ownership](#ownership--_mirrorstack-challengeanchor-txt): a pass that cannot
+reach a resolver publishes and warns rather than stopping.
 
 **Renewal needs no credential at all.** Cloudflare's DCV tokens expire on a short
 clock — 7 days for Let's Encrypt, 14 for Google Trust Services — so a form that

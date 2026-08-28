@@ -15,84 +15,165 @@ instead of by trusting a support reply.
 
 ## Status, before anything else
 
-This service is **being rebuilt**, and the reason is a defect in what it does
-today rather than a feature we want.
+**There are two surfaces in this binary, and only one of them is bounded.**
 
-Today it takes a list of DNS records from MirrorStack's private half and
-publishes them, refusing anything outside the anchor. That bounds **where** we
-can write. It does not bound **what** — inside your domain, the private half
-picks the record and its value, and a record's value is not something containment
-can constrain. So a reader of this repository cannot currently answer the
-question it exists to answer.
+The rebuild described in [`docs/DESIGN.md`](docs/DESIGN.md) is largely built. The
+**intent surface** is here: MirrorStack's private half names a lane, an identity
+and a **domain**, and can no longer name a DNS record at all. The derivation moved
+into this repository — [`internal/derive`](internal/derive/derive.go) is the
+package the whole rebuild exists for — so every value that can reach your zone is
+now one of exactly three things: computed here, relayed verbatim from AWS or
+Cloudflare, or published by you. And the record that proves you own the domain is
+one **you** publish: it is derived here so we can tell you what to put there, and
+a plan that contains it is refused rather than written.
 
-[`docs/DESIGN.md`](docs/DESIGN.md) is the shape being built: MirrorStack's private
-half sends an intent and a domain and can no longer name a record at all, the
-derivation moves here, and **the record that proves you own the domain becomes
-one you publish rather than one we write.**
+**The old surface is still routed, in the same binary, behind the same OAuth
+client, and it is what production calls today.** `Publish` takes a record list
+from the private half, exactly as it always did. Its anchor check bounds a
+record's name and never its value, and its digest is optional — the field is
+`expectedDigest,omitempty`, so omitting it skips the check.
 
-Everything below describes what runs **today**. Where this file and the design
-disagree, this file is the truth.
+🔴 **So this branch does not change your answer to the question yet, and it would
+be dishonest to imply otherwise.** The two surfaces share one dispatcher, one
+OAuth client and one grant. An authorization obtained through the new flow — with
+your genuine consent, on a page this service served, against a proof you
+published — returns an authorization code, and nothing stops that code being
+redeemed against `Publish` with a record list instead of against `Complete`. The
+result is exactly the two records [`docs/DESIGN.md`](docs/DESIGN.md) §1 opens
+with:
+
+```
+CNAME  account.example.com          →  attacker.example
+TXT    _acme-challenge.example.com  →  a third party's ACME token
+```
+
+with every check in this repository passing. While both are routed, what
+MirrorStack can put in your zone is the **union** of what the intent surface
+derives and whatever list the private half hands to the old one, and the weaker
+half decides. The bound becomes a property of the **deployment** on the day the
+`Publish` case is deleted from the dispatcher, and not one day before. That
+deletion is the next step, and it is a change to two repositories in caller-first
+order.
+
+Four more things this file would rather you heard from us than found yourself:
+
+- **Lane 2 cannot be authorized on the deployed build at all.** The wildcard lane
+  requires this service's own consent page to have been acknowledged, and an
+  acknowledgement is a MAC under a key that never leaves this deployment. Nothing
+  in this binary mints one yet, so `IntentAuthorize` refuses `org_app_domain`
+  every time. It fails closed on purpose — the alternative is minting your
+  agreement somewhere you were not — and it stays that way until the
+  customer-facing consent route is settled.
+- **Record 7, Cloudflare's serving proof, never appears.** `relay.Edge` is not
+  wired in this build (the reason is written out at its wiring site in
+  `cmd/dns-delegate-api/main.go`), so `_cf-custom-hostname` is in no pass on any
+  lane. [`docs/RECORDS.md`](docs/RECORDS.md) lists it and marks it, because the
+  record is needed and simply absent: until Edge is wired, a hostname can
+  resolve, hold a certificate whose status reads active, and still answer 526.
+- **The digest is required on `Complete`, and it is still not the cross-boundary
+  control §4 implies.** It compares a plan derived here against a hex string this
+  service handed the caller — `derive(reg) == derive(reg)` — so it catches a bug
+  or a configuration change between the screen you saw and the write, not a
+  private half that meant you harm. It also covers only the **derived** records:
+  relayed records 5 and 7 are merged in afterwards and pass a superset test, so
+  they are written with no digest coverage at all. Both are defensible. The claim
+  built on top of them was not.
+- **The cadence in `internal/schedule` is declared, not enforced.** Nothing in
+  this service slows a caller that invokes `Advance` in a loop. What the numbers
+  buy you is a published definition to measure us against, not a control.
+
+Everything below describes what this binary does today, both surfaces marked.
+Where this file, [`docs/DESIGN.md`](docs/DESIGN.md) and
+[`docs/RECORDS.md`](docs/RECORDS.md) disagree, **the code is the truth** — so
+every claim here names the file that settles it.
 
 ---
 
 ## The short version
 
+Most rows are the same on both surfaces, because containment, the never-delete
+rule and the never-replace rule all live **below** them, in code both call. Three
+rows differ, and those three are what this branch is about: what bounds a
+record's **value**, what the digest covers, and what stopping us costs you.
+
 <table>
 <thead>
 <tr>
-<th width="22%">Question</th>
-<th width="50%">Answer</th>
-<th width="28%">Where to check</th>
+<th width="19%">Question</th>
+<th width="27%">Intent surface<br>(built, not yet what production calls)</th>
+<th width="27%">Legacy <code>Publish</code><br>(still routed, still live)</th>
+<th width="27%">Where to check</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>Can it delete a DNS record?</td>
 <td><strong>No.</strong> There is no delete call anywhere in this service.</td>
+<td><strong>Same.</strong> One provider interface, shared.</td>
 <td><a href="internal/dnsprovider/provider.go"><code>provider.go</code></a> — the <code>Provider</code> interface has eight methods, four of which reach the network, and none of them removes anything</td>
 </tr>
 <tr>
 <td>Can it touch a name you didn't see?</td>
 <td><strong>No.</strong> Every record must sit at or under the anchor — the exact hostname you proved you own — or the whole plan is refused.</td>
+<td><strong>Same.</strong> The boundary sits below both surfaces.</td>
 <td><a href="internal/dnsplan/plan.go"><code>plan.go</code></a>, <code>NewSnapshot</code> and <code>Contains</code></td>
 </tr>
 <tr>
 <td>Can it touch <code>www</code>, your apex, or your MX?</td>
 <td><strong>No</strong>, unless the domain you connected <em>is</em> that name. Connecting <code>shop.example.com</code> cannot reach <code>example.com</code>, <code>www.example.com</code>, or your mail records.</td>
+<td><strong>Same.</strong></td>
 <td><a href="internal/dnsplan/plan_test.go"><code>plan_test.go</code></a> asserts exactly this</td>
 </tr>
 <tr>
 <td>Can it write an A record or an MX record?</td>
 <td><strong>No.</strong> The plan vocabulary is <code>CNAME</code> and <code>TXT</code> only.</td>
+<td><strong>Same.</strong></td>
 <td><code>NormalizeRecords</code>, and <a href="internal/dnsplan/plan_test.go"><code>plan_test.go</code></a></td>
 </tr>
 <tr>
 <td>Can it take over a name you're already using?</td>
 <td><strong>No.</strong> If something already answers there and it isn't ours, the publish is refused and names what it found. You delete it yourself and authorize again.</td>
+<td><strong>Same.</strong> Every safety rule lives above the provider seam, in <code>internal/reconcile</code>.</td>
 <td><a href="internal/reconcile/reconcile.go"><code>ErrNameInUse</code></a></td>
 </tr>
 <tr>
 <td>Can what gets written differ from what you approved?</td>
-<td><strong>Not on the pass you authorized</strong> — a SHA-256 over the record set is taken before you consent and re-checked before anything is written. Later passes publish records that did not exist yet, so there was nothing to approve; those are bounded by the anchor. And the check is <strong>skipped if the caller omits the digest</strong>, so it defends against a bug in the private half, not against the private half.</td>
-<td><code>Snapshot.Digest</code>, <code>Snapshot.Validate</code></td>
+<td><strong>Not the derived records, on the pass you authorized.</strong> The digest is <strong>required</strong> — an empty one is refused — and re-derived before the authorization code is spent. But it compares a plan derived here against a hex string we handed you, so it catches a change between your screen and the write rather than a hostile private half; and relayed records 5 and 7 are merged in <em>after</em> it and carry no digest coverage.</td>
+<td>🔴 <strong>The check can be switched off by omitting a field.</strong> <code>expectedDigest</code> is optional here, which makes it a claim rather than a control.</td>
+<td><code>Complete</code> in <a href="internal/intent/service.go"><code>intent/service.go</code></a>; <code>PublishRequest.ExpectedDigest</code> in <a href="internal/grant/types.go"><code>grant/types.go</code></a>; <code>Snapshot.Digest</code>, <code>Snapshot.Validate</code>, <code>Snapshot.CoveredBy</code></td>
 </tr>
 <tr>
 <td><strong>Can the private half write a record you did not ask for?</strong></td>
-<td>🔴 <strong>Yes, today, inside your domain.</strong> Containment bounds a record's name, never its value. This is the defect the rebuild exists to fix.</td>
-<td><a href="docs/DESIGN.md"><code>docs/DESIGN.md</code></a></td>
+<td><strong>No.</strong> It sends a lane, an identity and a domain, and there is no field in which a record fits. Every value is derived in <code>internal/derive</code>, relayed verbatim from AWS or Cloudflare, or published by you.</td>
+<td>🔴 <strong>Yes, today, inside your domain.</strong> Containment bounds a record's name, never its value. This is the defect the rebuild exists to fix, and it is still routed.</td>
+<td><a href="internal/derive/derive.go"><code>derive.go</code></a> for the first; the <code>"Publish"</code> case in <a href="cmd/dns-delegate-api/main.go"><code>main.go</code></a> for the second</td>
+</tr>
+<tr>
+<td>Can you stop it once you have started?</td>
+<td><strong>Two controls, and one of them does not depend on us.</strong> Revoke at your provider — immediate, and works whether or not we behave. Or delete the ownership TXT: every write stops on the first pass after the deletion is visible in <em>public</em> DNS, which is your record's TTL and then up to one interval plus the jitter. A pass that cannot reach a resolver at all does <strong>not</strong> stop — it publishes and records a warning, because a nameserver failure must not be read as you saying no.</td>
+<td>Revocation at your provider, only. There is no proof to delete: on this surface the ownership TXT is written by us.</td>
+<td><code>checkProof</code> in <a href="internal/intent/service.go"><code>intent/service.go</code></a>, and <a href="internal/observe/observe.go"><code>observe.go</code></a> on why "unknown" is not "withdrawn"</td>
 </tr>
 <tr>
 <td>How long does the credential live?</td>
-<td>A platform-domain grant is held <strong>24 hours</strong>, and is not cut short when the last record lands. An app-domain grant is <strong>standing</strong>, because every new app you deploy needs a record created for it — you can revoke it at your provider at any time.</td>
-<td>See <em>Grant lifetimes</em> below</td>
+<td colspan="2"><strong>Same on both.</strong> A platform-domain grant is held <strong>24 hours</strong>, and is not cut short when the last record lands. An app-domain grant is <strong>standing</strong>, because every new app you deploy needs a record created for it — you can revoke it at your provider at any time.</td>
+<td>See <em>Grant lifetimes</em> below, and <code>Lane.GrantLifetime</code> in <a href="internal/lane/lane.go"><code>lane.go</code></a></td>
 </tr>
 </tbody>
 </table>
 
-If you want to check one thing, check `Contains` in
-[`internal/dnsplan/plan.go`](internal/dnsplan/plan.go). It is six lines, and it is
-the boundary — and then read [`docs/DESIGN.md`](docs/DESIGN.md) for why six lines
-bounding a *name* is not enough, and what replaces it.
+If you want to check one thing, check the dispatcher in
+[`cmd/dns-delegate-api/main.go`](cmd/dns-delegate-api/main.go). It is a single
+`switch`, it names every action this service will answer, and it marks the ones
+that can write to your zone: `Complete`, `Advance` and `BindAppToOrgAppDomain` on
+the intent surface, plus the deprecated `Publish`, which is the only one that
+takes its records from the caller.
+
+From there, two files answer the two halves of the question.
+[`internal/derive/derive.go`](internal/derive/derive.go) is **what** can be
+written — every value, derived from the lane and the domain alone. `Contains` in
+[`internal/dnsplan/plan.go`](internal/dnsplan/plan.go) is **where** — six lines,
+and it is the boundary both surfaces are checked against.
 
 For the complete list of what lands in your zone, including the two records that
 are relayed verbatim from AWS and Cloudflare rather than chosen by anyone at
@@ -114,8 +195,13 @@ service at all. Read the one you are doing.
 | routing records | one per sibling host, ×4 | **one wildcard**, `*.example.net` | one, for that hostname |
 | AWS certificate records | `account` `api` `apps` — not `cdn` | **none** | **none** |
 | the credential | held **24 hours** | **standing** | held **24 hours** |
+| consent page | not required | **required**, and 🔴 not mintable in this build | not required |
 
-The diagrams below are today's flow, defect included.
+The lane 1 and lane 2 diagrams below are the **legacy record-list flow** — what
+production calls today, defect included. Under each one is what the intent
+surface does instead, and which file settles it. Lane 3's diagram is the
+**intent** flow, because that lane's older path does not run through this service
+at all; the note at the end of that section says what it does run on.
 
 ---
 
@@ -125,9 +211,9 @@ Your MirrorStack console, on a hostname you own. The record set is known up fron
 and finite, so the credential is held only long enough for the two certificate
 authorities to answer.
 
-Read step 2 before anything else: **the record list is chosen entirely by
-MirrorStack's private half**, and the only thing this service checks is that each
-name sits under your domain.
+Read step 2 before anything else: on this path **the record list is chosen
+entirely by MirrorStack's private half**, and the only thing this service checks
+is that each name sits under your domain.
 
 ```mermaid
 sequenceDiagram
@@ -146,7 +232,7 @@ sequenceDiagram
     You->>CF: authorize (zone.read, dns.write — one zone)
     CF-->>Engine: authorization code
 
-    Note over Engine: refuse unless every NAME is at or<br/>under example.com. The VALUES are<br/>not checked against anything.
+    Note over Engine: legacy Publish: refuse unless every NAME<br/>is at or under example.com. The VALUES<br/>are not checked against anything.
     Engine->>CF: ownership TXT + routing CNAMEs<br/>+ _acme-challenge pointers (no token, nothing to wait for)
     Engine-->>Console: sealed credential, held 24h
 
@@ -162,17 +248,32 @@ sequenceDiagram
     Engine->>CF: revoke the credential
 ```
 
-Three things this diagram makes obvious, and which the rebuild changes:
+Three things this diagram makes obvious, and exactly what the intent surface does
+about each:
 
-- **The loop belongs to the private half.** Every re-derivation, every decision
-  about what to publish next, happens where you cannot read it. This service is
-  called once per pass and told what to write.
-- **The ownership TXT is written by us, in step 7.** It is also what gates the
-  custom hostname in step 13 — so the record that is supposed to prove you own
-  the domain is satisfied by our own write.
+- **The loop belongs to the private half.** On this path, every re-derivation and
+  every decision about what to publish next happens where you cannot read it.
+  On the intent surface the pass is here — `Advance` in
+  [`internal/intent`](internal/intent/service.go), one code path shared by every
+  lane — and the cadence it should run at is published in
+  [`internal/schedule`](internal/schedule/schedule.go): five minutes, a sixty
+  second spread, a sixty second floor, 288 passes. 🔴 **That is a declaration and
+  not a control.** The private half still holds the list of registrations and the
+  clock, and nothing here refuses a caller that invokes `Advance` in a loop. What
+  you get is a published number to hold us to and a change log at your provider
+  to check it against — which is worth having, and is not the same as a limit.
+- **The ownership TXT is written by us, in step 7.** So on this path the record
+  that is supposed to prove you own the domain is satisfied by our own write. On
+  the intent surface it is `derive.SourceCustomer`: computed in
+  [`internal/proof`](internal/proof/proof.go) so we can tell you the exact value,
+  handed to you to publish, and **never published by this service** — the whole
+  plan is refused if that record appears in the publishable set. `IntentAuthorize`
+  then refuses unless it resolves in public DNS at that moment, which is what
+  makes deleting it a control rather than a gesture.
 - **Three records arrive late** because they are answers from AWS and Cloudflare
   that do not exist when you authorize. That is why the credential is held rather
-  than spent once, and it is not going to change.
+  than spent once, and it is not going to change. (Fewer of them today: record 7
+  is not produced by this build — see the Status section.)
 
 ---
 
@@ -181,6 +282,15 @@ Three things this diagram makes obvious, and which the rebuild changes:
 One parent, and every app you deploy gets a hostname under it. The record set is
 **not** known up front, because the apps do not exist yet — which is the whole
 reason this lane's credential behaves differently.
+
+> 🔴 **On the intent surface this lane cannot be authorized at all in this
+> build.** It is the one lane that requires this service's own consent page to
+> have been served *and* acknowledged, and an acknowledgement is a MAC minted
+> under a key that never leaves this deployment. Nothing here mints one yet, so
+> `IntentAuthorize` answers `consent_required` for `org_app_domain` every time.
+> That is the safe end of the failure — the alternative is a screen somewhere
+> claiming you agreed to a standing wildcard with nothing behind the claim — and
+> it is a known gap, not a decision. The legacy path below is what runs.
 
 ```mermaid
 sequenceDiagram
@@ -213,14 +323,18 @@ sequenceDiagram
     Note over You,CF: revoke at your provider whenever you want
 ```
 
-Two differences from the platform lane that matter:
+Three differences from the platform lane that matter:
 
 - **Each app is bound at deploy time, and it may or may not be automatic.** When
   you deploy an app, MirrorStack asks this service to mint that app's
   certificate records. If the parent still holds a live authorization they are
   published for you; if it does not — you never authorized, or you revoked —
-  **nothing is written and you get the two records to add yourself**. Revoking
-  does not break deploys; it turns them manual.
+  **nothing is written and you get the records to add yourself**. Revoking
+  does not break deploys; it turns them manual. 🔴 **Today that hand-back is one
+  record where two are needed**, because `relay.Edge` is not wired in this build
+  and `_cf-custom-hostname` therefore appears in no pass, on any lane.
+  [`docs/RECORDS.md`](docs/RECORDS.md) marks the missing one; the symptom is a
+  526 from a hostname whose certificate reads perfectly healthy.
 - **One wildcard is all the routing you ever publish — but it is not all the
   DNS.** `*.example.net` matches exactly one label, so it covers
   `blog.example.net` and never `_acme-challenge.blog.example.net`. Each app still
@@ -239,10 +353,17 @@ delegated; the refusal to take over any name already in use inside it; and your
 provider's own revocation, which works whether or not we are involved and takes
 effect immediately.
 
-[`docs/DESIGN.md`](docs/DESIGN.md) describes the shape being built, where the
-loop, the derivation and the proof all move — and explains each function of the
-intent-based API that replaces the record list. The diagrams above are the flow;
-that document is the contract.
+On the intent surface there is a fourth, and it is the reason this lane has a
+consent page at all: `*.example.net` is the one grant whose scope you cannot
+enumerate for yourself, so the description you act on is rendered by
+[`internal/consent`](internal/consent/consent.go) from the same derivation the
+writer publishes from — not by a console this repository cannot vouch for. That
+control is built and, as the note above says, not yet reachable.
+
+[`docs/DESIGN.md`](docs/DESIGN.md) is the intent surface's contract: what the
+caller may send, what each of the four intents and seven lifecycle functions
+does, and what lands in your zone. The diagrams above are the legacy flow; that
+document is what replaces it.
 
 ---
 
@@ -262,6 +383,10 @@ so nothing is derived beneath it and nothing beside it is reachable — connecti
 `example.org` to an app cannot touch `www.example.org` or anything else in that
 zone.
 
+The diagram below is the **intent** flow, and every step of it is in this
+repository — with one exception, marked in the Status section: the last write in
+that loop, `_cf-custom-hostname`, is not produced by this build at all.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -271,12 +396,12 @@ sequenceDiagram
     participant CF as Your DNS provider
     participant Edge as MirrorStack edge
 
-    App->>Engine: app_add_custom_domain(app, example.org)
+    App->>Engine: AddAppDomain(app, example.org)
     Engine-->>App: proof TXT + the full record list + digest
     App-->>You: publish this one TXT yourself
 
     You->>CF: _mirrorstack-challenge.example.org
-    App->>Engine: authorize
+    App->>Engine: IntentAuthorize
     Engine->>Engine: verify — public DNS only
     Engine-->>App: consent URL + sealed state
 
@@ -290,10 +415,10 @@ sequenceDiagram
         Engine->>CF: _cf-custom-hostname.example.org
     end
 
-    Note over You,CF: delete the proof TXT and every write stops within one tick
+    Note over You,CF: delete the proof TXT — writes stop on the first pass<br/>that sees it gone in PUBLIC DNS
 ```
 
-Two differences from the org lanes:
+Three things about this lane:
 
 - **No AWS certificate record**, for the same reason as lane 2 — it is a
   Cloudflare-for-SaaS hostname that never reaches AWS from your edge. That also
@@ -303,13 +428,23 @@ Two differences from the org lanes:
   closed — one host, four records, all knowable — so a longer window buys
   nothing. Only lane 2 is standing, and only because apps that do not exist yet
   will need records.
+- **Deleting the proof TXT stops the writes, and here is exactly how fast.** Not
+  instantly, and this file used to imply otherwise. Every write stops on the
+  first pass after the deletion becomes visible in *public* DNS: your record's
+  TTL, and then up to one interval plus the jitter — six minutes on the declared
+  cadence. A pass that cannot reach a resolver at all does **not** stop; it
+  publishes and records a warning, because a nameserver failure must not be read
+  as you saying no. That asymmetry is deliberate and written out at `checkProof`:
+  *granting* authority needs a positive answer, *continuing* to exercise it stops
+  only on a negative one. If you want an immediate stop rather than a bounded
+  one, revoke at your provider — that has never depended on us.
 
-> **Not migrated yet.** Today this lane still runs on an older path in
-> MirrorStack's private half, where you paste a Cloudflare API token instead —
-> no anchor, no digest, and nothing in this repository bounds it. The shape above
-> is what it becomes, and the migration is
-> [`docs/DESIGN.md`](docs/DESIGN.md)'s third intent. Until it ships, treat this
-> page's claims as covering lanes 1 and 2.
+> **Not migrated yet.** The flow above is implemented in this repository —
+> `AddAppDomain`, `IntentAuthorize`, `Complete`, `Advance` — but production has
+> not moved onto it. Today this lane still runs on an older path in MirrorStack's
+> private half, where you paste a Cloudflare API token instead: no anchor, no
+> digest, and nothing in this repository bounds it. The migration is a change in
+> the caller, not here.
 
 ---
 
@@ -319,10 +454,13 @@ Every lane can be done manually: you add the records in your own provider and
 grant MirrorStack nothing. No credential of yours then exists anywhere in
 MirrorStack, and none of the machinery on this page runs.
 
-Worth knowing anyway — **the list you are asked to add is derived here**, by the
-same code that would have written it. So the records on your screen and the
+Worth knowing anyway — **on the intent surface, the list you are asked to add is
+derived here**, by the same code that would have written it, and by the same
+function that renders the consent page. So the records on your screen and the
 records a grant would publish cannot drift apart, and you can read what you will
-be asked for before you agree to anything.
+be asked for before you agree to anything. On the legacy surface that guarantee
+does not exist: there the list is derived in the private half and this service
+only checks where each name sits.
 
 Revoking a grant returns you to this path. It does not break the domain.
 
@@ -335,25 +473,29 @@ would not answer your question anyway — you would have to read all of it to be
 sure none of it reached your zone.
 
 So the credential does not live there. `api-platform` never holds a DNS provider
-token, and this service never derives what records to create. The two halves are
-split on purpose:
+token. The two halves are split on purpose:
 
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 460}}}%%
 flowchart LR
-    P["api-platform · PRIVATE<br/><br/>authenticates the operator<br/>works out which records are needed"]
-    E["dns-delegate-engine · PUBLIC — you are reading it<br/><br/>holds the credential<br/>✅ nothing outside the anchor<br/>✅ nothing whose digest moved<br/>✅ creates and updates, never deletes<br/>✅ never takes over a name in use<br/>✅ one bounded window, then it stops"]
+    P["api-platform · PRIVATE<br/><br/>authenticates the operator<br/>names the domain and the intent<br/>🔴 and, on the legacy surface, still names the records"]
+    E["dns-delegate-engine · PUBLIC — you are reading it<br/><br/>holds the credential<br/>✅ nothing outside the anchor<br/>✅ creates and updates, never deletes<br/>✅ never takes over a name in use<br/>✅ derives every value itself — intent surface<br/>🔴 still accepts a record list — legacy Publish<br/>✅ a bounded window on lanes 1 and 3 — lane 2 is standing"]
     DNS["your DNS provider"]
 
-    P ==>|the plan| E
+    P ==>|an intent — or, on the legacy surface, a plan| E
     E ==>|writes| DNS
 ```
 
 The call only ever goes left to right. A bug — or a bad actor — on the private
-side cannot get `www.example.com` written, because the plan it sends is checked
-here against the name you proved you own, and refused if it does not fit.
+side cannot get `www.example.com` written, because every plan is checked here
+against the name you proved you own, and refused if it does not fit. What it can
+still do, for as long as `Publish` is routed, is choose a record's **value**
+inside your own domain. That is the defect the intent surface closes and the
+deployment has not yet.
 
-That containment check is the reason this repository is small enough to read.
+Containment is what made this repository small enough to read. Derivation is what
+makes reading it *sufficient* — and it is only sufficient once the legacy surface
+is gone.
 
 ---
 
@@ -380,7 +522,7 @@ happened. It never retries the write. A retry is how one record becomes two.
 ## Grant lifetimes
 
 Set out per lane above, and summarised here because it is the question people
-come back for.
+come back for. These are the same on both surfaces.
 
 | | 1 · org platform | 2 · org app domain | 3 · each app domain |
 |---|---|---|---|
@@ -428,15 +570,44 @@ value. It cannot opt out of a safety rule, because it never sees one.
 
 ```
 dns-delegate-engine/
-├── cmd/dns-delegate-api/       Lambda: the RPC surface api-platform calls
+├── cmd/dns-delegate-api/       Lambda: the RPC surface api-platform calls, and
+│                               the dispatcher that routes BOTH surfaces — the
+│                               switch in main.go is the shortest complete answer
+│                               to "what can this service be asked to do?"
 ├── internal/
-│   ├── dnsplan/                the authorization boundary — containment, digest, normalization
-│   ├── dnsprovider/            the provider seam; safety rules live ABOVE it
+│   │
+│   │   ─── the intent surface: a domain and an intent, never a record ───
+│   ├── intent/                 the RPC surface — four intents, and the lifecycle:
+│   │                           verify, authorize, complete, advance, describe,
+│   │                           orphans, release
+│   ├── derive/                 WHAT gets written, values included — the package
+│   │                           the whole rebuild exists for
+│   ├── proof/                  the ownership TXT: derived here, published by YOU,
+│   │                           and never written by this service
+│   ├── lane/                   the three lanes, and the rules the rest validates
+│   │                           against — identity kind, anchor shape, lifetime
+│   ├── consent/                the standing-wildcard page, rendered by the code
+│   │                           that does the writing, plus the acknowledgement
+│   ├── observe/                what PUBLIC DNS says about a plan, right now
+│   ├── relay/                  records 5 and 7, read verbatim from AWS and
+│   │                           Cloudflare and bounded before anyone sees them
+│   ├── sealed/                 the two envelopes: a registration, and one
+│   │                           authorization in progress
+│   ├── schedule/               the declared cadence — a declaration, not a control
+│   │
+│   │   ─── shared by both surfaces: this is where the safety rules live ───
+│   ├── dnsplan/                the authorization boundary — containment, digest,
+│   │                           normalization
 │   ├── reconcile/              the publisher, and every safety rule
+│   ├── dnsprovider/            the provider seam; safety rules live ABOVE it
 │   ├── provider/cloudflare/    the first adapter
-│   ├── grant/                  the RPC surface: authorize, publish, revoke
-│   └── shared/                 the OAuth client, the sealing keyset, the JSON envelope
-├── docs/DESIGN.md              the shape this is being rebuilt into
+│   ├── shared/                 the OAuth client, the sealing keyset, the JSON envelope
+│   │
+│   │   ─── the legacy record-list surface ───
+│   └── grant/                  🔴 DEPRECATED and still routed: authorize,
+│                               publish(records), revoke. Read this if you want to
+│                               know what production calls today.
+├── docs/DESIGN.md              the intent surface's contract, in full
 ├── docs/RECORDS.md             every record we can write, in full
 └── Makefile                    make check — vet, build, race tests, arm64 cross-build
 ```

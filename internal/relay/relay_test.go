@@ -78,6 +78,15 @@ func oneCertificate(host string, options ...acmtypes.DomainValidation) *fakeACM 
 	}
 }
 
+// acmRecords is how every test below reads ACM: through the FREE
+// ValidationRecords, which is the call internal/intent makes and the one that
+// carries the bounds. Calling ACM's method directly would test a reader whose
+// answer nothing has checked yet, and would let a check quietly move back down
+// into the adapter without a single test noticing.
+func acmRecords(api ACMAPI, hosts ...string) ([]dnsplan.Record, error) {
+	return ValidationRecords(context.Background(), ACM{API: api}, hosts)
+}
+
 func cnameOption(name, value string) acmtypes.DomainValidation {
 	return acmtypes.DomainValidation{
 		DomainName: ptr("account.example.com"),
@@ -99,7 +108,7 @@ func TestEmptyValidationOptionsAreAWaitNotAnError(t *testing.T) {
 			acmtypes.DomainValidation{DomainName: ptr("account.example.com")}),
 		"no certificate in the account": {pages: []*acm.ListCertificatesOutput{{}}},
 	} {
-		records, err := ACM{API: api}.ValidationRecords(context.Background(), []string{"account.example.com"})
+		records, err := acmRecords(api, "account.example.com")
 		if err != nil {
 			t.Fatalf("%s: want no error, got %v", name, err)
 		}
@@ -118,7 +127,7 @@ func TestACMTrimsTheTrailingDotOnNameAndValue(t *testing.T) {
 		"_a79865eb4cd1a6ab990a45779b4e0b96.Account.Example.com.",
 		"_ff6c7f9a.acm-validations.aws.",
 	))
-	records, err := ACM{API: api}.ValidationRecords(context.Background(), []string{"account.example.com"})
+	records, err := acmRecords(api, "account.example.com")
 	if err != nil {
 		t.Fatalf("ValidationRecords: %v", err)
 	}
@@ -159,7 +168,7 @@ func TestACMRefusesRecordsAWSSaysItCannotReturn(t *testing.T) {
 			"_x.account.example.com", "_ff6c7f9a.acm-validations.aws.example.net"),
 	} {
 		api := oneCertificate("account.example.com", option)
-		records, err := ACM{API: api}.ValidationRecords(context.Background(), []string{"account.example.com"})
+		records, err := acmRecords(api, "account.example.com")
 		if !errors.Is(err, ErrUnexpectedRecord) {
 			t.Fatalf("%s: want ErrUnexpectedRecord, got %v", name, err)
 		}
@@ -180,7 +189,7 @@ func TestACMSkipsValidationRecordsForHostsWeDidNotAskAbout(t *testing.T) {
 		cnameOption("_theirs.shop.example.net", "_b.acm-validations.aws"),
 		cnameOption("_lookalike.notaccount.example.com", "_c.acm-validations.aws"),
 	)
-	records, err := ACM{API: api}.ValidationRecords(context.Background(), []string{"account.example.com"})
+	records, err := acmRecords(api, "account.example.com")
 	if err != nil {
 		t.Fatalf("ValidationRecords: %v", err)
 	}
@@ -215,7 +224,7 @@ func TestACMOutputIsDedupedAndDeterministic(t *testing.T) {
 		},
 	}
 	hosts := []string{"api.example.com", "account.example.com"}
-	records, err := ACM{API: api}.ValidationRecords(context.Background(), hosts)
+	records, err := acmRecords(api, hosts...)
 	if err != nil {
 		t.Fatalf("ValidationRecords: %v", err)
 	}
@@ -233,7 +242,7 @@ func TestACMOutputIsDedupedAndDeterministic(t *testing.T) {
 // signal, so every value is named explicitly.
 func TestACMListingDefeatsTheFiltersThatHideCertificates(t *testing.T) {
 	api := oneCertificate("account.example.com")
-	if _, err := (ACM{API: api}).ValidationRecords(context.Background(), []string{"account.example.com"}); err != nil {
+	if _, err := acmRecords(api, "account.example.com"); err != nil {
 		t.Fatalf("ValidationRecords: %v", err)
 	}
 	if len(api.keyTypes) < 4 {
@@ -261,7 +270,7 @@ func TestACMListingDefeatsTheFiltersThatHideCertificates(t *testing.T) {
 func TestACMTreatsACertificateDeletedMidPassAsAbsent(t *testing.T) {
 	api := oneCertificate("account.example.com")
 	api.describeErr = &acmtypes.ResourceNotFoundException{}
-	records, err := ACM{API: api}.ValidationRecords(context.Background(), []string{"account.example.com"})
+	records, err := acmRecords(api, "account.example.com")
 	if err != nil || len(records) != 0 {
 		t.Fatalf("want no records and no error, got %v / %v", records, err)
 	}
@@ -282,7 +291,7 @@ func TestACMPagesUntilTheTokenRunsOut(t *testing.T) {
 			}}},
 		},
 	}
-	records, err := ACM{API: api}.ValidationRecords(context.Background(), []string{"account.example.com"})
+	records, err := acmRecords(api, "account.example.com")
 	if err != nil {
 		t.Fatalf("ValidationRecords: %v", err)
 	}
@@ -311,7 +320,7 @@ func TestACMDescribesCertificatesWhoseSANListWasTruncated(t *testing.T) {
 			}}},
 		},
 	}
-	records, err := ACM{API: api}.ValidationRecords(context.Background(), []string{"account.example.com"})
+	records, err := acmRecords(api, "account.example.com")
 	if err != nil {
 		t.Fatalf("ValidationRecords: %v", err)
 	}
@@ -356,7 +365,7 @@ func TestServingProofAbsenceIsNotReadyAndNotAnError(t *testing.T) {
 		e := edgeFor(t, func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = io.WriteString(w, body)
 		})
-		record, ready, err := e.ServingProof(context.Background(), "account.example.com")
+		record, ready, err := ServingProof(context.Background(), e, "account.example.com")
 		if err != nil {
 			t.Fatalf("%s: want no error, got %v", name, err)
 		}
@@ -377,7 +386,7 @@ func TestServingProofReadsTheOwnershipVerificationTXT(t *testing.T) {
 		    "name":"_cf-custom-hostname.account.example.com",
 		    "value":"ac4a9a9d-0f4a-4e5e-9a3f-2f1c1b0d9e8a"}}]}`)
 	})
-	record, ready, err := e.ServingProof(context.Background(), "account.example.com")
+	record, ready, err := ServingProof(context.Background(), e, "account.example.com")
 	if err != nil || !ready {
 		t.Fatalf("want a ready proof, got %+v / %v / %v", record, ready, err)
 	}
@@ -400,7 +409,7 @@ func TestServingProofDoesNotTrimATrailingDotFromATXTValue(t *testing.T) {
 		  "ownership_verification":{"type":"txt",
 		    "name":"_cf-custom-hostname.account.example.com","value":"proof-value."}}]}`)
 	})
-	record, ready, err := e.ServingProof(context.Background(), "account.example.com")
+	record, ready, err := ServingProof(context.Background(), e, "account.example.com")
 	if err != nil || !ready {
 		t.Fatalf("want a ready proof, got %v / %v", ready, err)
 	}
@@ -419,7 +428,7 @@ func TestServingProofMatchesTheHostExactlyRatherThanTakingTheFirstResult(t *test
 		  {"hostname":"account.example.com",
 		   "ownership_verification":{"type":"txt","name":"_cf-custom-hostname.account.example.com","value":"right"}}]}`)
 	})
-	record, ready, err := e.ServingProof(context.Background(), "account.example.com")
+	record, ready, err := ServingProof(context.Background(), e, "account.example.com")
 	if err != nil || !ready {
 		t.Fatalf("want a ready proof, got %v / %v", ready, err)
 	}
@@ -441,7 +450,7 @@ func TestServingProofRefusesARecordThatDoesNotNameTheHost(t *testing.T) {
 			_, _ = io.WriteString(w, `{"success":true,"result":[{"hostname":"account.example.com",
 			  "ownership_verification":`+proof+`}]}`)
 		})
-		record, ready, err := e.ServingProof(context.Background(), "account.example.com")
+		record, ready, err := ServingProof(context.Background(), e, "account.example.com")
 		if !errors.Is(err, ErrUnexpectedRecord) {
 			t.Fatalf("%s: want ErrUnexpectedRecord, got %v", name, err)
 		}
@@ -460,7 +469,7 @@ func TestServingProofSendsTheZoneCredentialAsABearerAndNowhereElse(t *testing.T)
 		auth, target = r.Header.Get("Authorization"), r.URL.String()
 		_, _ = io.WriteString(w, `{"success":true,"result":[]}`)
 	})
-	if _, _, err := e.ServingProof(context.Background(), "account.example.com"); err != nil {
+	if _, _, err := ServingProof(context.Background(), e, "account.example.com"); err != nil {
 		t.Fatalf("ServingProof: %v", err)
 	}
 	if auth != "Bearer ms-zone-token" {
@@ -483,7 +492,7 @@ func TestServingProofRefusesToRunWithoutAZoneAndACredential(t *testing.T) {
 		"an empty token":   {ZoneID: "z", Token: StaticToken("  ")},
 		"a failing source": {ZoneID: "z", Token: func(context.Context) (string, error) { return "", errors.New("secret unavailable") }},
 	} {
-		if _, ready, err := e.ServingProof(context.Background(), "account.example.com"); err == nil || ready {
+		if _, ready, err := ServingProof(context.Background(), e, "account.example.com"); err == nil || ready {
 			t.Fatalf("%s: want a refusal, got ready=%v err=%v", name, ready, err)
 		}
 	}
@@ -492,7 +501,7 @@ func TestServingProofRefusesToRunWithoutAZoneAndACredential(t *testing.T) {
 func TestServingProofRejectsAHostThatIsNotADNSName(t *testing.T) {
 	e := Edge{ZoneID: "z", Token: StaticToken("t")}
 	for _, host := range []string{"", "   ", strings.Repeat("a", dnsplan.MaxDNSName+1)} {
-		if _, _, err := e.ServingProof(context.Background(), host); err == nil {
+		if _, _, err := ServingProof(context.Background(), e, host); err == nil {
 			t.Fatalf("want a refusal for %q", host)
 		}
 	}
@@ -503,7 +512,7 @@ func TestServingProofSurfacesACloudflareRefusal(t *testing.T) {
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = io.WriteString(w, `{"success":false,"errors":[{"code":9109,"message":"Unauthorized to access requested resource"}]}`)
 	})
-	_, ready, err := e.ServingProof(context.Background(), "account.example.com")
+	_, ready, err := ServingProof(context.Background(), e, "account.example.com")
 	if err == nil || ready {
 		t.Fatalf("a failed read of our own zone is a fault, got ready=%v err=%v", ready, err)
 	}
@@ -573,6 +582,166 @@ func TestServingProofsSurfaceAFailedRead(t *testing.T) {
 	edge := stubEdge{err: errors.New("cloudflare unavailable")}
 	if _, err := ServingProofs(context.Background(), edge, []string{"account.example.com"}); err == nil {
 		t.Fatal("a failed read must not be reported as an empty set of proofs")
+	}
+}
+
+// hostileCA answers CertificateAuthority with whatever it was built with,
+// whatever it is asked. It is not a caricature: from above the interface it is
+// indistinguishable from a SECOND certificate authority, a double someone wires
+// by mistake, or a change inside AWS.
+type hostileCA struct{ records []dnsplan.Record }
+
+func (h hostileCA) ValidationRecords(context.Context, []string) ([]dnsplan.Record, error) {
+	return h.records, nil
+}
+
+// hostileEdge is the same for EdgeHostnames, and always claims to be ready.
+type hostileEdge struct{ record dnsplan.Record }
+
+func (h hostileEdge) ServingProof(context.Context, string) (dnsplan.Record, bool, error) {
+	return h.record, true, nil
+}
+
+// 🔴 THE PROOF THAT THE BOUNDS ARE ABOVE THE INTERFACE AND NOT INSIDE AN ADAPTER.
+//
+// internal/dnsprovider states the rule this is the other half of: an adapter
+// cannot opt out of a rule it never sees. A check that lives only in acm.go is a
+// check the next certificate authority silently does not have, with every
+// comment in this package still reading true. There is no ACM in this test —
+// every refusal below is made by relay.ValidationRecords itself.
+func TestAHostileCertificateAuthorityIsRefusedAboveTheInterface(t *testing.T) {
+	hosts := []string{"account.example.com", "api.example.com"}
+	for name, record := range map[string]dnsplan.Record{
+		"a record for a host nobody asked about": {
+			Type: "CNAME", Name: "_x.example.net", Value: "_y" + ValidationTargetSuffix},
+		"a lookalike of a host we did ask about": {
+			Type: "CNAME", Name: "_x.notaccount.example.com", Value: "_y" + ValidationTargetSuffix},
+		// 🔴 A CNAME AT THE HOST ITSELF REPLACES WHAT THAT NAME ANSWERS. It is
+		// the one write this service could make that takes a working site down
+		// rather than sitting beside it, and it would be made with a credential
+		// the customer granted for the opposite purpose.
+		"the host itself rather than a name beneath it": {
+			Type: "CNAME", Name: "account.example.com", Value: "_y" + ValidationTargetSuffix},
+		"a name a browser could resolve": {
+			Type: "CNAME", Name: "www.account.example.com", Value: "_y" + ValidationTargetSuffix},
+		"no name at all": {Type: "CNAME", Name: "", Value: "_y" + ValidationTargetSuffix},
+		"a type ACM's own contract says it cannot return": {
+			Type: "TXT", Name: "_x.account.example.com", Value: "_y" + ValidationTargetSuffix},
+		"a value naming somewhere else entirely": {
+			Type: "CNAME", Name: "_x.account.example.com", Value: "attacker.example.net"},
+		"a value carrying the AWS zone as a label rather than a suffix": {
+			Type: "CNAME", Name: "_x.account.example.com", Value: "_y.acm-validations.aws.example.net"},
+		"a target longer than a DNS name": {
+			Type: "CNAME", Name: "_x.account.example.com",
+			Value: strings.Repeat("a", dnsplan.MaxDNSName) + ValidationTargetSuffix},
+	} {
+		ca := hostileCA{records: []dnsplan.Record{record}}
+		records, err := ValidationRecords(context.Background(), ca, hosts)
+		if !errors.Is(err, ErrUnexpectedRecord) {
+			t.Fatalf("%s: want ErrUnexpectedRecord, got %v", name, err)
+		}
+		if records != nil {
+			t.Fatalf("%s: a refusal must publish nothing, got %+v", name, records)
+		}
+	}
+}
+
+// The same proof for record 7, whose value had NO bound at all until this test
+// existed: Edge is nil in production today, so anything that could answer
+// MirrorStack's custom_hostnames endpoint chose the bytes published under a
+// customer's own name.
+func TestAHostileEdgeIsRefusedAboveTheInterface(t *testing.T) {
+	const host = "account.example.com"
+	for name, record := range map[string]dnsplan.Record{
+		"a proof for a host nobody asked about": {
+			Type: "TXT", Name: ownershipRecordPrefix + "example.net", Value: "v"},
+		"the host itself rather than a name beneath it": {
+			Type: "TXT", Name: host, Value: "v"},
+		"a name beneath the host that is not the ownership record": {
+			Type: "TXT", Name: "_other." + host, Value: "v"},
+		"a type Cloudflare returns in another field entirely": {
+			Type: "CNAME", Name: ownershipRecordPrefix + host, Value: "v"},
+		"ready, with no value": {
+			Type: "TXT", Name: ownershipRecordPrefix + host, Value: ""},
+		"a value past the length one TXT string carries": {
+			Type: "TXT", Name: ownershipRecordPrefix + host,
+			Value: strings.Repeat("a", maxServingProofValue+1)},
+		// The publisher wraps a TXT value in quotes and does not escape what is
+		// inside, so a quote in the value moves where that string ends.
+		"a value carrying the quote that ends a TXT string": {
+			Type: "TXT", Name: ownershipRecordPrefix + host, Value: `proof" "injected`},
+		"a value carrying a backslash": {
+			Type: "TXT", Name: ownershipRecordPrefix + host, Value: `proof\injected`},
+		// A control character costs twice: it is also how a log line is forged.
+		"a value carrying a control character": {
+			Type: "TXT", Name: ownershipRecordPrefix + host, Value: "proof\nlog-line-forged"},
+	} {
+		edge := hostileEdge{record: record}
+		if _, ready, err := ServingProof(context.Background(), edge, host); !errors.Is(err, ErrUnexpectedRecord) || ready {
+			t.Fatalf("%s: want ErrUnexpectedRecord, got ready=%v err=%v", name, ready, err)
+		}
+		// ServingProofs is the call internal/intent actually makes. A bound that
+		// held only on the singular form would be a bound production never runs.
+		if proofs, err := ServingProofs(context.Background(), edge, []string{host}); !errors.Is(err, ErrUnexpectedRecord) || proofs != nil {
+			t.Fatalf("%s: ServingProofs must refuse it too, got %+v / %v", name, proofs, err)
+		}
+	}
+}
+
+// The other half of both proofs. A bound that refused everything would pass the
+// two tests above and publish nothing at all, which is not the property claimed:
+// a well-formed record from the same hostile implementations survives, arrives
+// normalized, and loses the orange cloud it asked for.
+func TestAWellFormedRelayedRecordSurvivesFromAnyImplementation(t *testing.T) {
+	ctx := context.Background()
+	ca := hostileCA{records: []dnsplan.Record{{
+		Type: "cname", Name: "_X.Account.Example.com.", Value: "_y.acm-validations.aws.", Proxied: true,
+	}}}
+	records, err := ValidationRecords(ctx, ca, []string{"account.example.com"})
+	if err != nil {
+		t.Fatalf("ValidationRecords: %v", err)
+	}
+	want := dnsplan.Record{Type: "CNAME", Name: "_x.account.example.com", Value: "_y.acm-validations.aws"}
+	if len(records) != 1 || records[0] != want {
+		t.Fatalf("want %+v, got %+v", want, records)
+	}
+
+	edge := hostileEdge{record: dnsplan.Record{
+		Type: "txt", Name: "_CF-Custom-Hostname.Account.Example.com", Value: "proof-value", Proxied: true,
+	}}
+	record, ready, err := ServingProof(ctx, edge, "account.example.com")
+	if err != nil || !ready {
+		t.Fatalf("want a ready proof, got %+v / %v / %v", record, ready, err)
+	}
+	wantProof := dnsplan.Record{
+		Type: "TXT", Name: "_cf-custom-hostname.account.example.com", Value: "proof-value",
+	}
+	if record != wantProof {
+		t.Fatalf("want %+v, got %+v", wantProof, record)
+	}
+}
+
+// Every other untrusted input on this branch is bounded by name and by reason,
+// and an upstream body is untrusted before it has parsed: Base is overridable,
+// and an endpoint that never stops sending must not turn one pass of the loop
+// into an allocation. The bound refuses rather than truncating, so a body cut
+// off mid-JSON can never parse as an answer nobody sent.
+func TestServingProofRefusesAResponseBodyPastTheBound(t *testing.T) {
+	e := edgeFor(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"success":true,"result":[]`)
+		pad := strings.Repeat(" ", 64*1024)
+		for written := 0; written <= maxEdgeResponse; written += len(pad) {
+			if _, err := io.WriteString(w, pad); err != nil {
+				return
+			}
+		}
+	})
+	_, ready, err := ServingProof(context.Background(), e, "account.example.com")
+	if err == nil || ready {
+		t.Fatalf("want a refusal, got ready=%v err=%v", ready, err)
+	}
+	if !strings.Contains(err.Error(), "longer than") {
+		t.Fatalf("the length bound must be what refused it, got %v", err)
 	}
 }
 

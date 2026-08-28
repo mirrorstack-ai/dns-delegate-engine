@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -14,21 +13,6 @@ import (
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
 )
-
-// ValidationTargetSuffix is the only zone an ACM DNS validation record may point
-// at.
-//
-// 🔴 THIS BOUNDS THE HALF THAT CONTAINMENT CANNOT.
-//
-// dnsplan.Contains bounds a record's NAME to the subtree the customer proved
-// they own. Nothing bounds its VALUE, and a relayed value is by definition one
-// this repository cannot show you. So the value is checked against the only
-// thing that is knowable about it in advance: an ACM DNS validation record
-// always points into AWS's validation zone. A value that does not is refused
-// loudly rather than dropped quietly, because a silently-dropped validation
-// record looks identical to a certificate AWS has simply not filled in yet, and
-// would sit "preparing" forever with nothing to read.
-const ValidationTargetSuffix = ".acm-validations.aws"
 
 // DefaultMaxCertificates bounds how many certificates one pass will describe.
 //
@@ -102,13 +86,22 @@ func NewACM(ctx context.Context, region string) (ACM, error) {
 // RequestCertificate returns an ARN immediately and ACM fills the validation
 // record in seconds to minutes later, so a certificate is routinely present and
 // recordless for the first minutes of its life. Absent is not-yet. The only
-// things that produce an error here are a failed AWS call and a record AWS
-// should not have been able to hand back at all.
+// thing that produces an error in this method is a failed AWS call; a record AWS
+// should not have been able to hand back at all is refused a level up.
 //
 // Which hosts get a certificate at all is a derivation decision made elsewhere —
 // lane 1 covers account, api and apps but NOT cdn, which the CDN Worker
 // terminates before it ever reaches API Gateway, and lanes 2 and 3 have no ACM
 // record of any kind. This reader takes the list it is given.
+//
+// 🔴 WHAT COMES BACK HERE IS A FINDING, NOT A PLAN. Whether a record may be
+// published — CNAME, an underscore name beneath a host that was asked for, a
+// target inside the AWS validation zone — is decided by relay.ValidationRecords,
+// above the CertificateAuthority interface. Duplicates and order are settled
+// there too, for the same reason: two SANs can carry one ResourceRecord, the
+// plan digest is order-sensitive, and neither fact is about ACM. Every rule that
+// lived in this file would be a rule the next certificate authority does not
+// have.
 func (a ACM) ValidationRecords(ctx context.Context, hosts []string) ([]dnsplan.Record, error) {
 	wanted := normalizeHosts(hosts)
 	if a.API == nil || len(wanted) == 0 {
@@ -118,33 +111,14 @@ func (a ACM) ValidationRecords(ctx context.Context, hosts []string) ([]dnsplan.R
 	if err != nil {
 		return nil, err
 	}
-	seen := make(map[string]struct{}, len(arns))
 	out := make([]dnsplan.Record, 0, len(arns))
 	for _, arn := range arns {
 		records, err := a.describe(ctx, arn, wanted)
 		if err != nil {
 			return nil, err
 		}
-		for _, record := range records {
-			identity := record.Type + "|" + record.Name + "|" + record.Value
-			if _, ok := seen[identity]; ok {
-				continue
-			}
-			seen[identity] = struct{}{}
-			out = append(out, record)
-		}
+		out = append(out, records...)
 	}
-	// 🔴 SORTED, BECAUSE THE PLAN DIGEST IS ORDER-SENSITIVE. api-platform hashes
-	// the record list in order before the customer authorizes, and this service
-	// re-checks that hash before it writes. If two passes over the same AWS
-	// answer produced two orders, a customer sitting on the consent screen would
-	// be told the plan changed, at random, with nothing having changed.
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Name != out[j].Name {
-			return out[i].Name < out[j].Name
-		}
-		return out[i].Value < out[j].Value
-	})
 	return out, nil
 }
 
@@ -275,43 +249,23 @@ func (a ACM) describe(ctx context.Context, arn *string, hosts []string) ([]dnspl
 		if option.ResourceRecord == nil {
 			continue
 		}
-		record, err := validationRecord(*option.ResourceRecord)
-		if err != nil {
-			return nil, err
-		}
-		// A certificate may legitimately carry names this pass did not ask
-		// about. Those records belong to another host's zone and are not ours to
-		// publish — see underAnyHost for the bug this prevents.
-		if !underAnyHost(hosts, record.Name) {
+		// The TYPE is passed through rather than asserted to be CNAME. AWS
+		// declares CNAME the only type this field takes, so a record that is
+		// anything else is a contract violation — and relay.ValidationRecords
+		// refuses it by name. Hard-coding "CNAME" here would instead RELABEL
+		// whatever came back and publish its value as a CNAME target.
+		record := relayedRecord(string(option.ResourceRecord.Type),
+			deref(option.ResourceRecord.Name), deref(option.ResourceRecord.Value))
+		// The one drop this reader is entitled to make: a certificate legitimately
+		// carries names this pass did not ask about, and their records belong to
+		// another host's plan. Everything else — including a record with no name
+		// at all — is handed up to be refused loudly. See forAnotherHost.
+		if forAnotherHost(hosts, record) {
 			continue
 		}
 		records = append(records, record)
 	}
 	return records, nil
-}
-
-// validationRecord converts one ACM ResourceRecord, or refuses it.
-//
-// AWS declares Name, Type and Value required and declares CNAME the only type
-// this field takes. Every check below is therefore a check that AWS returned
-// what AWS says it returns — cheap, and the alternative is publishing a record
-// nobody chose into a customer's zone. An empty name in particular would
-// normalize to the empty string and, at a publisher that did not re-check, land
-// as a write against the zone apex.
-func validationRecord(resource acmtypes.ResourceRecord) (dnsplan.Record, error) {
-	if resource.Type != acmtypes.RecordTypeCname {
-		return dnsplan.Record{}, fmt.Errorf("%w: ACM validation record type %q is not CNAME",
-			ErrUnexpectedRecord, string(resource.Type))
-	}
-	record := relayedRecord("CNAME", deref(resource.Name), deref(resource.Value))
-	if record.Name == "" || len(record.Name) > dnsplan.MaxDNSName {
-		return dnsplan.Record{}, fmt.Errorf("%w: ACM validation record has no usable name", ErrUnexpectedRecord)
-	}
-	if !strings.HasSuffix(record.Value, ValidationTargetSuffix) {
-		return dnsplan.Record{}, fmt.Errorf("%w: ACM validation record for %q points at %q, not %s",
-			ErrUnexpectedRecord, record.Name, record.Value, ValidationTargetSuffix)
-	}
-	return record, nil
 }
 
 // deref reads an SDK string pointer without pulling the aws helper package in.

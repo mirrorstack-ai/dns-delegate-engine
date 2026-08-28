@@ -1,45 +1,84 @@
 // Package schedule declares the clock the advance loop runs on.
 //
-// 🔴 THIS PACKAGE SETTLES HOW OFTEN. IT CANNOT SETTLE WHICH.
+// 🔴 THIS PACKAGE IS A DECLARATION. IT IS NOT A CONTROL.
 //
-// docs/DESIGN.md §8 makes a promise measured in time: delete the ownership proof
-// and every write from this service stops "within one tick", because the proof
-// is re-checked on every pass. A promise denominated in ticks is worth exactly
-// what the tick is worth, and a tick that lives in a private scheduler's
-// configuration is worth nothing to the person relying on it — they would be
-// reading a support reply rather than a repository. So the numbers are here, in
-// the open, as constants, and two of them are functions a pass has to go
-// through rather than sentences a pass can ignore.
+// The numbers below are published so that "how often could MirrorStack touch my
+// zone, and under what conditions" has an answer somebody outside the company
+// can read: the ordinary gap between two passes over one registration, the
+// spread that keeps a fleet from advancing in the same second, the floor, what a
+// failed pass waits and how far that grows, how many passes a stuck registration
+// gets, and whether a pass that finds nothing missing writes anything (it does
+// not). They are constants in a public file rather than settings in a private
+// scheduler because a promise denominated in ticks is worth exactly what the
+// tick is worth, and a tick that can only be learned by asking us is worth
+// nothing to the person relying on it.
 //
-// Now the part that does not resolve, stated plainly rather than dressed up:
+// What this package does NOT do is make any of it happen:
 //
-//	a stateless service cannot enumerate what is due.
+//	declared here   the intended gap, the spread, the floor, the backoff curve
+//	                and its ceiling, the pass ceiling, and the quiet steady
+//	                state — as constants, and as three functions that compute
+//	                them.
+//	done elsewhere  which registrations exist, which one is asked about next,
+//	                when it is asked, and whether it is asked at all.
 //
-// Enumeration needs the list of registrations; the list is rows; and this
-// service owns no rows and never will — see CLAUDE.md, "No database, ever", and
-// DESIGN.md §7. So the half of "what runs, and when" that walks the list and
-// picks the next domain to advance stays in api-platform, where it is not
-// public. The division is exact, and a reader should hold both halves of it:
+// That split is structural, not a preference. Deciding something is due needs
+// the list of registrations; the list is rows; this service owns no rows and
+// never will (CLAUDE.md, "No database, ever", and DESIGN.md §7). So the private
+// half in api-platform holds the list AND the clock. Advance, Complete and
+// BindAppToOrgAppDomain publish as fast as they are invoked, and nothing in this
+// repository slows them down.
 //
-//	settled here       the gap between two passes over one registration, the
-//	                   spread that stops a fleet advancing in the same second,
-//	                   the floor nothing may go below, what a failed pass waits,
-//	                   how many passes a stuck registration gets, and whether a
-//	                   pass that finds nothing missing writes anything (it does
-//	                   not).
-//	settled elsewhere  which registrations exist, which one is asked about next,
-//	                   and whether anything is asked at all.
+// 🔴 SO THE FLOOR IS DECLARED HERE AND ENFORCED NOWHERE, and the reason is worth
+// stating rather than leaving a reader to assume it is unfinished work. Refusing
+// an early pass means knowing when the last one ran, and there is nowhere honest
+// to keep that timestamp. DESIGN §5 lists every field the caller may send and
+// none of them is a time; neither sealed envelope carries one. Sealing one would
+// not fix it either: the private half holds every envelope this service ever
+// issued and can hand back an older one, and rolling a last-pass time backwards
+// asks for MORE frequency, not less. That is the same argument §8 gives for why
+// a stateless service cannot count deletions, and it lands the same way here.
 //
-// What that division buys is a BOUND, not a schedule. The private half may
-// advance a domain less often than the cadence below, or never — §7's "a sealed
-// envelope can be withheld" is the same limitation seen from the credential
-// side, and it is a limitation in the customer's favour. What it cannot do is
-// make this service touch a zone more often than MinInterval, because Due
-// refuses.
+// Which is why the numbers are still worth publishing:
 //
-// 🔴 A PASS THAT DOES NOT CONSULT Due IS A DEFECT. Same standing rule as
-// dnsplan.Contains, and for the same reason: a bound one caller may skip is a
-// bound that will be skipped by the caller that mattered.
+//	a declared cadence is a claim a customer can falsify. An undeclared one
+//	cannot be checked at all.
+//
+// How far that goes is worth being precise about, because only the checkable
+// half is any use. Every write we make under an anchor lands in the customer's
+// own zone with a timestamp, in a log we do not control and cannot edit. Quiet
+// is the claim it tests hardest: a converged registration should leave that log
+// silent, so a chatty steady state would be visible the first day. A repair
+// recurring faster than minInterval would be visible the same way. What a change
+// log does NOT show is a pass that wrote nothing — most of them, by design — so
+// the poll rate itself is only checkable where the provider logs API access as
+// well as changes. Where it is checkable, these are the numbers to check
+// against. Where it is not, the two controls in §8 — delete the ownership proof,
+// revoke at the provider — end it regardless of what we were doing, and neither
+// needs our cooperation. Those are the real bounds; this file is the claim they
+// are used to judge.
+//
+// One neighbouring guarantee does NOT depend on any of this, and confusing the
+// two would undersell it. §8's "every write stops within one tick" is kept by
+// the pass, not by the clock: intent.Service.pass re-reads the ownership proof
+// and, when it resolves as ABSENT, returns before a credential is opened. So the
+// cadence cannot open a window between a customer deleting the proof and us
+// stopping — a slower loop makes fewer writes, not later ones, and the tick in
+// that sentence bounds how long the customer waits to see the record NOT come
+// back, not how long we keep writing. (A proof that cannot be resolved at all —
+// SERVFAIL, a timeout — is a third state, and what a pass does with it is
+// decided there, not here.) That promise is enforced in code. The cadence below
+// is not, and the difference is the point of this comment.
+//
+// Due, Spread and Delay stay because they are that declaration in executable
+// form. A reader who wants the wait after the fourth consecutive failure calls
+// Delay(4) rather than parsing a sentence, and Due answers the boundary cases —
+// never advanced, a clock running ahead, an interval set below the floor — that
+// prose leaves ambiguous. Any loop built to run this cadence, ours or a second
+// implementation of the private half, should go through them rather than
+// re-derive the arithmetic, so the schedule that runs and the schedule that is
+// published cannot drift apart. Today they have no caller outside the tests, and
+// this comment says so until they do.
 //
 // Nothing in this file reads a clock of its own, opens a connection, or starts a
 // goroutine. Every function is pure and takes the times it needs as arguments,
@@ -65,10 +104,17 @@ const maxDuration = time.Duration(1<<63 - 1)
 // unfalsifiable — true, perhaps, but not checkable, which in this repository is
 // the same as not claimed.
 type Cadence struct {
-	// Interval is the ordinary gap between two passes over one registration.
-	// It is also the resolution of every promise in §8 that is measured in
-	// time: a proof the customer deletes is noticed one interval later, at
-	// worst, because noticing is what a pass does.
+	// Interval is the ordinary gap between two passes over one registration,
+	// and so the resolution of anything in §8 measured in time: a proof the
+	// customer deletes is noticed one interval after they delete it, if the
+	// loop is running at the cadence declared here. A loop running slower
+	// notices later — the private half may advance a domain less often than
+	// this, or never, which is §7's "a sealed envelope can be withheld" seen
+	// from the schedule side and is a limitation in the customer's favour.
+	//
+	// The direction that would NOT be in their favour is not governed here:
+	// §8's "every write stops within one tick" is kept by the proof re-check
+	// inside a pass, not by this number. See the package comment.
 	Interval time.Duration
 
 	// Jitter is the width of the per-registration offset that keeps a fleet
@@ -78,14 +124,20 @@ type Cadence struct {
 	// tick" — a spread that is never disclosed is a promise quietly widened.
 	Jitter time.Duration
 
-	// MinInterval is the floor: no caller, ours or otherwise, can cause a
-	// registration to be advanced more often than this.
+	// MinInterval is the floor: the fastest this cadence says a registration
+	// may be advanced, whatever a caller asks for.
 	//
-	// 🔴 THIS IS THE ONE VALUE HERE THAT IS A CONTROL RATHER THAN A
-	// DECLARATION. Interval, Jitter and MaxPasses describe what the loop
-	// intends; a caller that ignores them advances at some other rate and no
-	// code in this repository would know. MinInterval is different because Due
-	// enforces it at the door, against whatever the caller asks for.
+	// 🔴 IT IS DECLARED, NOT ENFORCED, and it is the field most likely to be
+	// misread as a guarantee. Due applies it to every caller that asks — and
+	// applies it to a Cadence whose Interval was set below it — but nothing in
+	// this service makes a caller ask, because refusing an early pass needs a
+	// last-pass timestamp this service has no honest place to keep. The package
+	// comment gives that argument in full; it is the same one §8 gives for why
+	// we cannot count deletions.
+	//
+	// What the number is for: it is the rate a customer can hold us to. A
+	// repair recurring faster than this in their own change log is us breaking
+	// a published claim, in a record they can point at.
 	MinInterval time.Duration
 
 	// Backoff is what a failed pass waits before the next one. Worth reading as
@@ -94,8 +146,8 @@ type Cadence struct {
 	// off is how we stop being the reason their rate limit is exhausted.
 	Backoff Backoff
 
-	// MaxPasses bounds one run of consecutive passes that leave a registration
-	// still unfinished. After that it stops being advanced and becomes
+	// MaxPasses is how many consecutive passes may leave a registration still
+	// unfinished before the loop should stop advancing it and it becomes
 	// something a person looks at. A pass that finds everything present ends
 	// the run and resets the count.
 	//
@@ -180,15 +232,20 @@ const (
 
 	// minInterval — 60 seconds, and it is a FLOOR rather than a target.
 	//
-	// It exists because "how often" has to survive a bug on the other side of a
-	// boundary this repository cannot see. If a scheduler over there loops,
-	// retries hot, or is deployed twice, the worst it can do to a customer zone
-	// is sixty reads an hour instead of sixty a second.
+	// It exists because "how often" has to mean something across a boundary
+	// this repository cannot see. A scheduler over there that loops, retries
+	// hot, or is deployed twice will not be stopped by this number — nothing
+	// here can stop it, see the package comment — but it will be MEASURED
+	// against it. Sixty seconds is the line between a fast pass and a bug we
+	// have published our own definition of, which is what makes "your zone was
+	// touched nine times a minute" a breach of something written down rather
+	// than an argument about what is reasonable.
 	//
 	// It sits well below interval on purpose, so that a legitimate "check now"
 	// — a person clicking retry in a console immediately after publishing the
-	// proof — still works without a code change here. A floor set at the
-	// interval would have punished the one case that is a human waiting.
+	// proof — is inside what we published, without a code change here. A floor
+	// set at the interval would have made the one case that is a human waiting
+	// look like the abuse.
 	minInterval = 60 * time.Second
 
 	// backoffFirst — 60 seconds, set EQUAL TO minInterval deliberately: the
@@ -225,9 +282,10 @@ const (
 	//
 	// 288 is tied to the 24-hour grant on lanes 1 and 3 on purpose: the passes
 	// we are willing to make run out at about the moment the credential we hold
-	// to make them does. On lane 2, whose grant is standing, this ceiling is the
-	// only thing that ends a futile run at all, which is why it is declared
-	// rather than left to whatever the caller felt was reasonable.
+	// to make them does. On lane 2, whose grant is standing, the credential
+	// never expires, so this ceiling is the only declared end to a futile run —
+	// which is why there is a number here at all rather than whatever the caller
+	// thought was reasonable, unwritten.
 	//
 	// It counts PASSES, not hours. A registration that is failing and backing
 	// off spans far longer in wall-clock time, deliberately: passes are what
@@ -239,7 +297,7 @@ const (
 	quiet = true
 )
 
-// Declared is the cadence this build runs.
+// Declared is the cadence this build publishes.
 //
 // It is a constant in this file rather than an environment variable, a flag or a
 // parameter, and that is the entire point: a value read from configuration is
@@ -247,8 +305,14 @@ const (
 // someone see the shape of the clock and none of its numbers, which is the
 // situation §8 exists to end. Changing any of these is a customer-visible change
 // to how often we may touch a zone, so it should be a reviewable diff in a
-// public repository — and health() publishes the deployed commit, so which diff
-// is running is checkable too.
+// public repository.
+//
+// A diff is only half of it: knowing WHICH revision is deployed needs the
+// running service to say so. That is health()'s job, and the claim above is
+// worth exactly as much as health()'s answer identifies a commit — so if this
+// build's health response carries no revision, the numbers below are checkable
+// in the source and not in the deployment, and a customer comparing the two is
+// taking our word for which is which.
 //
 // It returns the whole struct rather than exporting the fields one by one so a
 // caller cannot take half a cadence. An interval without its floor is not a
@@ -274,11 +338,13 @@ func Declared() Cadence {
 //
 // 🔴 THE REQUIRED GAP IS THE LARGER OF Interval AND MinInterval.
 //
-// That max() is the floor doing its job. A Cadence whose interval was set below
-// the floor — by a bug, by a test, by some future per-lane variation — still
-// cannot beat the floor, because the comparison is made here rather than trusted
-// to whoever built the struct. A floor that is only a comment on a constant is
-// not a floor.
+// A Cadence whose interval was set below the floor — by a bug, by a test, by
+// some future per-lane variation — cannot beat the floor here, because the
+// comparison is made at the decision rather than trusted to whoever assembled
+// the struct. That is the whole of what this function guarantees, and it is
+// worth being exact about the size of it: the floor binds every caller that
+// ASKS. Nothing in this service makes one ask, and the package comment says why
+// that cannot be fixed from this side.
 //
 // Three edges fall out of the arithmetic, and all three fail in the safe
 // direction:
@@ -317,9 +383,11 @@ func (c Cadence) Due(last, now time.Time) bool {
 // rand" is not something anyone can verify from outside.
 //
 // 🔴 SPREAD ONLY EVER DELAYS. The result is in [0, Jitter), it is ADDED to a
-// pass time, and Due deliberately does not consult it. Jitter that could pull a
-// pass earlier would be a way around MinInterval, which is the one number in
-// this file that nothing may weaken.
+// pass time, and Due deliberately does not consult it. A jitter that could pull
+// a pass earlier would mean the declared floor and the declared spread
+// contradicting each other — the file would be publishing two numbers a customer
+// cannot both hold us to. Jitter widens the tick they are promised and never
+// narrows it.
 //
 // FNV is not a security primitive and nothing here needs it to be one. The
 // modulo bias across a 64-bit hash is orders of magnitude below anything
@@ -344,7 +412,7 @@ func (b Backoff) Delay(attempt int) time.Duration {
 	}
 	delay := b.First
 	factor := time.Duration(b.Factor)
-	// 🔴 attempt ARRIVES FROM THE PRIVATE HALF'S ROW AND IS UNTRUSTED, like
+	// 🔴 attempt IS THE PRIVATE HALF'S COUNT, SO IT IS UNTRUSTED, like
 	// every other value that crosses that boundary. So the loop stops the moment
 	// another step would reach the ceiling: a runaway or corrupt counter costs a
 	// handful of iterations rather than 2^n of them, and — the part that

@@ -23,11 +23,17 @@ import (
 // check by reading the imports, and one shared URL string is a cheap price.
 const edgeAPIBase = "https://api.cloudflare.com/client/v4"
 
-// ownershipRecordPrefix is the owner name Cloudflare mints the serving proof at.
-// It is here to be asserted against, not to be constructed from: the name is
-// relayed verbatim from Cloudflare, and this constant only checks that what came
-// back is the record we asked for.
-const ownershipRecordPrefix = "_cf-custom-hostname."
+// maxEdgeResponse bounds the upstream body this reader will hold in memory.
+//
+// Base is overridable and the response is untrusted input in the same sense
+// internal/sealed's stored envelope is: it is read BEFORE anything about it has
+// been established, so an endpoint that answers with an endless body must not be
+// able to turn one pass of the loop into an allocation. A custom hostname
+// listing filtered to ONE hostname is a few kilobytes; this is generous by
+// orders of magnitude and still finite. Exceeding it is a refusal, not a silent
+// truncation — a truncated JSON body that happened to parse would be an answer
+// nobody sent.
+const maxEdgeResponse = 1 << 20 // 1 MiB
 
 // TokenSource yields MirrorStack's own Cloudflare zone credential for one call.
 //
@@ -106,9 +112,11 @@ type customHostname struct {
 // is not; on a later one both are.
 //
 // ready=false with a nil error is the normal early state: the custom hostname
-// does not exist yet, or exists and Cloudflare has not asked for a proof. Only a
-// failed call, a missing credential, or a record Cloudflare's own contract says
-// it cannot return produces an error.
+// does not exist yet, or exists and Cloudflare has not asked for a proof. The
+// only errors this method returns are a failed call and a missing credential. A
+// record Cloudflare's own contract says it cannot return is refused one level
+// up, by the free ServingProof in relay.go, so the refusal holds for every
+// implementation of EdgeHostnames rather than for this one.
 func (e Edge) ServingProof(ctx context.Context, host string) (dnsplan.Record, bool, error) {
 	host = dnsplan.NormalizeName(host)
 	if host == "" || len(host) > dnsplan.MaxDNSName {
@@ -160,47 +168,45 @@ func (e Edge) ServingProof(ctx context.Context, host string) (dnsplan.Record, bo
 		if dnsplan.NormalizeName(found.Hostname) != host {
 			continue
 		}
-		return servingProofRecord(host, found)
+		record, ready := servingProofRecord(found)
+		return record, ready, nil
 	}
 	// No custom hostname for this host yet. Ordinary: it is created only after
 	// the customer's own ownership TXT verifies in public DNS.
 	return dnsplan.Record{}, false, nil
 }
 
-// servingProofRecord reads one custom hostname's ownership_verification.
+// servingProofRecord reads one custom hostname's ownership_verification and
+// answers the one question this file is entitled to answer about it: has
+// Cloudflare minted a proof yet.
 //
 // 🔴 CLOUDFLARE KEEPS THIS OBJECT PRESENT WITH EMPTY STRINGS once the proof is
 // no longer required, and this was MEASURED on a live host rather than guessed
 // at. An unguarded read of it produces a record with no name — which normalizes
 // to the empty string and, at any publisher that does not re-check, lands as a
 // write against the customer's zone APEX. The object being present proves
-// nothing; only a non-empty name AND a non-empty value do.
+// nothing; only a non-empty name AND a non-empty value do. That is Cloudflare's
+// wire shape, which is why the WAIT is decided here.
 //
 // Note also that ownership_verification is a TOP-LEVEL field, a sibling of ssl
 // rather than a member of it. api-platform read the ssl object alone and went
 // months without ever parsing this proof, which is the same shape of bug read
 // from the other side.
-func servingProofRecord(host string, found customHostname) (dnsplan.Record, bool, error) {
+//
+// 🔴 WHETHER THE RECORD MAY BE PUBLISHED IS NOT DECIDED HERE. The type, the
+// _cf-custom-hostname name beneath the host that was asked for, and the bound on
+// the value are checked by the free ServingProof in relay.go, above this
+// interface, so they hold for any edge implementation and not only for this one.
+// Cloudflare's HTTP alternative, for instance, arrives in its own field
+// (ownership_verification_http) and never as a type here — but it is relay.go
+// that refuses a non-TXT, because an adapter cannot opt out of a rule it never
+// sees.
+func servingProofRecord(found customHostname) (dnsplan.Record, bool) {
 	proof := found.OwnershipVerification
 	if strings.TrimSpace(proof.Name) == "" || strings.TrimSpace(proof.Value) == "" {
-		return dnsplan.Record{}, false, nil
+		return dnsplan.Record{}, false
 	}
-	if !strings.EqualFold(strings.TrimSpace(proof.Type), "txt") {
-		// Cloudflare's HTTP alternative arrives in its own field
-		// (ownership_verification_http), so a non-TXT type here is not a form
-		// this service knows how to publish rather than a form it declines to.
-		return dnsplan.Record{}, false, fmt.Errorf("%w: ownership verification for %q is %q, not txt",
-			ErrUnexpectedRecord, host, proof.Type)
-	}
-	record := relayedRecord("TXT", proof.Name, proof.Value)
-	// The proof must name the host we asked about. Cloudflare has no reason to
-	// return anything else, which is exactly why an unchecked assumption here
-	// would survive review and then publish another registration's record.
-	if !dnsplan.Contains(host, record.Name) || !strings.HasPrefix(record.Name, ownershipRecordPrefix) {
-		return dnsplan.Record{}, false, fmt.Errorf("%w: ownership verification for %q names %q",
-			ErrUnexpectedRecord, host, record.Name)
-	}
-	return record, true, nil
+	return relayedRecord(proof.Type, proof.Name, proof.Value), true
 }
 
 func (e Edge) base() string {
@@ -235,9 +241,15 @@ func (e Edge) get(ctx context.Context, token, path string, out any) error {
 		return fmt.Errorf("relay: custom hostname request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
+	// One byte past the bound, so a body AT the limit is told apart from one
+	// that was cut off at it.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxEdgeResponse+1))
 	if err != nil {
 		return fmt.Errorf("relay: read custom hostname response: %w", err)
+	}
+	if len(raw) > maxEdgeResponse {
+		return fmt.Errorf("relay: custom hostname response is longer than %d bytes (status %d)",
+			maxEdgeResponse, resp.StatusCode)
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		// The status code is reported without the body. A response this service
