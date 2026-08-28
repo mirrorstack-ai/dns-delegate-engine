@@ -33,6 +33,7 @@ import (
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/derive"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsprovider"
 )
 
 // ErrObserve is this package's single refusal: the plan cannot be observed at
@@ -583,13 +584,16 @@ func isNotFound(err error) bool {
 // quotes a zone file uses and a provider's API usually does not, and whitespace
 // from wherever it was pasted.
 //
+// The quotes go through dnsprovider.TrimTXTQuotes, which is the form the WRITE
+// path compares with — "this value is already correct" and "this value is
+// published" have to be one question.
+//
 // Case is NOT folded. A TXT value is an octet string, and a difference in case
 // is a real difference to whoever is checking it — a value that looks published
 // to us but not to Cloudflare would be the worst of both answers. The ownership
 // proof is the one deliberate exception; see foldProofValue.
 func normalizeTXT(value string) string {
-	value = strings.TrimSpace(value)
-	value = strings.Trim(value, `"`)
+	value = dnsprovider.TrimTXTQuotes(strings.TrimSpace(value))
 	return strings.TrimSpace(value)
 }
 
@@ -604,22 +608,18 @@ func normalizeTXTValues(values []string) []string {
 	return out
 }
 
-// foldProofValue is the ownership proof's comparison form.
+// foldProofValue is the ownership proof's comparison form: normalizeTXT, then
+// case folded, because the proof is lowercase base32 and several DNS control
+// panels upper-case what is pasted into them. Refusing over presentation would
+// refuse a customer who did as asked.
 //
 // 🔴 IT MUST AGREE WITH internal/proof's `fold`, WHICH IS THE CANONICAL ONE.
-// Duplicated rather than imported because Proof is handed an accept set and
-// never an identity — what keeps this package unable to decide what counts as a
-// valid proof. The duplication is guarded, not promised:
+// Not imported because Proof is handed an accept set and never an identity —
+// what keeps this package unable to decide what counts as a valid proof — so
 // TestProofMatchingAgreesWithTheProofPackage drives this and proof.Prover.Matches
 // over one table and fails if they ever disagree.
-//
-// Case is folded here, unlike every other TXT value, because the proof is
-// lowercase base32 and several DNS control panels upper-case what is pasted into
-// them. Refusing over presentation would refuse a customer who did as asked.
 func foldProofValue(value string) string {
-	value = strings.TrimSpace(value)
-	value = strings.Trim(value, `"`)
-	return strings.ToLower(strings.TrimSpace(value))
+	return strings.ToLower(normalizeTXT(value))
 }
 
 // matchesAccepted reports whether any observed value is an accepted one.

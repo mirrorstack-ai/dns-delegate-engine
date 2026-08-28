@@ -2,7 +2,6 @@ package intent
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -27,6 +26,8 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/sealed"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfoauth"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport/derivefixture"
 )
 
 // Fixture domains are example.com / .net / .org only, per CLAUDE.md: a real
@@ -39,7 +40,7 @@ const (
 	appParent      = "example.net" // lane 2
 	appHostname    = "example.org" // lane 3
 
-	testDCVUUID = "6126b8722afa32ca"
+	testDCVUUID = derivefixture.DCVDelegationUUID
 )
 
 // ─── the tests the rules demand ─────────────────────────────────────────────
@@ -451,7 +452,7 @@ func TestCompleteRefusesAStateFromAnotherKeyset(t *testing.T) {
 	out := h.register(t, lane.OrgPlatformDomain, testOrg, platformDomain)
 	h.publishProof(t, out)
 
-	stranger := newSealer(t, "other")
+	stranger := testsupport.Sealer(t, "other")
 	state, err := sealed.SealAuthState(stranger, sealed.AuthState{
 		Lane: lane.OrgPlatformDomain, Identity: testOrg, Anchor: platformDomain,
 		Nonce: "00112233445566778899aabbccddeeff", IssuedAt: nowUnix(),
@@ -989,7 +990,7 @@ func TestReleaseReportsAnUnreadableEnvelopeRatherThanGuessing(t *testing.T) {
 // what binds it — one org can connect one domain on two lanes, and those are two
 // consents, two proofs and two grants.
 func TestGrantAADBindsToTheWholeRegistration(t *testing.T) {
-	sealer := newSealer(t, "k1")
+	sealer := testsupport.Sealer(t, "k1")
 	base := sealed.Registration{Lane: lane.OrgPlatformDomain, Identity: testOrg, Anchor: platformDomain}
 	aad := GrantAAD(base)
 	if aad != "ms-dns-grant/v1\x00org_platform_domain\x00"+testOrg+"\x00"+platformDomain {
@@ -1065,7 +1066,7 @@ func TestVerifyRecomputesTheValueItLooksFor(t *testing.T) {
 // constant shared by every customer.
 func TestADeploymentWithNoKeysetRefusesEveryEntryPoint(t *testing.T) {
 	h := newHarness(t)
-	h.svc.Keys = stubKeys{}
+	h.svc.Keys = testsupport.StubKeys{}
 	if _, err := h.svc.AddOrgPlatformDomain(t.Context(), AddOrgPlatformDomainRequest{
 		OrgID: testOrg, Domain: platformDomain,
 	}); !errors.Is(err, ErrUnavailable) {
@@ -1549,22 +1550,17 @@ func newHarness(t *testing.T) *harness {
 
 func newHarnessWithKeys(t *testing.T, ids ...string) *harness {
 	t.Helper()
-	sealer := newSealer(t, ids...)
+	sealer := testsupport.Sealer(t, ids...)
 	resolver := &fakeResolver{
 		txt: map[string][]string{}, cname: map[string]string{}, fail: map[string]error{},
 	}
 	provider := &recordingProvider{}
 	oauth := &oauthServer{}
 	svc := &Service{
-		Keys:      stubKeys{sealer: sealer},
+		Keys:      testsupport.StubKeys{Held: sealer},
 		Publisher: reconcile.Publisher{Provider: provider},
 		Resolver:  resolver,
-		Derive: derive.Config{
-			OrgRoutingTarget:  "connect.mirrorstack.ai",
-			AppRoutingTarget:  "connect.mirrorstack.app",
-			DCVDelegationUUID: testDCVUUID,
-			ReservedSuffixes:  []string{"mirrorstack.ai", "mirrorstack.app"},
-		},
+		Derive:    derivefixture.Config(),
 	}
 	svc.OAuth, svc.HTTPClient = oauth.start(t)
 	return &harness{svc: svc, sealer: sealer, resolver: resolver, provider: provider, oauth: oauth}
@@ -1625,38 +1621,6 @@ func (h *harness) authorize(t *testing.T, out RegisteredResponse) string {
 	return authorized.State
 }
 
-// newSealer derives key material from the key ID rather than from its position,
-// so a rotation fixture that reorders ids still holds identical bytes — the same
-// property grantcrypto's own tests rely on, and the reason
-// TestDescribeReportsAProofPublishedUnderARotatedKey means anything.
-func newSealer(t *testing.T, ids ...string) *grantcrypto.Sealer {
-	t.Helper()
-	if len(ids) == 0 {
-		t.Fatal("a keyset needs at least one key")
-	}
-	entries := make([]string, 0, len(ids))
-	for _, id := range ids {
-		raw := make([]byte, grantcrypto.KeySize)
-		for i := range raw {
-			raw[i] = id[i%len(id)] ^ byte(i)
-		}
-		entries = append(entries, fmt.Sprintf("%q:%q", id, base64.StdEncoding.EncodeToString(raw)))
-	}
-	keys, err := grantcrypto.ParseKeyset(fmt.Sprintf(`{"active":%q,"keys":{%s}}`, ids[0], strings.Join(entries, ",")))
-	if err != nil {
-		t.Fatalf("ParseKeyset: %v", err)
-	}
-	sealer, err := grantcrypto.NewSealer(keys)
-	if err != nil {
-		t.Fatalf("NewSealer: %v", err)
-	}
-	return sealer
-}
-
-type stubKeys struct{ sealer *grantcrypto.Sealer }
-
-func (s stubKeys) Sealer(context.Context) *grantcrypto.Sealer { return s.sealer }
-
 // vanishingKeys stops handing out a sealer once gone is set.
 //
 // It is the only way to make sealing FAIL: a Sealer holding a key cannot fail to
@@ -1676,10 +1640,6 @@ func (v *vanishingKeys) Sealer(context.Context) *grantcrypto.Sealer {
 	}
 	return v.sealer
 }
-
-type stubOAuth struct{ cfg *cfoauth.Config }
-
-func (s stubOAuth) Config(context.Context) *cfoauth.Config { return s.cfg }
 
 // fakeResolver answers from a map. No test in this package resolves a real name:
 // the whole safety story here is meant to be checkable without a network.
@@ -1703,7 +1663,7 @@ func (f *fakeResolver) LookupTXT(_ context.Context, name string) ([]string, erro
 	if values, ok := f.txt[dnsplan.NormalizeName(name)]; ok {
 		return values, nil
 	}
-	return nil, notFound(name)
+	return nil, testsupport.NotFound(name)
 }
 
 func (f *fakeResolver) LookupCNAME(_ context.Context, name string) (string, error) {
@@ -1715,7 +1675,7 @@ func (f *fakeResolver) LookupCNAME(_ context.Context, name string) (string, erro
 	if value, ok := f.cname[dnsplan.NormalizeName(name)]; ok {
 		return value, nil
 	}
-	return "", notFound(name)
+	return "", testsupport.NotFound(name)
 }
 
 // failWith makes a name answer with something OTHER than absence — the state
@@ -1731,13 +1691,6 @@ func (f *fakeResolver) remove(name string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.txt, dnsplan.NormalizeName(name))
-}
-
-// notFound is how a resolver spells NXDOMAIN, and also "the name exists but
-// holds no record of this type". internal/observe recognises exactly this and
-// nothing else as absence.
-func notFound(name string) error {
-	return &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
 }
 
 // recordingProvider counts what reached the customer's zone. Writes are what the
@@ -1829,7 +1782,7 @@ func (o *oauthServer) start(t *testing.T) (oauthLoader, *http.Client) {
 		fmt.Fprintf(w, `{"access_token":"access-1","refresh_token":%q,"token_type":"bearer","expires_in":3600}`, refresh)
 	}))
 	t.Cleanup(ts.Close)
-	return stubOAuth{cfg: &cfoauth.Config{
+	return testsupport.StubOAuth{Cfg: &cfoauth.Config{
 		Config: oauth2.Config{
 			ClientID: "cid", ClientSecret: "csec", RedirectURL: "https://account.example/cb",
 			Scopes: []string{"zone.read", "dns.write", "offline_access"},

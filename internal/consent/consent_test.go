@@ -1,7 +1,6 @@
 package consent
 
 import (
-	"encoding/base64"
 	"errors"
 	"html/template"
 	"strings"
@@ -11,7 +10,10 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/proof"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/relay"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport/derivefixture"
 )
 
 const (
@@ -26,60 +28,9 @@ const (
 	fixtureProof = "msv1-aaaaaaaabbbbbbbbccccccccddddddddeeeeeeeeffffffffgggg"
 )
 
-// goldenKeyset is 32 bytes 0x00…0x1f under one key id, written out rather than
-// randomized so a reader can regenerate the vector in TestGoldenAcknowledgement
-// with any HKDF/HMAC tool. Deliberately identical to internal/proof's fixture,
-// which is what makes TestAnOwnershipProofIsNotAnAcknowledgement a test of the
-// domain separation rather than of two different keys.
-func goldenKeyset(t *testing.T) string {
-	t.Helper()
-	raw := make([]byte, grantcrypto.KeySize)
-	for i := range raw {
-		raw[i] = byte(i)
-	}
-	return `{"active":"golden","keys":{"golden":"` + base64.StdEncoding.EncodeToString(raw) + `"}}`
-}
-
-// keysetOf builds a keyset whose material is derived from each key id, never
-// from its position — so a rotation fixture can reorder the ids and the only
-// thing that moves is which key is active. The first id is the active one.
-func keysetOf(t *testing.T, ids ...string) string {
-	t.Helper()
-	encoded := make([]string, 0, len(ids))
-	for _, id := range ids {
-		raw := make([]byte, grantcrypto.KeySize)
-		for j := range raw {
-			raw[j] = id[j%len(id)] ^ byte(j)
-		}
-		encoded = append(encoded, `"`+id+`":"`+base64.StdEncoding.EncodeToString(raw)+`"`)
-	}
-	return `{"active":"` + ids[0] + `","keys":{` + strings.Join(encoded, ",") + `}}`
-}
-
-func sealerFrom(t *testing.T, keyset string) *grantcrypto.Sealer {
-	t.Helper()
-	keys, err := grantcrypto.ParseKeyset(keyset)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sealer, err := grantcrypto.NewSealer(keys)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return sealer
-}
-
-// testConfig is a deployment's routing vocabulary. The targets are MirrorStack's
-// own names, which is what they are in production too — a routing target is not
-// a customer domain and must not be spelled as one.
-func testConfig() derive.Config {
-	return derive.Config{
-		OrgRoutingTarget:  "connect.mirrorstack.ai",
-		AppRoutingTarget:  "connect.mirrorstack.app",
-		DCVDelegationUUID: "0123456789abcdef",
-		ReservedSuffixes:  []string{"mirrorstack.ai", "mirrorstack.app"},
-	}
-}
+// 🔴 testsupport.GoldenKeyset is the SAME key internal/proof's golden vectors
+// use, which is what makes TestAnOwnershipProofIsNotAnAcknowledgement a test of
+// the HKDF domain separation rather than of two different keys.
 
 // lane2Plan is a real registration plan from internal/derive, not a hand-built
 // one. Every test that asks what the page SAYS runs against a plan the service
@@ -87,7 +38,7 @@ func testConfig() derive.Config {
 // their own, because the plans they need are ones derive will not construct.
 func lane2Plan(t *testing.T, anchor string) derive.Plan {
 	t.Helper()
-	plan, err := testConfig().Registration(lane.OrgAppDomain, fixtureIdentity, anchor, fixtureProof)
+	plan, err := derivefixture.Config().Registration(lane.OrgAppDomain, fixtureIdentity, anchor, fixtureProof)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +105,7 @@ func TestAnUnknownLaneIsRequiredToHaveAPageAndCannotBeGivenOne(t *testing.T) {
 // ──────────────────────── Token and Verify ────────────────────────
 
 func TestTokenAndVerifyRoundTrip(t *testing.T) {
-	sealer := sealerFrom(t, goldenKeyset(t))
+	sealer := testsupport.SealerFrom(t, testsupport.GoldenKeyset(t))
 	token, err := Token(sealer, fixtureNonce, fixtureAnchor)
 	if err != nil {
 		t.Fatalf("Token: %v", err)
@@ -168,7 +119,7 @@ func TestTokenAndVerifyRoundTrip(t *testing.T) {
 }
 
 func TestVerifyRefusesATokenForADifferentReferenceOrAnchor(t *testing.T) {
-	sealer := sealerFrom(t, goldenKeyset(t))
+	sealer := testsupport.SealerFrom(t, testsupport.GoldenKeyset(t))
 	token, err := Token(sealer, fixtureNonce, fixtureAnchor)
 	if err != nil {
 		t.Fatal(err)
@@ -196,13 +147,13 @@ func TestVerifyRefusesATokenForADifferentReferenceOrAnchor(t *testing.T) {
 // otherwise send a customer back round the consent flow with nothing to tell
 // them why.
 func TestVerifyAcceptsATokenMintedUnderARetiredKey(t *testing.T) {
-	old := sealerFrom(t, keysetOf(t, "v1"))
+	old := testsupport.SealerFrom(t, testsupport.Keyset(t, "v1"))
 	token, err := Token(old, fixtureNonce, fixtureAnchor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// v2 is now active and v1 is retained: the token still verifies.
-	rotated := sealerFrom(t, keysetOf(t, "v2", "v1"))
+	rotated := testsupport.SealerFrom(t, testsupport.Keyset(t, "v2", "v1"))
 	if !Verify(rotated, fixtureNonce, fixtureAnchor, token) {
 		t.Fatal("Verify rejected a token minted under a retired-but-present key")
 	}
@@ -220,14 +171,14 @@ func TestVerifyAcceptsATokenMintedUnderARetiredKey(t *testing.T) {
 	}
 	// Dropping v1 from the keyset is what actually invalidates it — a deliberate
 	// act with a customer-visible consequence, not a cleanup.
-	dropped := sealerFrom(t, keysetOf(t, "v2"))
+	dropped := testsupport.SealerFrom(t, testsupport.Keyset(t, "v2"))
 	if Verify(dropped, fixtureNonce, fixtureAnchor, token) {
 		t.Fatal("Verify accepted a token under a key that is no longer in the keyset")
 	}
 }
 
 func TestVerifyFailsClosed(t *testing.T) {
-	sealer := sealerFrom(t, goldenKeyset(t))
+	sealer := testsupport.SealerFrom(t, testsupport.GoldenKeyset(t))
 	token, err := Token(sealer, fixtureNonce, fixtureAnchor)
 	if err != nil {
 		t.Fatal(err)
@@ -240,7 +191,7 @@ func TestVerifyFailsClosed(t *testing.T) {
 		token  string
 	}{
 		{"no keyset", nil, fixtureNonce, fixtureAnchor, token},
-		{"another deployment's keyset", sealerFrom(t, keysetOf(t, "elsewhere")), fixtureNonce, fixtureAnchor, token},
+		{"another deployment's keyset", testsupport.SealerFrom(t, testsupport.Keyset(t, "elsewhere")), fixtureNonce, fixtureAnchor, token},
 		{"no token", sealer, fixtureNonce, fixtureAnchor, ""},
 		{"whitespace token", sealer, fixtureNonce, fixtureAnchor, "   "},
 		{"a token that is not ours", sealer, fixtureNonce, fixtureAnchor, "msack1-notatoken"},
@@ -260,7 +211,7 @@ func TestVerifyFailsClosed(t *testing.T) {
 }
 
 func TestTokenRefusesWhatItCannotBind(t *testing.T) {
-	sealer := sealerFrom(t, goldenKeyset(t))
+	sealer := testsupport.SealerFrom(t, testsupport.GoldenKeyset(t))
 	for _, tc := range []struct {
 		name   string
 		sealer *grantcrypto.Sealer
@@ -298,7 +249,7 @@ func TestTokenRefusesWhatItCannotBind(t *testing.T) {
 // a value this service minted, so a spelling we never issued is not one to
 // accept.
 func TestTokenFoldsTheAnchorAndOnlyTrimsTheReference(t *testing.T) {
-	sealer := sealerFrom(t, goldenKeyset(t))
+	sealer := testsupport.SealerFrom(t, testsupport.GoldenKeyset(t))
 	token, err := Token(sealer, fixtureNonce, fixtureAnchor)
 	if err != nil {
 		t.Fatal(err)
@@ -336,7 +287,7 @@ func TestTokenFoldsTheAnchorAndOnlyTrimsTheReference(t *testing.T) {
 // pinning: the temptation to treat this one as editable is the difference.
 func TestGoldenAcknowledgement(t *testing.T) {
 	const want = "msack1-p5ge5dpa7quiyd3vr5hjbln7iruahqbnrqspj3l656pbri3okuja"
-	got, err := Token(sealerFrom(t, goldenKeyset(t)), fixtureNonce, fixtureAnchor)
+	got, err := Token(testsupport.SealerFrom(t, testsupport.GoldenKeyset(t)), fixtureNonce, fixtureAnchor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,8 +305,8 @@ func TestGoldenAcknowledgement(t *testing.T) {
 // The HKDF info is what separates them; this test is what notices if the two
 // ever share one.
 func TestAnOwnershipProofIsNotAnAcknowledgement(t *testing.T) {
-	keyset := goldenKeyset(t)
-	sealer := sealerFrom(t, keyset)
+	keyset := testsupport.GoldenKeyset(t)
+	sealer := testsupport.SealerFrom(t, keyset)
 	prover := proof.Prover{Sealer: sealer}
 	published, err := prover.Expected(lane.OrgAppDomain, fixtureIdentity, fixtureAnchor)
 	if err != nil {
@@ -408,8 +359,8 @@ func TestPageNamesTheWildcardAndSaysStanding(t *testing.T) {
 	// The per-app records, which are the point of a standing grant: names that
 	// do not exist yet.
 	for _, want := range []string{
-		template.HTMLEscapeString(dcvPrefix + slugPlaceholder + "." + fixtureAnchor),
-		template.HTMLEscapeString(servingPrefix + slugPlaceholder + "." + fixtureAnchor),
+		template.HTMLEscapeString(derive.DCVPrefix + slugPlaceholder + "." + fixtureAnchor),
+		template.HTMLEscapeString(relay.ServingProofPrefix + slugPlaceholder + "." + fixtureAnchor),
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("the page does not describe the per-app record %q", want)
@@ -535,7 +486,7 @@ func TestPageIsDeterministic(t *testing.T) {
 // what a usable (reference, anchor) pair is — a page nobody can acknowledge is a
 // dead end a customer reaches after reading the whole thing.
 func TestEveryPageServedCanBeAcknowledged(t *testing.T) {
-	sealer := sealerFrom(t, goldenKeyset(t))
+	sealer := testsupport.SealerFrom(t, testsupport.GoldenKeyset(t))
 	plan := lane2Plan(t, fixtureAnchor)
 	for _, nonce := range []string{
 		fixtureNonce,
@@ -573,7 +524,7 @@ func TestEveryPageServedCanBeAcknowledged(t *testing.T) {
 
 func TestPageRefusesEveryLaneButTheWildcardOne(t *testing.T) {
 	for _, l := range []lane.Lane{lane.OrgPlatformDomain, lane.AppDomain} {
-		plan, err := testConfig().Registration(l, fixtureIdentity, "example.com", fixtureProof)
+		plan, err := derivefixture.Config().Registration(l, fixtureIdentity, "example.com", fixtureProof)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -591,7 +542,7 @@ func TestPageRefusesEveryLaneButTheWildcardOne(t *testing.T) {
 // authorizes. It reaches this refusal twice over — no wildcard and no ownership
 // proof — and either one alone would be enough.
 func TestPageRefusesAPerAppBindPlan(t *testing.T) {
-	plan, err := testConfig().BindApp(fixtureAnchor, "blog")
+	plan, err := derivefixture.Config().BindApp(fixtureAnchor, "blog")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -731,32 +682,6 @@ func TestPageRefusesRowsItCannotHonestlyShow(t *testing.T) {
 	}
 }
 
-// The page names two records that do not exist yet, and it builds their names
-// from literals this package holds because the packages that own them keep them
-// unexported. This is the drift guard for the half that CAN be checked: if
-// internal/derive ever moves the certificate record to another owner name, the
-// page stops describing the record that will actually appear.
-func TestPerAppNamesMatchWhatBindAppDerives(t *testing.T) {
-	plan, err := testConfig().BindApp(fixtureAnchor, "blog")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan.Items) != 1 {
-		t.Fatalf("BindApp derived %d records, want 1", len(plan.Items))
-	}
-	if want := dcvPrefix + "blog." + fixtureAnchor; plan.Items[0].Record.Name != want {
-		t.Fatalf("BindApp derives %q, and the page describes %q",
-			plan.Items[0].Record.Name, want)
-	}
-	// 🔴 servingPrefix has no equivalent guard: record 7's owner name is built
-	// inside internal/relay's Cloudflare adapter, and reaching it from a test
-	// needs a Cloudflare answer. It is pinned here as a literal so a change shows
-	// up as a failing assertion in one place rather than nowhere at all.
-	if servingPrefix != "_cf-custom-hostname." {
-		t.Fatalf("the serving record's owner name moved: %q", servingPrefix)
-	}
-}
-
 // The whole point of the page is that a customer can read it. This is not a
 // styling assertion — it checks the document is complete, since a template that
 // stopped rendering halfway would still return a string.
@@ -807,7 +732,7 @@ func TestTheWriterColumnIsNeverBlank(t *testing.T) {
 	plan.Items = append(plan.Items, derive.Item{
 		Record: dnsplan.Record{
 			Type:  "TXT",
-			Name:  servingPrefix + "blog." + fixtureAnchor,
+			Name:  relay.ServingProofPrefix + "blog." + fixtureAnchor,
 			Value: "a proof Cloudflare minted",
 		},
 		Purpose: derive.PurposeServing,

@@ -9,6 +9,7 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport"
 )
 
 // fuzzKeysetJSON builds a keyset of `ids` with `active` as the active key.
@@ -40,18 +41,12 @@ func fuzzKeysetJSON(t testing.TB, ids []string, active string) string {
 	return string(encoded)
 }
 
-// fuzzProver builds a Prover over a literal keyset.
+// fuzzProver builds a Prover over a literal keyset. It keeps its own builder
+// rather than testsupport's because the ACTIVE id is fuzzed here — including to
+// one the key map does not hold, which testsupport.Keyset cannot spell.
 func fuzzProver(t testing.TB, ids []string, active string) Prover {
 	t.Helper()
-	keys, err := grantcrypto.ParseKeyset(fuzzKeysetJSON(t, ids, active))
-	if err != nil {
-		t.Fatal(err)
-	}
-	sealer, err := grantcrypto.NewSealer(keys)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return Prover{Sealer: sealer}
+	return Prover{Sealer: testsupport.SealerFrom(t, fuzzKeysetJSON(t, ids, active))}
 }
 
 // fuzzProofKey is the (lane, identity, anchor) triple AFTER the normalization

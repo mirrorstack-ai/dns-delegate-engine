@@ -26,7 +26,6 @@ package consent
 
 import (
 	"crypto/hmac"
-	"encoding/base32"
 	"errors"
 	"fmt"
 	"strings"
@@ -241,18 +240,15 @@ func message(nonce, anchor string) ([]byte, error) {
 	return []byte(messagePrefix + separator + nonce + separator + anchor), nil
 }
 
-// encode renders a MAC as the string an acknowledgement travels as: the same
-// base32 alphabet as internal/proof's published value, where the full argument
-// for it lives. Two of its reasons apply here rather than all of them. This token
-// is never typed into somebody else's web form, but it is logged, quoted in a
-// support thread and copied between two systems, so it may only hold characters
-// that survive that without quoting; and it must not be base64, because two
-// distinct MACs can differ only in the case of one character there and the case
-// folding in fold would make two different acknowledgements one value. 32 bytes
-// encode to 52 characters, 59 with the prefix.
+// encode renders a MAC as the string an acknowledgement travels as:
+// grantcrypto.EncodeMAC under this package's prefix. Two of that function's
+// reasons apply here rather than all of them — this token is never typed into
+// somebody else's web form, but it is logged, quoted in a support thread and
+// copied between two systems, and it must not be base64, because the case
+// folding in fold would make two distinct MACs one acknowledgement. 59
+// characters with the prefix.
 func encode(mac []byte) string {
-	return valuePrefix + strings.ToLower(
-		base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(mac))
+	return grantcrypto.EncodeMAC(valuePrefix, mac)
 }
 
 // fold normalizes a candidate token into the form encode produces: trimming and

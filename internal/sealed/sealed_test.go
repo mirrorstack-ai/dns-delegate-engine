@@ -11,6 +11,7 @@ import (
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport"
 )
 
 // The fixtures. Every one of them is a documentation domain (RFC 2606) or a
@@ -35,26 +36,16 @@ const (
 // that has to show up as a failure.
 var laneWireValues = []string{"org_platform_domain", "org_app_domain", "app_domain"}
 
-func testSealer(t *testing.T) *grantcrypto.Sealer {
+// testSealer takes a testing.TB so a fuzz seed corpus can be built from
+// *testing.F as well: the envelope fixtures in fuzz_test.go were sealed under
+// THIS key and open under no other.
+func testSealer(t testing.TB) *grantcrypto.Sealer {
 	t.Helper()
 	key := make([]byte, grantcrypto.KeySize)
 	for i := range key {
 		key[i] = byte(i*7 + 1)
 	}
-	// The same JSON shape the deployed secret has, built inline: a keyset
-	// fixture that reads a file or a secret store is a test that can fail for a
-	// reason that has nothing to do with sealing.
-	raw := fmt.Sprintf(`{"active":%q,"keys":{%q:%q}}`,
-		testKeyID, testKeyID, base64.StdEncoding.EncodeToString(key))
-	keys, err := grantcrypto.ParseKeyset(raw)
-	if err != nil {
-		t.Fatalf("parse test keyset: %v", err)
-	}
-	sealer, err := grantcrypto.NewSealer(keys)
-	if err != nil {
-		t.Fatalf("new test sealer: %v", err)
-	}
-	return sealer
+	return testsupport.SealerWithKey(t, testKeyID, key)
 }
 
 func wireLane(t *testing.T, wire string) lane.Lane {

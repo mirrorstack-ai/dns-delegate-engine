@@ -7,6 +7,8 @@ import (
 	"testing"
 )
 
+// testKeyset is internal/testsupport's builder, kept here because these tests are
+// in package grantcrypto and testsupport imports it.
 func testKeyset(t *testing.T, ids ...string) string {
 	t.Helper()
 	keys := map[string]string{}

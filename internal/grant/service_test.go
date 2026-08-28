@@ -19,6 +19,7 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/reconcile"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfoauth"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport"
 )
 
 // 🔴 CROSS-REPOSITORY GOLDEN — DO NOT REGENERATE TO MAKE A FAILURE GO AWAY.
@@ -75,46 +76,8 @@ func testSealer(t *testing.T) *grantcrypto.Sealer {
 	for i := range key {
 		key[i] = byte(i)
 	}
-	keys, err := grantcrypto.ParseKeyset(fmt.Sprintf(`{"active":"k1","keys":{"k1":%q}}`, base64Std(key)))
-	if err != nil {
-		t.Fatalf("ParseKeyset: %v", err)
-	}
-	sealer, err := grantcrypto.NewSealer(keys)
-	if err != nil {
-		t.Fatalf("NewSealer: %v", err)
-	}
-	return sealer
+	return testsupport.SealerWithKey(t, "k1", key)
 }
-
-func base64Std(b []byte) string {
-	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	var sb strings.Builder
-	for i := 0; i < len(b); i += 3 {
-		var chunk [3]byte
-		n := copy(chunk[:], b[i:])
-		v := uint(chunk[0])<<16 | uint(chunk[1])<<8 | uint(chunk[2])
-		out := []byte{
-			alphabet[(v>>18)&0x3f], alphabet[(v>>12)&0x3f],
-			alphabet[(v>>6)&0x3f], alphabet[v&0x3f],
-		}
-		switch n {
-		case 1:
-			out[2], out[3] = '=', '='
-		case 2:
-			out[3] = '='
-		}
-		sb.Write(out)
-	}
-	return sb.String()
-}
-
-type stubOAuth struct{ cfg *cfoauth.Config }
-
-func (s stubOAuth) Config(context.Context) *cfoauth.Config { return s.cfg }
-
-type stubKeys struct{ sealer *grantcrypto.Sealer }
-
-func (s stubKeys) Sealer(context.Context) *grantcrypto.Sealer { return s.sealer }
 
 type recordingProvider struct {
 	writes  int
@@ -191,12 +154,12 @@ func newService(t *testing.T, provider dnsprovider.Provider, srv *oauthServer, w
 		RevokeURL: ts.URL + "/revoke", AuthMethod: cfoauth.AuthClientSecretPost,
 	}
 	svc := &Service{
-		OAuth:      stubOAuth{cfg: cfg},
+		OAuth:      testsupport.StubOAuth{Cfg: cfg},
 		Publisher:  reconcile.Publisher{Provider: provider},
 		HTTPClient: ts.Client(),
 	}
 	if withKeys {
-		svc.Keys = stubKeys{sealer: testSealer(t)}
+		svc.Keys = testsupport.StubKeys{Held: testSealer(t)}
 	}
 	return svc, ts
 }
@@ -458,7 +421,7 @@ func TestPublishRequiresExactlyOneCredentialSource(t *testing.T) {
 }
 
 func TestUnavailableWhenNoOAuthClient(t *testing.T) {
-	svc := &Service{OAuth: stubOAuth{}}
+	svc := &Service{OAuth: testsupport.StubOAuth{}}
 	if _, err := svc.Publish(context.Background(), baseRequest()); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("want ErrUnavailable, got %v", err)
 	}

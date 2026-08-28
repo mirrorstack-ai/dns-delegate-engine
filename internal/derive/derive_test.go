@@ -2,7 +2,6 @@ package derive
 
 import (
 	"bytes"
-	"encoding/base64"
 	"errors"
 	"os"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/proof"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport"
 )
 
 // One fixture domain per lane, so a golden plan can never be read as belonging
@@ -718,16 +718,7 @@ func TestOwnershipRecordMatchesInternalProof(t *testing.T) {
 
 func testSealer(t *testing.T) *grantcrypto.Sealer {
 	t.Helper()
-	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x2a}, grantcrypto.KeySize))
-	keys, err := grantcrypto.ParseKeyset(`{"active":"k1","keys":{"k1":"` + key + `"}}`)
-	if err != nil {
-		t.Fatalf("ParseKeyset: %v", err)
-	}
-	sealer, err := grantcrypto.NewSealer(keys)
-	if err != nil {
-		t.Fatalf("NewSealer: %v", err)
-	}
-	return sealer
+	return testsupport.SealerWithKey(t, "k1", bytes.Repeat([]byte{0x2a}, grantcrypto.KeySize))
 }
 
 // Every plan this package produces is one dnsplan.NewSnapshot accepts. The two

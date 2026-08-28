@@ -254,26 +254,26 @@ func FuzzCheckedRecordsAreAlwaysBounded(f *testing.F) {
 // a log line is forged.
 func FuzzServingProofsAreAlwaysBounded(f *testing.F) {
 	const host = "account.example.com"
-	f.Add(host, "TXT", ownershipRecordPrefix+host, "proof-value")
+	f.Add(host, "TXT", ServingProofPrefix+host, "proof-value")
 	f.Add(host, "txt", "_CF-Custom-Hostname.Account.Example.com", "proof-value")
 	// Every case TestAHostileEdgeIsRefusedAboveTheInterface names.
-	f.Add(host, "TXT", ownershipRecordPrefix+"example.net", "v")
+	f.Add(host, "TXT", ServingProofPrefix+"example.net", "v")
 	f.Add(host, "TXT", host, "v")
 	f.Add(host, "TXT", "_other."+host, "v")
-	f.Add(host, "CNAME", ownershipRecordPrefix+host, "v")
-	f.Add(host, "TXT", ownershipRecordPrefix+host, "")
-	f.Add(host, "TXT", ownershipRecordPrefix+host, strings.Repeat("a", maxServingProofValue+1))
-	f.Add(host, "TXT", ownershipRecordPrefix+host, `proof" "injected`)
-	f.Add(host, "TXT", ownershipRecordPrefix+host, `proof\injected`)
-	f.Add(host, "TXT", ownershipRecordPrefix+host, "proof\nlog-line-forged")
+	f.Add(host, "CNAME", ServingProofPrefix+host, "v")
+	f.Add(host, "TXT", ServingProofPrefix+host, "")
+	f.Add(host, "TXT", ServingProofPrefix+host, strings.Repeat("a", maxServingProofValue+1))
+	f.Add(host, "TXT", ServingProofPrefix+host, `proof" "injected`)
+	f.Add(host, "TXT", ServingProofPrefix+host, `proof\injected`)
+	f.Add(host, "TXT", ServingProofPrefix+host, "proof\nlog-line-forged")
 	// A TXT value's trailing dot is DATA, not presentation, and must survive.
-	f.Add(host, "TXT", ownershipRecordPrefix+host, "proof.")
+	f.Add(host, "TXT", ServingProofPrefix+host, "proof.")
 	// Hosts that are not hosts, and the root dot with whitespace in front.
-	f.Add("", "TXT", ownershipRecordPrefix+host, "v")
-	f.Add(".", "TXT", ownershipRecordPrefix+host, "v")
-	f.Add(strings.Repeat("a.", 200), "TXT", ownershipRecordPrefix+host, "v")
-	f.Add(host+" .", "TXT", ownershipRecordPrefix+host, "v")
-	f.Add(host, "TXT", ownershipRecordPrefix+host+" .", "v")
+	f.Add("", "TXT", ServingProofPrefix+host, "v")
+	f.Add(".", "TXT", ServingProofPrefix+host, "v")
+	f.Add(strings.Repeat("a.", 200), "TXT", ServingProofPrefix+host, "v")
+	f.Add(host+" .", "TXT", ServingProofPrefix+host, "v")
+	f.Add(host, "TXT", ServingProofPrefix+host+" .", "v")
 
 	f.Fuzz(func(t *testing.T, host, recType, recName, recValue string) {
 		edge := hostileEdge{record: dnsplan.Record{
@@ -314,8 +314,8 @@ func FuzzServingProofsAreAlwaysBounded(f *testing.F) {
 		if record.Type != "TXT" {
 			t.Fatalf("a serving proof survived as a %s: %+v", record.Type, record)
 		}
-		if !strings.HasPrefix(record.Name, ownershipRecordPrefix) {
-			t.Fatalf("a serving proof survived named %q, not %s<host>", record.Name, ownershipRecordPrefix)
+		if !strings.HasPrefix(record.Name, ServingProofPrefix) {
+			t.Fatalf("a serving proof survived named %q, not %s<host>", record.Name, ServingProofPrefix)
 		}
 		if record.Value == "" {
 			t.Fatalf("a serving proof survived with no value; an empty value is a WAIT at the adapter, not a record")

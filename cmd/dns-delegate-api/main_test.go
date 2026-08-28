@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,19 +24,17 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/sealed"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfoauth"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport/derivefixture"
 )
 
 func readyDispatcher() *dispatcher {
 	return &dispatcher{grants: &grant.Service{
-		OAuth: stubOAuth{cfg: &cfoauth.Config{Config: oauth2.Config{
+		OAuth: testsupport.StubOAuth{Cfg: &cfoauth.Config{Config: oauth2.Config{
 			ClientID: "cid", RedirectURL: "https://account.example/cb", Scopes: []string{"dns.write"},
 		}}},
 	}}
 }
-
-type stubOAuth struct{ cfg *cfoauth.Config }
-
-func (s stubOAuth) Config(context.Context) *cfoauth.Config { return s.cfg }
 
 func TestLambdaHandlerAnswersTheGatewayHealthProbeWithoutDispatching(t *testing.T) {
 	// No pool wired: if the probe reached the dispatcher it would report
@@ -182,14 +179,14 @@ func TestPublishWorkflowStampsTheCommit(t *testing.T) {
 // deployment must not start answering "unconfigured" and get pulled out of
 // rotation by mirrorstack-infra's probe.
 func TestHealthSurvivesTheDeprecatedServiceBeingRemoved(t *testing.T) {
-	oauth := stubOAuth{cfg: &cfoauth.Config{Config: oauth2.Config{ClientID: "cid"}}}
+	oauth := testsupport.StubOAuth{Cfg: &cfoauth.Config{Config: oauth2.Config{ClientID: "cid"}}}
 
 	intentsOnly := &dispatcher{intents: &intent.Service{OAuth: oauth}}
 	if got := intentsOnly.health(context.Background()); !got.OK || got.Delegation != "no-keyset" {
 		t.Fatalf("the intent surface alone must report a healthy no-keyset deployment: %#v", got)
 	}
 
-	held := &dispatcher{intents: &intent.Service{OAuth: oauth, Keys: stubKeys{sealer: newSealer(t)}}}
+	held := &dispatcher{intents: &intent.Service{OAuth: oauth, Keys: testsupport.StubKeys{Held: newSealer(t)}}}
 	if got := held.health(context.Background()); !got.OK || got.Delegation != "ready" {
 		t.Fatalf("a client and a keyset must report ready: %#v", got)
 	}
@@ -648,16 +645,11 @@ func intentDispatcher(t *testing.T) (*dispatcher, *grantcrypto.Sealer) {
 	t.Helper()
 	sealer := newSealer(t)
 	return &dispatcher{intents: &intent.Service{
-		OAuth: stubOAuth{cfg: &cfoauth.Config{Config: oauth2.Config{
+		OAuth: testsupport.StubOAuth{Cfg: &cfoauth.Config{Config: oauth2.Config{
 			ClientID: "cid", RedirectURL: "https://account.example/cb", Scopes: []string{"dns.write"},
 		}}},
-		Keys: stubKeys{sealer: sealer},
-		Derive: derive.Config{
-			OrgRoutingTarget:  "connect.mirrorstack.ai",
-			AppRoutingTarget:  "connect.mirrorstack.app",
-			DCVDelegationUUID: "a1b2c3d4e5f60718",
-			ReservedSuffixes:  []string{"mirrorstack.ai", "mirrorstack.app"},
-		},
+		Keys:   testsupport.StubKeys{Held: sealer},
+		Derive: derivefixture.Config(),
 		// No Resolver and no relays: rendering the consent page reaches neither,
 		// and a fixture that supplied them would hide it if that ever changed.
 	}}, sealer
@@ -714,22 +706,9 @@ func gatedGet(h http.Handler, target string) *httptest.ResponseRecorder {
 
 func newSealer(t *testing.T) *grantcrypto.Sealer {
 	t.Helper()
-	raw := make([]byte, grantcrypto.KeySize)
-	for i := range raw {
-		raw[i] = byte(i*7 + 1)
+	key := make([]byte, grantcrypto.KeySize)
+	for i := range key {
+		key[i] = byte(i*7 + 1)
 	}
-	keys, err := grantcrypto.ParseKeyset(fmt.Sprintf(
-		`{"active":"k1","keys":{"k1":%q}}`, base64.StdEncoding.EncodeToString(raw)))
-	if err != nil {
-		t.Fatalf("ParseKeyset: %v", err)
-	}
-	sealer, err := grantcrypto.NewSealer(keys)
-	if err != nil {
-		t.Fatalf("NewSealer: %v", err)
-	}
-	return sealer
+	return testsupport.SealerWithKey(t, "k1", key)
 }
-
-type stubKeys struct{ sealer *grantcrypto.Sealer }
-
-func (s stubKeys) Sealer(context.Context) *grantcrypto.Sealer { return s.sealer }

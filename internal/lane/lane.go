@@ -71,7 +71,7 @@ func Parse(s string) (Lane, error) {
 	case OrgPlatformDomain, OrgAppDomain, AppDomain:
 		return Lane(s), nil
 	}
-	return "", fmt.Errorf("%w: unknown lane %q", ErrInvalid, echo(s))
+	return "", fmt.Errorf("%w: unknown lane %q", ErrInvalid, Echo(s))
 }
 
 // IdentityKind is what the id on a request denotes.
@@ -104,8 +104,8 @@ func (l Lane) Identity() IdentityKind {
 // 🔴 THE CALLER CANNOT ADD A FIFTH LABEL OR RENAME ONE. Each label becomes a
 // hostname inside the customer's own domain and a subject on a publicly-trusted
 // certificate; a label supplied on a request would be a caller-chosen name, and
-// this design has exactly one of those (see ValidateSlug). `cdn` owns no AWS
-// certificate record, being terminated before the request reaches AWS.
+// this design has exactly one of those (see ValidateSlug). `cdn` is the one label
+// CertificateHosts excludes.
 //
 // The honest limit: this is a package-level slice, so it is writable — by code
 // in this repository and nowhere else, since the package is internal. Tests pin
@@ -153,6 +153,39 @@ func (l Lane) Hosts(anchor string) []string {
 	return nil
 }
 
+// cdnLabel is the one platform label that owns no AWS certificate record; see
+// CertificateHosts.
+const cdnLabel = "cdn"
+
+// CertificateHosts are the hostnames under anchor that an AWS certificate is
+// requested for: Hosts minus `cdn`, and only on the org platform lane
+// (docs/DESIGN.md §6 row 5).
+//
+// 🔴 THE EXCLUSION LIVES BESIDE PlatformLabels BECAUSE IT NAMES ONE. The CDN
+// worker terminates TLS for that hostname before anything reaches API Gateway,
+// so no AWS certificate ever covers it — and an exclusion spelled `"cdn"` in
+// another package would keep matching nothing after a rename, sending cdn to ACM,
+// which never answers for it: one host reported as waiting forever.
+func (l Lane) CertificateHosts(anchor string) []string {
+	if l != OrgPlatformDomain {
+		return nil
+	}
+	anchor, err := ValidateDomain(anchor, nil)
+	if err != nil {
+		return nil
+	}
+	excluded := cdnLabel + "." + anchor
+	hosts := l.Hosts(anchor)
+	out := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		if host == excluded {
+			continue
+		}
+		out = append(out, host)
+	}
+	return out
+}
+
 // Standing is the grant lifetime of a lane held with no fixed expiry. It is the
 // zero duration, which is why GrantLifetime never returns zero for anything else.
 const Standing = time.Duration(0)
@@ -188,41 +221,20 @@ func (l Lane) GrantLifetime() time.Duration {
 }
 
 // ValidateIdentity accepts ONLY the canonical 36-character hyphenated UUID, in
-// any case, and returns it lowercased.
+// any case, and returns it lowercased. It is dnsplan.CanonicalUUID plus this
+// package's sentinel: the id is inside the plan digest AND the ownership HMAC,
+// so a second, looser copy of the rule would mint a proof for a spelling the
+// publish boundary refuses.
 //
-// Stricter than a general UUID parser, for dnsplan's reason: pgtype accepts
-// braced and unhyphenated spellings, so "the same" id can arrive in several
-// encodings. The id is inside the plan digest AND the ownership HMAC, so two
-// encodings are two digests and two proofs — a registration would quietly stop
-// matching itself and the customer would be told the plan changed. Whether the
-// org or app EXISTS is api-platform's question; only the spelling is settled
-// here, which is why the nil UUID is accepted: canonical, and it names nothing.
-//
-// The rule is duplicated because dnsplan's copy is unexported, and the looser of
-// two copies is the one that matters — so
-// TestValidateIdentityMatchesDnsplanStrictness runs both over one table and
-// fails if they ever disagree.
+// Whether the org or app EXISTS is api-platform's question; only the spelling is
+// settled here, which is why the nil UUID is accepted: canonical, and it names
+// nothing.
 func ValidateIdentity(s string) (string, error) {
-	if len(s) != 36 {
+	canonical, ok := dnsplan.CanonicalUUID(s)
+	if !ok {
 		return "", fmt.Errorf("%w: identity is not a canonical uuid", ErrInvalid)
 	}
-	for i := 0; i < 36; i++ {
-		c := s[i]
-		if i == 8 || i == 13 || i == 18 || i == 23 {
-			if c != '-' {
-				return "", fmt.Errorf("%w: identity is not a canonical uuid", ErrInvalid)
-			}
-			continue
-		}
-		switch {
-		case c >= '0' && c <= '9':
-		case c >= 'a' && c <= 'f':
-		case c >= 'A' && c <= 'F':
-		default:
-			return "", fmt.Errorf("%w: identity is not a canonical uuid", ErrInvalid)
-		}
-	}
-	return strings.ToLower(s), nil
+	return canonical, nil
 }
 
 // ValidateDomain accepts one DNS name and returns it normalized: lowercased,
@@ -260,7 +272,7 @@ func ValidateDomain(name string, reserved []string) (string, error) {
 	// "example.com.." folded away and the refusal evaporated with it. An empty
 	// label is illegal however it is spelled, so it is refused on what arrived.
 	if strings.Contains(strings.TrimSpace(name), "..") {
-		return "", fmt.Errorf("%w: %q has an empty label", ErrInvalid, echo(strings.TrimSpace(name)))
+		return "", fmt.Errorf("%w: %q has an empty label", ErrInvalid, Echo(strings.TrimSpace(name)))
 	}
 	normalized := dnsplan.NormalizeName(name)
 	if normalized == "" {
@@ -272,15 +284,15 @@ func ValidateDomain(name string, reserved []string) (string, error) {
 	}
 	labels := strings.Split(normalized, ".")
 	if len(labels) < 2 {
-		return "", fmt.Errorf("%w: %q is a single label, not a domain", ErrInvalid, echo(normalized))
+		return "", fmt.Errorf("%w: %q is a single label, not a domain", ErrInvalid, Echo(normalized))
 	}
 	for _, label := range labels {
 		if reason := labelReason(label); reason != "" {
-			return "", fmt.Errorf("%w: %s in %q", ErrInvalid, reason, echo(normalized))
+			return "", fmt.Errorf("%w: %s in %q", ErrInvalid, reason, Echo(normalized))
 		}
 	}
 	if allDigits(labels[len(labels)-1]) {
-		return "", fmt.Errorf("%w: %q has an all-numeric rightmost label", ErrInvalid, echo(normalized))
+		return "", fmt.Errorf("%w: %q has an all-numeric rightmost label", ErrInvalid, Echo(normalized))
 	}
 	// Checked before use, so a malformed entry is reported whichever domain is
 	// under inspection; inline, it would surface only for names that matched
@@ -302,14 +314,14 @@ func ValidateDomain(name string, reserved []string) (string, error) {
 			slog.Error("lane: refusing every domain because a reserved-suffix entry is written with a leading dot",
 				"entry", suffix)
 			return "", fmt.Errorf("%w: the reserved suffix %q is written with a leading dot; it must be a name",
-				ErrInvalid, echo(suffix))
+				ErrInvalid, Echo(suffix))
 		}
 		suffixes = append(suffixes, suffix)
 	}
 	for _, suffix := range suffixes {
 		if dnsplan.Contains(suffix, normalized) {
 			return "", fmt.Errorf("%w: %q is at or under the reserved suffix %q",
-				ErrInvalid, echo(normalized), echo(suffix))
+				ErrInvalid, Echo(normalized), Echo(suffix))
 		}
 	}
 	return normalized, nil
@@ -340,10 +352,10 @@ func ValidateDomain(name string, reserved []string) (string, error) {
 func ValidateSlug(s string) (string, error) {
 	folded := strings.ToLower(s)
 	if strings.Contains(folded, ".") {
-		return "", fmt.Errorf("%w: a slug is one label, not a name: %q", ErrInvalid, echo(folded))
+		return "", fmt.Errorf("%w: a slug is one label, not a name: %q", ErrInvalid, Echo(folded))
 	}
 	if reason := labelReason(folded); reason != "" {
-		return "", fmt.Errorf("%w: a slug must be one LDH label, got %s: %q", ErrInvalid, reason, echo(folded))
+		return "", fmt.Errorf("%w: a slug must be one LDH label, got %s: %q", ErrInvalid, reason, Echo(folded))
 	}
 	return folded, nil
 }
@@ -401,10 +413,13 @@ func allDigits(label string) bool {
 	return true
 }
 
-// echo bounds what a refusal quotes back: input is untrusted in size as well as
+// Echo bounds what a refusal quotes back: input is untrusted in size as well as
 // content, and an error string gets copied, logged, and copied again. Truncating
 // may split a UTF-8 rune; %q renders the stray byte honestly, as an escape.
-func echo(s string) string {
+//
+// Exported because internal/derive and internal/consent quote refusals from the
+// same untrusted input and had a verbatim copy each.
+func Echo(s string) string {
 	const max = 64
 	if len(s) > max {
 		return s[:max] + "…(truncated)"

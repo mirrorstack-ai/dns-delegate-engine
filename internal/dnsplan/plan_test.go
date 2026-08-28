@@ -294,10 +294,10 @@ func TestNormalizeRecordsRejectsUnsupportedTypes(t *testing.T) {
 }
 
 func TestCanonicalUUIDIsStrict(t *testing.T) {
-	if _, ok := canonicalUUID(strings.ToUpper(testTarget)); !ok {
+	if _, ok := CanonicalUUID(strings.ToUpper(testTarget)); !ok {
 		t.Fatal("uppercase canonical form must be accepted")
 	}
-	got, ok := canonicalUUID(strings.ToUpper(testTarget))
+	got, ok := CanonicalUUID(strings.ToUpper(testTarget))
 	if !ok || got != testTarget {
 		t.Fatalf("must normalize to lowercase, got %q", got)
 	}
@@ -309,7 +309,7 @@ func TestCanonicalUUIDIsStrict(t *testing.T) {
 		"3f2a1b4c-5d6e-4f70-8a91-b2c3d4e5f60g",   // non-hex
 		"3f2a1b4c_5d6e_4f70_8a91_b2c3d4e5f607",   // wrong separator
 	} {
-		if _, ok := canonicalUUID(bad); ok {
+		if _, ok := CanonicalUUID(bad); ok {
 			t.Fatalf("%q must be refused", bad)
 		}
 	}
