@@ -81,6 +81,11 @@ type Service struct {
 	// here is one a caller could substitute a permissive derivation into.
 	Derive derive.Config
 
+	// Delegation reads record 6's uuid half from Cloudflare, per zone, with
+	// MirrorStack's own credential. Nil means "not wired", and Derive's
+	// configured value stands — see deriveFor.
+	Delegation relay.DCVDelegations
+
 	// Resolver reads PUBLIC DNS, and there is deliberately no default: a nil
 	// Resolver is reported as ErrUnavailable rather than quietly replaced with
 	// observe.NetResolver{}, because a default would let a test that forgot its
@@ -161,7 +166,10 @@ func (s *Service) prover(ctx context.Context) (proof.Prover, error) {
 // ─── capabilities ───────────────────────────────────────────────────────────
 
 // Capabilities reports what this deployment can offer and what it would put in a
-// zone. It writes nothing, takes no registration, and touches no credential.
+// zone. It writes nothing and takes no registration. It does spend MirrorStack's
+// OWN Cloudflare credential, on the same cached read the derivation makes, so
+// that the identifier it publishes is the one records would actually carry — a
+// customer's grant is never touched here or anywhere near here.
 //
 // The routing targets and the DCV delegation identifier are published on
 // purpose: none is a secret, and each ends up in a customer's own zone as the
@@ -172,7 +180,7 @@ func (s *Service) Capabilities(ctx context.Context) CapabilitiesResponse {
 		OrgRoutingTarget:  s.Derive.OrgRoutingTarget,
 		AppRoutingTarget:  s.Derive.AppRoutingTarget,
 		DCVDelegationUUID: s.Derive.DCVDelegationUUID,
-		Lanes:             laneCapabilities(s.edgeZones()),
+		Lanes:             s.laneCapabilities(ctx),
 	}
 	// The declared clock, so DESIGN §8's promise — that what runs, and when, is
 	// public — is answerable from this API, not only from a source file.
@@ -195,10 +203,13 @@ func (s *Service) Capabilities(ctx context.Context) CapabilitiesResponse {
 		}
 	}
 
-	if err := s.Derive.Validate(); err != nil {
-		// Reported rather than swallowed: an unconfigured deployment and a
-		// MISCONFIGURED one otherwise look identical from outside — the trap
-		// cfoauth.FromEnv documents.
+	// Validated as the derivation will actually USE it, identifier included: a
+	// deployment whose uuid comes from Cloudflare is configured, whatever its
+	// environment says. Reported rather than swallowed, because an unconfigured
+	// deployment and a MISCONFIGURED one otherwise look identical from outside —
+	// the trap cfoauth.FromEnv documents.
+	derived, _ := s.deriveFor(ctx, lane.OrgPlatformDomain)
+	if err := derived.Validate(); err != nil {
 		out.ConfigError = err.Error()
 	}
 	cfg := s.oauthConfig(ctx)
@@ -234,9 +245,11 @@ func (s *Service) providerName() string {
 }
 
 // laneCapabilities describes the three lanes in the terms a customer decides on:
-// what is anchored, what is derived beneath it, how long a credential lives, and
-// which MirrorStack zone this deployment reads that lane's serving proof from.
-func laneCapabilities(zones relay.EdgeZones) []LaneCapability {
+// what is anchored, what is derived beneath it, how long a credential lives,
+// which MirrorStack zone this deployment reads that lane's serving proof from,
+// and which DCV delegation identifier it points that lane's record 6 at.
+func (s *Service) laneCapabilities(ctx context.Context) []LaneCapability {
+	zones := s.edgeZones()
 	out := make([]LaneCapability, 0, 3)
 	for _, l := range []lane.Lane{lane.OrgPlatformDomain, lane.OrgAppDomain, lane.AppDomain} {
 		description := ""
@@ -252,13 +265,16 @@ func laneCapabilities(zones relay.EdgeZones) []LaneCapability {
 		// this is a description of the deployment, and "no zone" is the truth
 		// about one whose edge relay is not wired.
 		zoneID, _ := zones.ForLane(l)
+		cfg, source := s.deriveFor(ctx, l)
 		out = append(out, LaneCapability{
-			Lane:         string(l),
-			Hosts:        description,
-			Anchor:       "the domain you connect, and every record sits at or under it",
-			GrantSeconds: grantSeconds(l),
-			ConsentPage:  consent.Required(l),
-			EdgeZone:     zoneID,
+			Lane:                string(l),
+			Hosts:               description,
+			Anchor:              "the domain you connect, and every record sits at or under it",
+			GrantSeconds:        grantSeconds(l),
+			ConsentPage:         consent.Required(l),
+			EdgeZone:            zoneID,
+			DCVDelegationUUID:   cfg.DCVDelegationUUID,
+			DCVDelegationSource: source,
 		})
 	}
 	return out
@@ -318,7 +334,8 @@ func (s *Service) register(ctx context.Context, l lane.Lane, identity, domain st
 	if err != nil {
 		return RegisteredResponse{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
-	plan, err := s.Derive.Registration(l, canonical, anchor, proofValue)
+	cfg, _ := s.deriveFor(ctx, l)
+	plan, err := cfg.Registration(l, canonical, anchor, proofValue)
 	if err != nil {
 		return RegisteredResponse{}, deriveError(err)
 	}
@@ -412,7 +429,8 @@ func (s *Service) BindAppToOrgAppDomain(ctx context.Context, req BindAppRequest)
 		return PassResponse{}, fmt.Errorf(
 			"%w: an app is bound under an org app domain, not under %s", ErrInvalidRequest, reg.Lane)
 	}
-	plan, err := s.Derive.BindApp(reg.Anchor, req.Slug)
+	cfg, _ := s.deriveFor(ctx, reg.Lane)
+	plan, err := cfg.BindApp(reg.Anchor, req.Slug)
 	if err != nil {
 		return PassResponse{}, deriveError(err)
 	}
@@ -1177,11 +1195,56 @@ func (s *Service) derivedPlan(ctx context.Context, reg sealed.Registration) (der
 	if err != nil {
 		return derive.Plan{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
-	plan, err := s.Derive.Registration(reg.Lane, reg.Identity, reg.Anchor, value)
+	cfg, _ := s.deriveFor(ctx, reg.Lane)
+	plan, err := cfg.Registration(reg.Lane, reg.Identity, reg.Anchor, value)
 	if err != nil {
 		return derive.Plan{}, deriveError(err)
 	}
 	return plan, nil
+}
+
+// deriveFor is this deployment's derivation configuration for one lane, with the
+// DCV delegation identifier Cloudflare reports for that lane's zone in place of
+// the configured one. It also names which of the two won, for `capabilities`.
+//
+// 🔴 THE CONFIGURED VALUE LOSES, AND THE DISAGREEMENT IS LOGGED AT ERROR. A
+// hand-set label silently overriding what the provider says is how record 6 came
+// to point at a name nobody had ever verified (derive.DCVTarget), and record 6 is
+// published on the first pass and never republished — so the wrong label is a
+// certificate that never issues, in a zone that looks correct.
+//
+// A read that FAILS leaves the configured value standing and warns. It is a
+// fallback for a deployment that cannot reach Cloudflare, and turning an
+// unreachable API into a failed pass would stop a lane publishing everything else
+// it can derive — relayInto's rule, one step earlier.
+//
+// 🔴 A CHANGE OF SOURCE MOVES THE PLAN DIGEST. Record 6's value is inside the
+// plan api-platform hashes before the customer authorizes, so a deployment that
+// falls back and later recovers tells a customer on the consent screen that the
+// plan changed. It did: the pointer really moved.
+func (s *Service) deriveFor(ctx context.Context, l lane.Lane) (derive.Config, string) {
+	cfg := s.Derive
+	configured := strings.TrimSpace(cfg.DCVDelegationUUID)
+	fetched, ok, err := relay.DelegationUUID(ctx, s.Delegation, l)
+	switch {
+	case err != nil:
+		slog.Warn("intent: the DCV delegation identifier could not be read from Cloudflare; "+
+			"deriving record 6 from the configured one", "lane", l, "error", err)
+	case !ok:
+		// Nothing to ask, or nothing to ask WITH. The configured value stands.
+	default:
+		if configured != "" && !strings.EqualFold(configured, fetched) {
+			slog.Error("🔴 intent: the configured DCV delegation identifier disagrees with Cloudflare "+
+				"and is being ignored; correct the environment",
+				"lane", l, "configured", configured, "cloudflare", fetched)
+		}
+		cfg.DCVDelegationUUID = fetched
+		return cfg, DCVFromCloudflare
+	}
+	if configured == "" {
+		return cfg, ""
+	}
+	return cfg, DCVFromConfig
 }
 
 // deriveError splits a derivation refusal by AUDIENCE: an incomplete routing

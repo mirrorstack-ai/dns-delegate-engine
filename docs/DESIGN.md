@@ -384,7 +384,8 @@ reported as such and never guessed at, because a grant we cannot name is one a
 human has to end by hand and saying so is the only useful answer.
 
 Two more exist and write nothing: `capabilities()` (`IntentCapabilities`),
-which publishes the routing targets, the DCV delegation identifier, the declared
+which publishes the routing targets, the DCV delegation identifier in force on
+each lane and whether it was read from Cloudflare or hand-set, the declared
 cadence, the per-lane grant lifetimes and whether a lane needs a consent page —
 none of them secret, every one of them a value that ends up in your own zone or
 on your own clock — and `health()` (`Health`), which publishes the git SHA this
@@ -487,6 +488,19 @@ both halves of it (the hostname you connected, a per-zone uuid) are known before
 anything is asked of anyone. So it is publishable in the first pass, and it never
 changes again: Cloudflare mints and rotates the real tokens behind it, in its own
 zone, for every future renewal.
+
+🔴 **The uuid is read from Cloudflare rather than configured.** It belongs to a
+zone — `GET /zones/{zone_id}/dcv_delegation/uuid`, under the same MirrorStack
+token record 7 is read with — so a deployment holding that credential takes it
+per lane, and `CF_ORG_DCV_DELEGATION_UUID` is the fallback for one that cannot
+ask. **When the two disagree the configured value loses and the disagreement is
+logged at ERROR**; `capabilities` reports, per lane, which source won. A hand-set
+label silently overriding the provider is how this record came to point at a name
+nobody had ever verified.
+
+What that read does *not* settle is the form around the uuid: the endpoint
+returns an identifier and no target, so whether the value carries the `<host>.`
+prefix is exactly as open as it was, and `derive.DCVTarget` says so.
 
 That single choice removes a whole stage from the flow, and it is what
 lets a closed lane hold a credential for 24 hours rather than forever. Cloudflare's

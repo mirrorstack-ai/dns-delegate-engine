@@ -418,6 +418,9 @@ func main() {
 	// Cloudflare is the first provider. A second is an adapter beside it plus a
 	// selector here; every safety rule stays in reconcile.
 	publisher := reconcile.Publisher{Provider: cloudflare.Client{}}
+	// The two reads that spend MirrorStack's own Cloudflare token, off one zone
+	// table and one loader.
+	edge, delegation := edgeReaders()
 
 	// How public DNS is read, and how much a positive reading is worth. The
 	// default is the container's single recursive resolver — this service's
@@ -461,7 +464,8 @@ func main() {
 			Reach:    reach,
 
 			Certificates: certificateAuthority(context.Background()),
-			Edge:         edgeHostnames(),
+			Edge:         edge,
+			Delegation:   delegation,
 		},
 	}
 
@@ -526,35 +530,42 @@ const (
 	edgeAppZoneEnv = "CF_SAAS_APP_ZONE_ID"
 )
 
-// edgeHostnames wires the Cloudflare relay — record 7, the serving proof — or
-// returns nil.
+// edgeReaders wires the two reads that use MirrorStack's OWN Cloudflare token —
+// record 7's serving proof, and record 6's DCV delegation identifier — or
+// returns nils.
 //
 // 🔴 NIL IS THE UNCONFIGURED ANSWER, AND IT IS A WAIT RATHER THAN A FAULT. A
 // deployment that names no edge token, or no zone for any lane, publishes
-// everything it can derive and reports record 7 as not yet available — visibly
-// incomplete rather than confidently wrong, and never an error on a pass. A
-// deployment that names a token it cannot READ is the other case, and
-// internal/shared/cfedge keeps the two apart.
+// everything it can derive: record 7 is reported as not yet available and record
+// 6 falls back to CF_ORG_DCV_DELEGATION_UUID — visibly incomplete rather than
+// confidently wrong, and never an error on a pass. A deployment that names a
+// token it cannot READ is the other case, and internal/shared/cfedge keeps the
+// two apart.
+//
+// Both readers take the same zone table and the same credential: one Cloudflare
+// account, two reads. Nils are returned as untyped nil, never as a typed nil
+// pointer, which is non-nil through an interface and would fail every pass.
 //
 // Not gated on config.IsLambda, unlike certificateAuthority: that gate exists
 // because relay.NewACM falls back to an ambient AWS account with no variable set
 // at all, and reading here takes an explicit CF_EDGE_TOKEN_SECRET_ID or
 // CF_EDGE_API_TOKEN.
-func edgeHostnames() relay.EdgeHostnames {
+func edgeReaders() (relay.EdgeHostnames, relay.DCVDelegations) {
 	zones := relay.EdgeZones{
 		OrgPlatform: strings.TrimSpace(os.Getenv(edgeOrgZoneEnv)),
 		App:         strings.TrimSpace(os.Getenv(edgeAppZoneEnv)),
 	}
 	if !zones.Configured() || !cfedge.Configured() {
-		slog.Info("dns-delegate-api: the edge relay is not wired, so the serving proof will be "+
-			"reported as not yet available on every lane",
+		slog.Info("dns-delegate-api: the edge reads are not wired, so the serving proof will be "+
+			"reported as not yet available and the DCV delegation identifier will be the configured one",
 			"zones", zones.Configured(), "credential", cfedge.Configured())
-		return nil
+		return nil, nil
 	}
 	// The loader is its own, not shared with the OAuth and keyset loaders: it
 	// reads a different secret, and it is the one credential in this binary that
 	// is MirrorStack's rather than a customer's.
-	return relay.Edge{Zones: zones, Token: cfedge.NewDefaultLoader().Token}
+	token := cfedge.NewDefaultLoader().Token
+	return relay.Edge{Zones: zones, Token: token}, relay.NewDCV(zones, token)
 }
 
 // lambdaHandler answers both the RPC envelope and the API-Gateway health probe

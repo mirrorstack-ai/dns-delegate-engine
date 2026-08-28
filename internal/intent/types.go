@@ -576,8 +576,12 @@ type CapabilitiesResponse struct {
 
 	Lanes []LaneCapability `json:"lanes,omitempty"`
 
-	OrgRoutingTarget  string `json:"orgRoutingTarget,omitempty"`
-	AppRoutingTarget  string `json:"appRoutingTarget,omitempty"`
+	OrgRoutingTarget string `json:"orgRoutingTarget,omitempty"`
+	AppRoutingTarget string `json:"appRoutingTarget,omitempty"`
+
+	// DCVDelegationUUID is the CONFIGURED identifier — CF_ORG_DCV_DELEGATION_UUID
+	// — and not necessarily the one in force. What each lane actually derives
+	// record 6 from, and where it came from, is on the lane entries below.
 	DCVDelegationUUID string `json:"dcvDelegationUuid,omitempty"`
 
 	// ConfigError names a deployment whose derivation configuration is
@@ -702,7 +706,31 @@ type LaneCapability struct {
 	// is an identifier and not a credential; it appears in every Cloudflare
 	// dashboard URL.
 	EdgeZone string `json:"edgeZone,omitempty"`
+
+	// DCVDelegationUUID is the identifier this lane's record 6 points at, and
+	// DCVDelegationSource is where it came from: DCVFromCloudflare when this
+	// deployment read it from the zone above, DCVFromConfig when it fell back to
+	// the environment, empty when there is none and record 6 cannot be derived.
+	//
+	// 🔴 PUBLISHED SO A HAND-SET IDENTIFIER IS TELLABLE FROM A VERIFIED ONE. The
+	// identifier is per zone and one environment variable covers all three lanes,
+	// so a value that is right for the org zone is a guess about the app zone;
+	// record 6 is published on the first pass and never republished, and a wrong
+	// label is a certificate that never issues with the record looking correct.
+	DCVDelegationUUID   string `json:"dcvDelegationUuid,omitempty"`
+	DCVDelegationSource string `json:"dcvDelegationSource,omitempty"`
 }
+
+// Where a lane's DCV delegation identifier came from, reported by capabilities.
+const (
+	// DCVFromCloudflare: read from `GET /zones/{zone_id}/dcv_delegation/uuid`
+	// under MirrorStack's own token, and the one that wins on a disagreement.
+	DCVFromCloudflare = "cloudflare"
+
+	// DCVFromConfig: CF_ORG_DCV_DELEGATION_UUID, hand-set — either because this
+	// deployment holds no Cloudflare credential or because the read failed.
+	DCVFromConfig = "configured"
+)
 
 // Failure describes an outcome that reached the provider, or the reason there is
 // no usable credential. It is the shape internal/grant established and callers

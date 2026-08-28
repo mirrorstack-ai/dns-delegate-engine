@@ -23,7 +23,7 @@ import (
 // sent to our zone" a property you can check by reading the imports.
 const edgeAPIBase = "https://api.cloudflare.com/client/v4"
 
-// maxEdgeResponse bounds the upstream body this reader will hold in memory. Base
+// maxEdgeResponse bounds the upstream body a read will hold in memory. Base
 // is overridable and the response is untrusted input read BEFORE anything about it
 // has been established, so an endpoint that answers with an endless body must not
 // turn one pass of the loop into an allocation. Exceeding it is a refusal, not a
@@ -154,25 +154,14 @@ func (e Edge) ServingProof(ctx context.Context, l lane.Lane, host string) (dnspl
 	if err != nil {
 		return dnsplan.Record{}, false, err
 	}
-	// A nil source is a wiring mistake — the binary passes a nil INTERFACE when
-	// this deployment has no credential, which never reaches here.
-	if e.Token == nil {
-		return dnsplan.Record{}, false, fmt.Errorf("relay: no MirrorStack zone credential configured for the serving proof")
+	token, held, err := edgeCredential(ctx, e.Token)
+	if err != nil {
+		return dnsplan.Record{}, false, err
 	}
-	token, err := e.Token(ctx)
-	switch {
-	case errors.Is(err, cfedge.ErrNotConfigured):
+	if !held {
 		// Nothing to read WITH is the same answer to the customer as nothing to
 		// read: the proof is not available yet. cfedge logs which it was.
 		return dnsplan.Record{}, false, nil
-	case err != nil:
-		return dnsplan.Record{}, false, fmt.Errorf("relay: resolve the MirrorStack zone credential: %w", err)
-	}
-	// A source that returns a blank token and NO error is a fault reported as a
-	// fault. Reported as not-ready it would be indistinguishable from Cloudflare
-	// being slow — and would stay indistinguishable forever.
-	if strings.TrimSpace(string(token)) == "" {
-		return dnsplan.Record{}, false, fmt.Errorf("relay: the MirrorStack zone credential is empty")
 	}
 
 	var env struct {
@@ -185,7 +174,7 @@ func (e Edge) ServingProof(ctx context.Context, l lane.Lane, host string) (dnspl
 	}
 	path := "/zones/" + url.PathEscape(zoneID) +
 		"/custom_hostnames?" + url.Values{"hostname": {host}}.Encode()
-	if err := e.get(ctx, token, path, &env); err != nil {
+	if err := edgeAPIFor(e.Base, e.HTTPClient, "custom hostname").get(ctx, token, path, &env); err != nil {
 		return dnsplan.Record{}, false, err
 	}
 	if !env.Success {
@@ -240,54 +229,91 @@ func servingProofRecord(found customHostname) (dnsplan.Record, bool) {
 	return relayedRecord(proof.Type, proof.Name, proof.Value), true
 }
 
-func (e Edge) base() string {
-	if e.Base != "" {
-		return strings.TrimRight(e.Base, "/")
+// edgeCredential resolves MirrorStack's own Cloudflare token for one read.
+//
+// 🔴 held=false WITH A NIL ERROR IS "THIS DEPLOYMENT HOLDS NONE", NOT A FAULT.
+// Every caller answers it with an absent result — a serving proof that is not
+// available yet, a delegation identifier that falls back to the configured one —
+// while a token that could not be READ stays an error. Collapsing the two would
+// make a deployment nobody finished look like one whose IAM policy is wrong; see
+// cfedge.ErrNotConfigured.
+//
+// A nil source is neither: the binary passes a nil INTERFACE when it has no
+// credential, so a reader holding a nil Source is a wiring mistake.
+func edgeCredential(ctx context.Context, src cfedge.Source) (cfedge.Token, bool, error) {
+	if src == nil {
+		return "", false, fmt.Errorf("relay: no MirrorStack zone credential is wired")
 	}
-	return edgeAPIBase
+	token, err := src(ctx)
+	switch {
+	case errors.Is(err, cfedge.ErrNotConfigured):
+		return "", false, nil
+	case err != nil:
+		return "", false, fmt.Errorf("relay: resolve the MirrorStack zone credential: %w", err)
+	}
+	// A source that returns a blank token and NO error is a fault reported as a
+	// fault. Reported as absent it would be indistinguishable from Cloudflare
+	// being slow — and would stay indistinguishable forever.
+	if strings.TrimSpace(string(token)) == "" {
+		return "", false, fmt.Errorf("relay: the MirrorStack zone credential is empty")
+	}
+	return token, true, nil
 }
 
-func (e Edge) client() *http.Client {
-	if e.HTTPClient != nil {
-		return e.HTTPClient
-	}
-	return &http.Client{Timeout: 15 * time.Second}
+// edgeAPI is the read half of Cloudflare's API under MirrorStack's own token.
+// Shared by both readers in this package so the credential reaches the wire in
+// exactly one place; `what` names the read in every error it can produce.
+type edgeAPI struct {
+	base   string
+	client *http.Client
+	what   string
 }
 
-// get performs the one read this file makes. There is no post, patch or delete
-// here, and that is not an accident of what was needed: a custom hostname belongs
-// to api-platform's lifecycle, and giving the half that holds credentials a write
-// method against MirrorStack's own zone would put the two halves back together.
+func edgeAPIFor(base string, client *http.Client, what string) edgeAPI {
+	if base == "" {
+		base = edgeAPIBase
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	return edgeAPI{base: strings.TrimRight(base, "/"), client: client, what: what}
+}
+
+// get performs the one kind of call this package makes. There is no post, patch
+// or delete here, and that is not an accident of what was needed: a custom
+// hostname belongs to api-platform's lifecycle, and giving the half that holds
+// credentials a write method against MirrorStack's own zone would put the two
+// halves back together.
 //
 // This is also the ONLY place the token is converted back to a string. Everywhere
 // else it is a cfedge.Token, which redacts itself under every fmt verb.
-func (e Edge) get(ctx context.Context, token cfedge.Token, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.base()+path, nil)
+func (a edgeAPI) get(ctx context.Context, token cfedge.Token, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.base+path, nil)
 	if err != nil {
-		return fmt.Errorf("relay: build custom hostname request: %w", err)
+		return fmt.Errorf("relay: build %s request: %w", a.what, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+string(token))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := e.client().Do(req)
+	resp, err := a.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("relay: custom hostname request failed: %w", err)
+		return fmt.Errorf("relay: %s request failed: %w", a.what, err)
 	}
 	defer resp.Body.Close()
 	// One byte past the bound, so a body AT the limit is told apart from one
 	// that was cut off at it.
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxEdgeResponse+1))
 	if err != nil {
-		return fmt.Errorf("relay: read custom hostname response: %w", err)
+		return fmt.Errorf("relay: read %s response: %w", a.what, err)
 	}
 	if len(raw) > maxEdgeResponse {
-		return fmt.Errorf("relay: custom hostname response is longer than %d bytes (status %d)",
-			maxEdgeResponse, resp.StatusCode)
+		return fmt.Errorf("relay: %s response is longer than %d bytes (status %d)",
+			a.what, maxEdgeResponse, resp.StatusCode)
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		// The status code is reported without the body. A response this service
 		// could not parse is the last place to start echoing bytes returned by a
 		// call that carried a credential.
-		return fmt.Errorf("relay: decode custom hostname response (status %d): %w", resp.StatusCode, err)
+		return fmt.Errorf("relay: decode %s response (status %d): %w", a.what, resp.StatusCode, err)
 	}
 	return nil
 }

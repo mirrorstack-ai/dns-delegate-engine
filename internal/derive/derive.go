@@ -211,11 +211,15 @@ type Config struct {
 	// then is not served, a failure whose DNS looks perfect.
 	AppRoutingTarget string
 
-	// DCVDelegationUUID is the middle label of record 6's value: the per-zone
-	// identifier Cloudflare gives for delegated certificate validation, one value
-	// covering every custom hostname under one of our SaaS zones. Despite its
-	// name, the observed values are 16 hexadecimal characters rather than a
-	// 36-character UUID, so it is validated as one DNS label. See DCVTarget.
+	// DCVDelegationUUID is the middle label of record 6's value: the identifier
+	// Cloudflare gives for delegated certificate validation in ONE of our SaaS
+	// zones. Despite its name, the observed values are 16 hexadecimal characters
+	// rather than a 36-character UUID, so it is validated as one DNS label.
+	//
+	// 🔴 A FALLBACK, NOT THE SOURCE OF TRUTH. The caller reads it from Cloudflare
+	// per zone (internal/relay.DCVDelegations) and overrides this field with what
+	// the provider says; a hand-set value is what a deployment that cannot reach
+	// Cloudflare derives from. See DCVTarget.
 	DCVDelegationUUID string
 
 	// ReservedSuffixes are the names nobody may connect: MirrorStack's own. A
@@ -260,9 +264,11 @@ var platformSuffixes = []string{"mirrorstack.ai", "mirrorstack.app"}
 //
 // The uuid has no default on purpose: empty is a truthful "this deployment has
 // not been told", which Validate turns into a refusal rather than a record
-// pointing at `.dcv.cloudflare.com` with a missing label. It should come from
-// `GET /zones/{our_zone}/dcv_delegation/uuid` against MirrorStack's own zone,
-// not from somebody's memory of the dashboard. Unlike shared/config.MustEnv this
+// pointing at `.dcv.cloudflare.com` with a missing label. It is the FALLBACK for
+// a deployment holding no Cloudflare credential — internal/relay reads the real
+// one per zone and overrides it — and one variable cannot be right for both of
+// our SaaS zones, which is the second reason not to trust it. Unlike
+// shared/config.MustEnv this
 // never exits, so Validate names the unset value as an error at the call site
 // rather than as a process that died at boot.
 func ConfigFromEnv() Config {
@@ -505,14 +511,20 @@ const (
 // and the disagreement is recorded rather than resolved because the other half is
 // a change in another repository.
 //
-// 🔴 UNVERIFIED AGAINST A LIVE DASHBOARD as of 2026-08-28. Nobody has read
-// `GET /zones/{our_zone}/dcv_delegation/uuid` with our own token; the uuid in use
-// is a hand-set environment variable. The one live probe on record — four custom
-// hostnames stuck at `pending_validation` "with the delegation CNAME in place and
-// resolving" — published the PREFIX-LESS target and concluded delegation was not
-// in effect. It cannot distinguish that from a pointer aimed at a name Cloudflare
-// never writes to, so "delegation does not work here" is open until re-measured
-// with the form above. A reader of this repository is owed that uncertainty.
+// 🔴 THE UUID IS READ FROM CLOUDFLARE; THE FORM AROUND IT IS NOT.
+//
+// A deployment holding MirrorStack's own token takes the middle label from
+// `GET /zones/{zone_id}/dcv_delegation/uuid`, per zone, and that answer beats the
+// configured one (internal/relay.DCVDelegations; the source in force is reported
+// per lane by `capabilities`). But the endpoint returns a uuid and no target, so
+// it says nothing about the prefix: the disagreement above is exactly as open as
+// it was.
+//
+// The one live probe on record — four custom hostnames stuck at
+// `pending_validation` "with the delegation CNAME in place and resolving" —
+// published the PREFIX-LESS target and concluded delegation was not in effect. It
+// cannot distinguish that from a pointer aimed at a name Cloudflare never writes
+// to, so that conclusion stays open until it is re-measured with the form above.
 //
 // Returns "" rather than a target that cannot be right, for proof.Name's reason:
 // only the empty value fails loudly. The uuid's SHAPE is Config.Validate's.

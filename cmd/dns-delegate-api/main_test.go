@@ -792,8 +792,9 @@ func (unusedResolver) LookupTXT(context.Context, string) ([]string, error) {
 // 🔴 AN UNCONFIGURED EDGE IS WIRED AS NIL, WHICH internal/relay REPORTS AS "NOT
 // YET". Anything else would put a warning on every pass of a deployment nobody
 // had finished configuring — and a fake reader would be worse still, since an
-// invented serving proof is published into a customer's zone.
-func TestTheEdgeRelayIsWiredOnlyWhenBothAZoneAndACredentialAreNamed(t *testing.T) {
+// invented serving proof is published into a customer's zone, and an invented
+// delegation identifier is a record 6 aimed at a name Cloudflare never wrote to.
+func TestTheEdgeReadsAreWiredOnlyWhenBothAZoneAndACredentialAreNamed(t *testing.T) {
 	for name, env := range map[string]map[string]string{
 		"nothing set":         {},
 		"zones but no token":  {edgeOrgZoneEnv: "org-zone", edgeAppZoneEnv: "app-zone"},
@@ -804,8 +805,12 @@ func TestTheEdgeRelayIsWiredOnlyWhenBothAZoneAndACredentialAreNamed(t *testing.T
 			t.Setenv(edgeAppZoneEnv, env[edgeAppZoneEnv])
 			t.Setenv(cfedge.TokenEnv, env[cfedge.TokenEnv])
 			t.Setenv(cfedge.SecretIDEnv, "")
-			if edge := edgeHostnames(); edge != nil {
-				t.Fatalf("want a nil reader, got %#v", edge)
+			edge, delegation := edgeReaders()
+			// Both nil, and both UNTYPED nil: a typed nil pointer is non-nil
+			// through an interface and would fail every pass instead of
+			// falling back.
+			if edge != nil || delegation != nil {
+				t.Fatalf("want nil readers, got %#v / %#v", edge, delegation)
 			}
 		})
 	}
@@ -814,7 +819,10 @@ func TestTheEdgeRelayIsWiredOnlyWhenBothAZoneAndACredentialAreNamed(t *testing.T
 	t.Setenv(edgeAppZoneEnv, "app-zone")
 	t.Setenv(cfedge.TokenEnv, "ms-token")
 	t.Setenv(cfedge.SecretIDEnv, "")
-	edge := edgeHostnames()
+	edge, delegation := edgeReaders()
+	if delegation == nil {
+		t.Fatal("a wired credential must also read the DCV delegation identifier")
+	}
 	reporter, ok := edge.(relay.EdgeZoneReporter)
 	if !ok {
 		t.Fatalf("a wired reader must be able to name its zones, got %T", edge)

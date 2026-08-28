@@ -236,7 +236,9 @@ _acme-challenge.<host>   CNAME   <host>.<uuid>.dcv.cloudflare.com       ← Clou
 
 **The `_acme-challenge` record carries no token.** It is a *pointer*, and both
 halves of it are known before anything is asked of anyone: the hostname is what
-you just connected, and the uuid is fixed configuration for MirrorStack's zone.
+you just connected, and the uuid identifies the MirrorStack zone your hostname is
+served from. That uuid is **read from Cloudflare**, per zone, rather than
+configured — `capabilities` names which lane got it from where.
 
 The token still exists — it lives at the far end, in Cloudflare's own zone,
 placed by Cloudflare. A certificate authority looking up
