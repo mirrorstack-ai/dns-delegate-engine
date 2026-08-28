@@ -1,6 +1,7 @@
 package dnsplan
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"strings"
@@ -41,6 +42,90 @@ func TestGoldenDigest(t *testing.T) {
 	}
 	if got := hex.EncodeToString(snapshot.Digest()); got != goldenDigestHex {
 		t.Fatalf("digest drift\n got: %s\nwant: %s", got, goldenDigestHex)
+	}
+}
+
+// 🔴 NORMALIZATION MUST BE A FIXED POINT.
+//
+// Validate re-normalizes what NewSnapshot stored and refuses when the two
+// disagree, so a name that normalizes differently on the second pass is accepted
+// at authorize time and refused at publish time — reported as plan_invalid,
+// whose contract says "this is a bug and retrying cannot help". A customer is
+// then stranded mid-connect on a domain that is perfectly fine.
+//
+// Found by fuzzing: trimming the root dot AFTER trimming space uncovered a space
+// the first trim had already run past, so "example.com ." became "example.com ".
+func TestNormalizeNameIsIdempotent(t *testing.T) {
+	for _, in := range []string{
+		"example.com", "EXAMPLE.COM", " example.com ", "example.com.",
+		"example.com .", "example.com. ", " example.com . ", "example.com..",
+		"_acme-challenge.api.example.com.", "*.example.net.", "", ".", " . ",
+	} {
+		once := NormalizeName(in)
+		if twice := NormalizeName(once); once != twice {
+			t.Errorf("NormalizeName(%q) = %q, but normalizing that again gives %q", in, once, twice)
+		}
+		if strings.TrimSpace(once) != once {
+			t.Errorf("NormalizeName(%q) = %q, which still carries whitespace", in, once)
+		}
+	}
+}
+
+// The consequence, asserted end to end: anything NewSnapshot accepts must
+// survive its own Validate. The two gates run at different moments in one
+// customer's connect and have to agree on every input, not only the tidy ones.
+func TestWhatNewSnapshotAcceptsAlwaysValidates(t *testing.T) {
+	long := strings.Repeat("t", MaxRecordIdentity)
+	for _, tc := range []struct {
+		name, anchor string
+		records      []Record
+	}{
+		{"a stray space before the root dot", "shop.example.com .",
+			[]Record{{Type: "CNAME", Name: "www.shop.example.com", Value: "edge.example.net"}}},
+		{"a doubled root dot", "example.com..",
+			[]Record{{Type: "CNAME", Name: "account.example.com", Value: "edge.example.net"}}},
+		{"an identity at the bound", "example.com",
+			[]Record{{Type: "TXT", Name: "_dcv.example.com", Value: long}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot, err := NewSnapshot(KindPlatform, testTarget, tc.anchor, tc.records)
+			if err != nil {
+				return // a refusal is always allowed; it is ACCEPTANCE that must hold up
+			}
+			if err := snapshot.Validate(snapshot.Digest()); err != nil {
+				t.Fatalf("NewSnapshot accepted a plan its own Validate refuses: %v", err)
+			}
+		})
+	}
+}
+
+// 🔴 THE DIGEST MUST BIND EVERY BYTE OF EVERY RECORD.
+//
+// Digest hashes json.Marshal of the envelope, and encoding/json SILENTLY folds
+// each invalid UTF-8 byte to U+FFFD rather than failing — so two plans whose
+// values genuinely differed hashed to one SHA-256. The digest is what binds what
+// a customer reviewed to what gets written; a collision in it is that binding
+// not existing.
+//
+// Found by FuzzDigestIsStableAndBinding. The fix refuses the input rather than
+// repairing it: no legitimate DNS record carries invalid UTF-8, and a digest
+// taken over a repaired value would bind the repair rather than the record.
+func TestInvalidUTF8CannotCollideTwoPlansIntoOneDigest(t *testing.T) {
+	build := func(value string) (Snapshot, error) {
+		return NewSnapshot(KindPlatform, testTarget, "example.com",
+			[]Record{{Type: "TXT", Name: "_cf-custom-hostname.example.com", Value: value}})
+	}
+	a, errA := build("token-\xff")
+	b, errB := build("token-\xfe")
+	if errA == nil || errB == nil {
+		t.Fatalf("invalid UTF-8 must be refused outright: %v / %v", errA, errB)
+	}
+	// If it ever stops being refused, it must at least stop colliding.
+	if errA == nil && errB == nil && bytes.Equal(a.Digest(), b.Digest()) {
+		t.Fatal("two records differing byte-for-byte produced one digest")
+	}
+	if _, err := build("token-ok"); err != nil {
+		t.Fatalf("valid UTF-8 must still be accepted: %v", err)
 	}
 }
 

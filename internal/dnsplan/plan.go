@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // Kinds a connect attempt can target. An org has two, with different tables and
@@ -35,8 +36,31 @@ const (
 // NormalizeName folds the two ways the same name arrives spelled: DNS is
 // case-insensitive, and a resolver answer carries the root dot where a provider
 // record does not.
+//
+// 🔴 IT MUST BE IDEMPOTENT. NormalizeName(NormalizeName(x)) == NormalizeName(x),
+// for every input, and several things break quietly when it is not.
+//
+// It was not. Trimming the root dot AFTER trimming space uncovers a space the
+// first trim already ran past: "example.com ." became "example.com " — a name
+// carrying a trailing space, which then fails to be a suffix of itself. Found by
+// FuzzContainsNeverEscapesTheAnchor and by three targets in internal/observe and
+// internal/relay, all reporting the same shape from different directions.
+//
+// The damage was fail-closed but customer-visible. Validate re-normalizes what
+// NewSnapshot stored and refuses when the two disagree, so an anchor could pass
+// the gate at authorize time and die at publish time — reported as plan_invalid,
+// which the caller's contract defines as "this is a bug and retrying cannot
+// help", and a caller that believes it may abandon the domain permanently.
+//
+// The loop also folds a doubled root dot. Neither spelling is a legal DNS name,
+// so nothing valid changes shape here and no stored digest moves — TestGoldenDigest
+// pins that, and it is a cross-repository contract with api-platform.
 func NormalizeName(name string) string {
-	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+	name = strings.TrimSpace(name)
+	for strings.HasSuffix(name, ".") {
+		name = strings.TrimSpace(strings.TrimSuffix(name, "."))
+	}
+	return strings.ToLower(name)
 }
 
 // NormalizeRecords applies the public receipt identity contract and returns the
@@ -53,7 +77,33 @@ func NormalizeRecords(records []Record) ([]Record, []string, error) {
 		if (record.Type != "CNAME" && record.Type != "TXT") || record.Name == "" || record.Value == "" {
 			return nil, nil, fmt.Errorf("%w: incomplete DNS record in group plan", ErrPlanPreparing)
 		}
+		// 🔴 EVERY FIELD MUST BE VALID UTF-8, AND THIS IS A DIGEST PROPERTY RATHER
+		// THAN A TIDINESS ONE.
+		//
+		// Digest hashes json.Marshal of the record envelope, and encoding/json
+		// SILENTLY REPLACES each invalid UTF-8 byte with U+FFFD instead of
+		// failing. So two plans whose values differ — "token-\xff" and
+		// "token-\xfe" — marshalled to identical bytes and produced ONE SHA-256.
+		// The digest is the thing that binds what a customer reviewed to what
+		// gets written; a collision in it is that binding not existing.
+		//
+		// Found by FuzzDigestIsStableAndBinding. Refusing the input is the fix
+		// rather than escaping it: no legitimate DNS record carries invalid
+		// UTF-8, and a digest computed over a repaired value would bind the
+		// repair rather than the record.
+		if !utf8.ValidString(record.Type) || !utf8.ValidString(record.Name) || !utf8.ValidString(record.Value) {
+			return nil, nil, fmt.Errorf("%w: DNS record is not valid UTF-8", ErrPlanInvalid)
+		}
 		identity := record.Type + "|" + record.Name + "|" + record.Value
+		// 🔴 BOUNDED HERE, NOT ONLY IN Validate. MaxRecordIdentity was enforced
+		// on read and not on write, so an over-long record was accepted at
+		// authorize time and refused at publish time — the same accept-then-refuse
+		// stranding described on NormalizeName above. A bound that only one of two
+		// gates applies is a bound that reports as a bug in the other one.
+		if len(identity) > MaxRecordIdentity {
+			return nil, nil, fmt.Errorf("%w: record identity is %d bytes, past the %d a plan holds",
+				ErrPlanInvalid, len(identity), MaxRecordIdentity)
+		}
 		if _, ok := seen[identity]; ok {
 			continue
 		}
