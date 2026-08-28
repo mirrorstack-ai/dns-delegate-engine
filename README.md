@@ -38,9 +38,13 @@ be dishonest to imply otherwise.** The two surfaces share one dispatcher, one
 OAuth client and one grant. An authorization obtained through the new flow — with
 your genuine consent, on a page this service served, against a proof you
 published — returns an authorization code, and nothing stops that code being
-redeemed against `Publish` with a record list instead of against `Complete`. The
-result is exactly the two records [`docs/DESIGN.md`](docs/DESIGN.md) §1 opens
-with:
+redeemed against `Publish` with a record list instead of against `Complete`.
+
+`Publish` takes the **anchor** as a request field as well, so the result is not
+bounded by the domain you connected at all — it is any `CNAME` or `TXT` anywhere
+in the zone your provider authorized. Connect `shop.example.com` and
+`www.example.com` is reachable. The two records
+[`docs/DESIGN.md`](docs/DESIGN.md) §1 opens with are the mild case:
 
 ```
 CNAME  account.example.com          →  attacker.example
@@ -115,14 +119,14 @@ record's **value**, what the digest covers, and what stopping us costs you.
 <tr>
 <td>Can it touch a name you didn't see?</td>
 <td><strong>No.</strong> Every record must sit at or under the anchor — the exact hostname you proved you own — or the whole plan is refused.</td>
-<td><strong>Same.</strong> The boundary sits below both surfaces.</td>
+<td>🔴 <strong>Not the same.</strong> The containment code is shared, but the <em>anchor</em> it checks against arrives as a request field — <code>PublishRequest.Anchor</code> — and on the authorization-code path nothing binds it to anything you proved. What bounds this surface is whatever your provider scoped the grant to, which is <strong>one whole zone</strong>.</td>
 <td><a href="internal/dnsplan/plan.go"><code>plan.go</code></a>, <code>NewSnapshot</code> and <code>Contains</code></td>
 </tr>
 <tr>
 <td>Can it touch <code>www</code>, your apex, or your MX?</td>
 <td><strong>No</strong>, unless the domain you connected <em>is</em> that name. Connecting <code>shop.example.com</code> cannot reach <code>example.com</code>, <code>www.example.com</code>, or your mail records.</td>
-<td><strong>Same.</strong></td>
-<td><a href="internal/dnsplan/plan_test.go"><code>plan_test.go</code></a> asserts exactly this</td>
+<td>🔴 <strong>Yes.</strong> The anchor is the caller's field here, so a grant taken for <code>shop.example.com</code> is checked against whatever anchor the private half names — anywhere inside the zone your provider authorized.</td>
+<td><a href="internal/dnsplan/plan_test.go"><code>plan_test.go</code></a> asserts this of the containment rule; <a href="internal/grant/service.go"><code>grant/service.go</code></a> is where the legacy surface chooses what to apply it to</td>
 </tr>
 <tr>
 <td>Can it write an A record or an MX record?</td>
@@ -169,11 +173,17 @@ that can write to your zone: `Complete`, `Advance` and `BindAppToOrgAppDomain` o
 the intent surface, plus the deprecated `Publish`, which is the only one that
 takes its records from the caller.
 
-From there, two files answer the two halves of the question.
+From there, three files answer the question.
 [`internal/derive/derive.go`](internal/derive/derive.go) is **what** can be
-written — every value, derived from the lane and the domain alone. `Contains` in
-[`internal/dnsplan/plan.go`](internal/dnsplan/plan.go) is **where** — six lines,
-and it is the boundary both surfaces are checked against.
+written — every derived value, from the lane, the domain, and this deployment's
+published routing configuration. It does not produce two of the seven records:
+those are relayed verbatim from AWS and Cloudflare in
+[`internal/relay`](internal/relay/relay.go), bounded on the way through.
+`Contains` in [`internal/dnsplan/plan.go`](internal/dnsplan/plan.go) is
+**where** — six lines, and it is the containment both surfaces are checked
+against, though the two surfaces differ in what they check it against (see the
+table above). [`internal/reconcile`](internal/reconcile/reconcile.go) is what
+actually writes.
 
 For the complete list of what lands in your zone, including the two records that
 are relayed verbatim from AWS and Cloudflare rather than chosen by anyone at
@@ -374,9 +384,10 @@ under any org parent. **It works for a personal app too**, one owned by a person
 with no organization anywhere in the picture, which is why this lane takes an app
 rather than an organization.
 
-It is authorized exactly like the other two: a Cloudflare grant, scoped by your
-provider to one zone, held by this service. There is no separate mechanism and no
-pasted API token.
+On the intent surface it is authorized exactly like the other two: a Cloudflare
+grant, scoped by your provider to one zone, held by this service, and no pasted
+API token. **That is not what runs today** — see the migration note at the end of
+this section.
 
 This is also the tightest of the three anchors. The anchor **is** the hostname,
 so nothing is derived beneath it and nothing beside it is reachable — connecting

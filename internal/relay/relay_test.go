@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -589,6 +590,59 @@ func TestServingProofsSurfaceAFailedRead(t *testing.T) {
 // whatever it is asked. It is not a caricature: from above the interface it is
 // indistinguishable from a SECOND certificate authority, a double someone wires
 // by mistake, or a change inside AWS.
+// 🔴 THE CASE THE BOUND USED TO FAIL SILENTLY.
+//
+// ACM returns one DomainValidationOption per SAN per certificate, and a host
+// re-issued many times has many certificates naming it. A lane-1 registration
+// asking about three hosts therefore produces a large answer that dedups to
+// three records. The bound used to be taken BEFORE dedup and against the whole
+// plan's budget, so an ordinary certificate estate was refused as
+// ErrUnexpectedRecord — which intent downgrades to a warning, so record 5 simply
+// never appeared and the customer's AWS certificate never validated.
+func TestALargeReissuedCertificateEstateStillRelays(t *testing.T) {
+	hosts := []string{"account.example.com", "api.example.com", "apps.example.com"}
+	// 43 re-issues per host: 129 rows in, 3 distinct records out. Comfortably
+	// past the old pre-dedup bound of 128 and past MaxRelayed too, so this test
+	// fails against either half of the old check.
+	var noisy []dnsplan.Record
+	for range 43 {
+		for _, host := range hosts {
+			noisy = append(noisy, dnsplan.Record{
+				Type: "CNAME", Name: "_v." + host, Value: "_v." + host + ".acm-validations.aws",
+			})
+		}
+	}
+	if len(noisy) <= MaxRelayed {
+		t.Fatalf("the fixture must cross the bound to be worth anything: %d", len(noisy))
+	}
+
+	got, err := ValidationRecords(t.Context(), hostileCA{records: noisy}, hosts)
+	if err != nil {
+		t.Fatalf("a re-issued estate is ordinary, not hostile: %v", err)
+	}
+	if len(got) != len(hosts) {
+		t.Fatalf("want one record per host after dedup, got %d: %#v", len(got), got)
+	}
+}
+
+// The reserve still refuses an answer that is genuinely too long AFTER dedup —
+// otherwise moving the check past dedup would have removed it rather than fixed
+// it.
+func TestTooManyDistinctValidationRecordsIsStillRefused(t *testing.T) {
+	hosts := []string{"example.com"}
+	var many []dnsplan.Record
+	for i := range MaxRelayed + 1 {
+		many = append(many, dnsplan.Record{
+			Type:  "CNAME",
+			Name:  fmt.Sprintf("_%d.example.com", i),
+			Value: fmt.Sprintf("_%d.acm-validations.aws", i),
+		})
+	}
+	if _, err := ValidationRecords(t.Context(), hostileCA{records: many}, hosts); !errors.Is(err, ErrUnexpectedRecord) {
+		t.Fatalf("want ErrUnexpectedRecord past the reserve, got %v", err)
+	}
+}
+
 type hostileCA struct{ records []dnsplan.Record }
 
 func (h hostileCA) ValidationRecords(context.Context, []string) ([]dnsplan.Record, error) {

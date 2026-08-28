@@ -551,6 +551,120 @@ func TestAdvanceWritesNothingWhenTheProofHasBeenDeleted(t *testing.T) {
 	}
 }
 
+// 🔴 THE CUSTOMER'S STOP CONTROL, IN EXECUTABLE FORM.
+//
+// checkProof fails for four reasons and only one of them is an answer about the
+// world. These tests pin the three that are NOT: a pass that was never in a
+// position to look must refuse rather than publish. Before proofBeforeWriting
+// existed, all four folded into a warning string and the pass wrote anyway —
+// so a deployment with a nil Resolver published into a customer's zone having
+// never read their proof, and deleting it changed nothing, forever.
+func TestAPassThatCouldNotLookRefusesRatherThanWriting(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cripple func(*harness)
+		want    error
+	}{
+		{
+			name: "no resolver wired",
+			// The Resolver field's own comment promises a nil is reported rather
+			// than quietly replaced. Describe and Orphans honoured that; the two
+			// paths that write did not.
+			cripple: func(h *harness) { h.svc.Resolver = nil },
+			want:    ErrUnavailable,
+		},
+		{
+			name: "the keyset went away mid-pass",
+			// Not a contrivance: the loaders are per-request and re-read their
+			// secret on a TTL, so a retired key or a secret store that starts
+			// refusing looks exactly like this from inside one call. Without a
+			// keyset there is no accept set, so there is nothing to compare a
+			// published proof against.
+			cripple: func(h *harness) {
+				h.svc.Keys = &vanishingKeys{sealer: h.sealer, gone: true}
+			},
+			want: ErrUnavailable,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			out := h.register(t, lane.OrgPlatformDomain, testOrg, platformDomain)
+			h.publishProof(t, out)
+			reg := h.open(t, out.Registration)
+			held := h.seal(t, "refresh-1", reg)
+			tc.cripple(h)
+
+			got, err := h.svc.Advance(t.Context(),
+				AdvanceRequest{Registration: out.Registration, SealedToken: held})
+			if err == nil {
+				t.Fatalf("a pass that could not read the proof must REFUSE, got %#v", got)
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("want %v, got %v", tc.want, err)
+			}
+			if h.provider.writes != 0 {
+				t.Fatalf("nothing may reach the customer's zone: %d writes", h.provider.writes)
+			}
+			// A warning inside a published response is exactly what this test
+			// exists to forbid: it is invisible to anyone reading the result.
+			if got.Result == ResultPublished {
+				t.Fatal("refusing must not be spelled as publishing-with-a-warning")
+			}
+		})
+	}
+}
+
+// The other half of the asymmetry, and it matters just as much: a resolver that
+// timed out is a fault of ours or of the network, not the customer withdrawing
+// consent. Stopping on it would let a nameserver blip take a working domain
+// down, and the loop would eventually release a live credential over it.
+func TestAResolverFailureStillWarnsAndStillPublishes(t *testing.T) {
+	h := newHarness(t)
+	out := h.register(t, lane.OrgPlatformDomain, testOrg, platformDomain)
+	h.publishProof(t, out)
+	reg := h.open(t, out.Registration)
+	held := h.seal(t, "refresh-1", reg)
+
+	h.resolver.failWith(proof.Prefix+platformDomain, errors.New("SERVFAIL"))
+
+	got, err := h.svc.Advance(t.Context(),
+		AdvanceRequest{Registration: out.Registration, SealedToken: held})
+	if err != nil {
+		t.Fatalf("a resolver fault is not a refusal: %v", err)
+	}
+	if got.Result != ResultPublished {
+		t.Fatalf("want the pass to proceed on the anchor proven at authorize time, got %#v", got)
+	}
+	if h.provider.writes == 0 {
+		t.Fatal("a resolver blip must not stop a pass that is otherwise fine")
+	}
+	if len(got.Warnings) == 0 {
+		t.Fatal("it must still be visible that the proof could not be read")
+	}
+}
+
+// lookupFailed is the classifier the rule above turns on. Pinning it directly
+// covers the one case the harness cannot reach: an accept set that came back
+// empty, which observe refuses so that it cannot be mistaken for a customer who
+// has not published yet.
+func TestLookupFailedNamesOnlyAnswersAboutTheWorld(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"a resolver that did not answer", errors.New("SERVFAIL"), true},
+		{"no keyset or no resolver", fmt.Errorf("%w: nothing wired", ErrUnavailable), false},
+		{"an anchor too deep to carry a proof", fmt.Errorf("%w: too deep", ErrInvalidRequest), false},
+		{"an empty accept set", fmt.Errorf("%w: no accepted values", observe.ErrObserve), false},
+		{"no error at all", nil, false},
+	} {
+		if got := lookupFailed(tc.err); got != tc.want {
+			t.Errorf("%s: lookupFailed(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
+		}
+	}
+}
+
 // 🔴 THE 2026-08-24 BUG. The provider rotates the refresh token on every use, so
 // once the refresh returns, the caller's stored token is already dead. A publish
 // failure after that point must still hand back the replacement.
@@ -1602,6 +1716,15 @@ func (f *fakeResolver) LookupCNAME(_ context.Context, name string) (string, erro
 		return value, nil
 	}
 	return "", notFound(name)
+}
+
+// failWith makes a name answer with something OTHER than absence — the state
+// internal/observe calls unknown, and the one half of checkProof's asymmetry
+// that must NOT stop a pass.
+func (f *fakeResolver) failWith(name string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fail[dnsplan.NormalizeName(name)] = err
 }
 
 func (f *fakeResolver) remove(name string) {

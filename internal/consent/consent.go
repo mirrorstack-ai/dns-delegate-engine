@@ -180,10 +180,18 @@ func Required(l lane.Lane) bool {
 // help, because the private half hands the envelope back and could hand back the
 // EARLIER one — a rollback in the direction that grants more authority, which is
 // the one direction sealed's replay note says the stateless design must never
-// depend on. The bounds that do hold are the registration's: re-registering the
-// domain mints a new reference and invalidates every acknowledgement for the old
-// one, and the two controls that actually stop a live grant are the customer's —
-// delete the ownership proof, or revoke at the provider (DESIGN §8).
+// depend on.
+//
+// 🔴 AND RE-REGISTERING IS NOT A WAY OUT OF IT. It mints a new reference, so an
+// old acknowledgement does not verify against the NEW registration — but it does
+// not retire the OLD one, which the private half may still present: a sealed
+// envelope is replayable and this service cannot tell a replay from the original
+// (sealed.go's replay note). So the acknowledgement remains spendable against the
+// old registration indefinitely.
+//
+// The two controls that actually stop a live grant are the customer's, and they
+// are the honest answer here — delete the ownership proof, or revoke at the
+// provider (DESIGN §8).
 func Token(s *grantcrypto.Sealer, nonce, anchor string) (string, error) {
 	if s == nil {
 		// No keyset means no acknowledgement — never an acknowledgement under an

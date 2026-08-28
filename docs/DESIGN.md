@@ -27,8 +27,11 @@ first thing below.
 > still calls them. They are reachable with the credential this flow obtains:
 > run the intent flow, get your genuine consent on your provider's screen, and
 > then redeem the resulting authorization code against `publish` with a record
-> list instead of against `complete` — and you get exactly the two records §1
-> opens with, in your zone. **Until that action is deleted, your answer to
+> list instead of against `complete`. `publish` takes the **anchor** as a request
+> field too, and on the authorization-code path nothing binds it to anything you
+> proved — so the reach is not the domain you connected, it is any `CNAME` or
+> `TXT` anywhere in the zone your provider authorized. The two records §1 opens
+> with are the mild case. **Until that action is deleted, your answer to
 > "could MirrorStack break our website?" is unchanged by everything below
 > it.** Deleting it is the next step and it is a change to two repositories,
 > caller first.
@@ -90,8 +93,14 @@ does not have, which is worse than today.
 
 All three are authorized the same way — a provider grant scoped to one zone, held
 by this service — and all three are bounded by a proof you published at the
-anchor. There is no lane with a weaker path, which is the point of listing them
-together.
+anchor. There is no lane with a weaker path — that is the design, and it is why
+they are listed together.
+
+On this build two of the three are not yet reachable on those terms: lane 2 is
+refused at `authorize` because nothing mints a consent acknowledgement (§4), and
+lane 3 still runs on the caller's older pasted-token path (the migration note
+below). The design is what the table describes; the status block at the top of
+this document is what runs.
 
 Lane 3 is the one to read carefully. It is not "an app under the org's parent" —
 it is a domain someone attaches to a single app, and it must work when there is
@@ -291,9 +300,11 @@ full below.
 🔴 **Which means lane 2 cannot be authorized on this build at all, and that is
 a gap rather than a decision.** An acknowledgement is a MAC minted under this
 deployment's key, over a reference sealed into the registration — and nothing in
-the deployed binary mints one. The consent page is rendered and the flow
-deliberately stops there, because where that page is served and which event
-counts as the agreement are not settled. So `IntentAuthorize` refuses
+the deployed binary mints one. The page itself is written, but on this build it is
+reachable only on the local-development HTTP route: no wire action returns it, so
+the deployed Lambda serves it to nobody. The flow deliberately stops there,
+because where that page is served and which event counts as the agreement are not
+settled. So `IntentAuthorize` refuses
 `org_app_domain` with `consent_required`, every time, on every deployment of
 this build. It ships that way because the refusal is the safe end of the
 failure: the alternative is minting the acknowledgement somewhere the customer
@@ -308,6 +319,11 @@ the records that are knowable at this moment.
 **Takes no identity, no lane and no domain** — all three come from the sealed
 `state`. That is what makes `authorize` and `complete` cryptographically the same
 act, rather than two requests whose fields are checked against each other.
+
+It also **re-resolves the ownership proof itself**, after the digest and before
+the code is exchanged. The sealed state is a ten-minute receipt of the check
+`authorize` made; without this second look there would be a ten-minute window in
+which the proof is already gone and this service still writes.
 `expectDigest` is **required**; an empty value is refused, because an
 integrity check a caller can switch off by omitting a field is a claim rather
 than a control. Three things it is *not*, and they matter more than the
@@ -362,8 +378,10 @@ write rather than clobbering an edit you made a second ago.
 
 ### `release(registration, grant, reason)`
 
-Revokes at the provider, refresh token first. An envelope that cannot be opened
-is reported as such and never guessed at.
+Revokes the refresh token at the provider — that is the one that kills the whole
+grant, so there is no second call to make. An envelope that cannot be opened is
+reported as such and never guessed at, because a grant we cannot name is one a
+human has to end by hand and saying so is the only useful answer.
 
 Two more exist and write nothing: `capabilities()` (`IntentCapabilities`),
 which publishes the routing targets, the DCV delegation identifier, the declared

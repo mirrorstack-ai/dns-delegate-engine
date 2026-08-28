@@ -588,12 +588,12 @@ func (s *Service) Authorize(ctx context.Context, req AuthorizeRequest) (Authoriz
 // act rather than two requests whose fields are checked against each other.
 //
 // 🔴 ExpectDigest IS REQUIRED AND AN EMPTY VALUE IS REFUSED. The legacy
-// PublishRequest treated it as optional, and README.md still says so out loud:
-// "the check is skipped if the caller omits the digest, so it defends against a
-// bug in the private half, not against the private half." An integrity check the
-// caller can switch off by omitting a field is a claim rather than a control, and
-// this repository is public precisely so its claims can be checked. Requiring it
-// is the fix.
+// PublishRequest treats it as optional and skips the check when it is absent, so
+// there it is a claim rather than a control. Requiring it here closes that half.
+//
+// It does NOT make the digest a bound on the private half — both sides are
+// derived here and the caller was handed the value. See the comment at the
+// comparison itself, and docs/DESIGN.md §4.
 func (s *Service) Complete(ctx context.Context, req CompleteRequest) (PassResponse, error) {
 	cfg := s.oauthConfig(ctx)
 	if cfg == nil {
@@ -641,9 +641,18 @@ func (s *Service) Complete(ctx context.Context, req CompleteRequest) (PassRespon
 	if err != nil {
 		return PassResponse{}, err
 	}
-	// 🔴 THE CROSS-BOUNDARY INTEGRITY CHECK, AND IT RUNS BEFORE THE EXCHANGE. A
-	// plan that does not reproduce what the customer reviewed is refused while
-	// the authorization code is still unspent and no credential exists.
+	// 🔴 THIS RUNS BEFORE THE EXCHANGE. A plan that does not reproduce what the
+	// customer reviewed is refused while the authorization code is still unspent
+	// and no credential exists.
+	//
+	// 🔴 AND IT IS NOT THE CROSS-BOUNDARY CONTROL IT LOOKS LIKE. Both sides of
+	// the comparison are derived here, from the sealed registration, and the
+	// caller was HANDED the digest it sends back — so this is derive(reg) against
+	// derive(reg). It catches a plan that drifted between registration and
+	// completion, and it catches a bug in the private half. It does not bound the
+	// private half, because nothing the customer signed enters it. docs/DESIGN.md
+	// §4 says the same thing at more length; if you are about to describe this as
+	// the thing that stops a hostile caller, read that section first.
 	//
 	// 🔴 IT IS TWO CHECKS AND THEY ARE TWO DIFFERENT SCREENS. Validate is asked
 	// against the snapshot's OWN digest, so the only thing it can still refuse is
@@ -679,10 +688,12 @@ func (s *Service) Complete(ctx context.Context, req CompleteRequest) (PassRespon
 	// state is a ten-minute receipt of that check (see sealed.OpenAuthState), and
 	// DESIGN §8 promises there is no window in which we are still writing and the
 	// customer has already said no. Ten minutes is such a window; this closes it.
-	check, err := s.checkProof(ctx, reg)
+	check, warning, err := s.proofBeforeWriting(ctx, reg)
 	if err != nil {
-		out.Warnings = append(out.Warnings, fmt.Sprintf(
-			"the ownership proof could not be re-read before publishing: %v", err))
+		return PassResponse{}, err
+	}
+	if warning != "" {
+		out.Warnings = append(out.Warnings, warning)
 	}
 	if check.withdrawn {
 		return stopped(out, check), nil
@@ -759,9 +770,12 @@ func (s *Service) pass(
 		GrantSeconds: grantSeconds(reg.Lane),
 	}
 
-	check, err := s.checkProof(ctx, reg)
+	check, warning, err := s.proofBeforeWriting(ctx, reg)
 	if err != nil {
-		out.Warnings = append(out.Warnings, fmt.Sprintf("the ownership proof could not be read: %v", err))
+		return PassResponse{}, err
+	}
+	if warning != "" {
+		out.Warnings = append(out.Warnings, warning)
 	}
 	if check.withdrawn {
 		return stopped(out, check), nil
@@ -1080,6 +1094,40 @@ func stopped(out PassResponse, check proofCheck) PassResponse {
 	return out
 }
 
+// proofBeforeWriting resolves the ownership proof for a pass that is about to
+// publish, and decides whether the pass may continue at all.
+//
+// 🔴 A PASS THAT COULD NOT LOOK MUST NOT WRITE.
+//
+// checkProof fails for four reasons and only ONE of them is an answer about the
+// world. A resolver that timed out or SERVFAILed is a fault of ours or of the
+// network, and stopping on it would make a nameserver blip indistinguishable
+// from a customer saying no — so that one degrades to a warning and the pass
+// proceeds on the anchor proven at authorize time.
+//
+// The other three — no keyset, no resolver wired, an accept set we could not
+// compute — mean this service was never in a position to ask. Publishing on
+// those makes the customer's stop control silently inoperative: they delete the
+// ownership proof, we never read it, and the records come back on every pass
+// with nothing but a warning string inside a `published` response to say so.
+// DESIGN §8 promises deletion stops every write; that promise is this function.
+//
+// Describe takes the opposite branch deliberately (see its call to checkProof):
+// it writes nothing, so a report with an `unknown` proof row beats no report.
+func (s *Service) proofBeforeWriting(ctx context.Context, reg sealed.Registration) (proofCheck, string, error) {
+	check, err := s.checkProof(ctx, reg)
+	switch {
+	case err == nil:
+		return check, "", nil
+	case lookupFailed(err):
+		return check, fmt.Sprintf("the ownership proof could not be read: %v", err), nil
+	default:
+		// 🔴 Returning the zero proofCheck matters: withdrawn is false on it, and
+		// a caller that ignored this error would fall through to the publish.
+		return proofCheck{}, "", err
+	}
+}
+
 // lookupFailed reports an error that belongs to the RESOLVER rather than to us.
 //
 // Everything this service could have got wrong is one of three sentinels: no
@@ -1335,8 +1383,16 @@ func reviewSnapshot(l lane.Lane, identity string, plan derive.Plan) (dnsplan.Sna
 // It also asserts that the reviewed plan is still COVERED by what is about to be
 // written. The write set may legitimately have GROWN — that is what a later pass
 // is for — but it may never shrink or mutate, because that is a plan the customer
-// did not see. dnsplan.CoveredBy is exactly this check and exists for exactly
-// this reason.
+// did not see.
+//
+// 🔴 BE HONEST ABOUT WHAT THAT ASSERTION CURRENTLY CATCHES: NOTHING. On every
+// path today, review and the write set are derived in the same call from the same
+// plan, and relayInto only ever APPENDS — so the containment holds by
+// construction and the check cannot fire. It is here for the edit that has not
+// been made yet: the day something filters the merged set, or derives the two
+// halves from different plans, this is what refuses. Defence in depth is worth
+// keeping and worth labelling as such; a reader must not come away thinking it
+// is catching a live drift between the consent screen and the write.
 //
 // A plan that is not publishable yet comes back as a Failure rather than an
 // error: it is a wait, not a fault.

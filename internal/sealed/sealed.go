@@ -181,6 +181,17 @@ type Registration struct {
 	// WHICH lanes owe one is consent.Required's rule, asked where a
 	// registration is minted; this package only guarantees that the reference
 	// cannot be added, edited or chosen afterwards.
+	//
+	// 🔴 ADDED WITHOUT BUMPING Version, AND THAT MAKES A ROLLBACK A ONE-WAY DOOR.
+	// Forward is safe: the AAD is unchanged, the field is omitempty, and validate
+	// treats it as absent on every envelope minted before it existed — so nothing
+	// already in flight was invalidated. Backward is not. decode uses
+	// DisallowUnknownFields, so a build without this field refuses every lane-2
+	// registration minted by a build with it, as a bare ErrInvalidEnvelope that
+	// names no cause. Bumping Version would have invalidated every live envelope
+	// to prevent a rollback nobody plans, which is strictly worse — so the trade
+	// is recorded here instead of paid for. If you roll this service back past
+	// this commit, lane-2 registrations must be re-registered.
 	ConsentNonce string `json:"consentNonce,omitempty"`
 
 	// IssuedAt records when the domain was registered, in unix seconds. It

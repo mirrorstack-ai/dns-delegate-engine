@@ -84,6 +84,31 @@ const ValidationTargetSuffix = ".acm-validations.aws"
 // record that was asked for.
 const ownershipRecordPrefix = "_cf-custom-hostname."
 
+// MaxRelayed is how many records this relay may add to one plan.
+//
+// It is a RESERVE, not the plan's whole budget, because the derived records are
+// already in the plan by the time a relayed one is merged. The arithmetic, for a
+// reader checking whether a large certificate estate can break their lane:
+//
+//	a plan holds                        dnsplan.MaxRecords = 128 records
+//	the largest derived lane is lane 1:  1 ownership proof
+//	                                     4 routing CNAMEs   (account api apps cdn)
+//	                                     4 DCV pointers     (one per host)
+//	                                     = 9 derived
+//	relayed, worst case:                 3 ACM validations  (cdn owns no AWS cert)
+//	                                     4 serving proofs   (one per host)
+//	                                     = 7 relayed in practice
+//
+// So the real shapes are nowhere near the limit, and the reserve exists for the
+// pathological upstream rather than the ordinary one. 64 leaves the derived side
+// room to double twice over and still fit, and refuses an answer long before it
+// could push a plan past dnsplan.MaxRecords — where the overflow would be spelled
+// ErrPlanPreparing and read by the caller as a wait that never resolves.
+//
+// 🔴 IT IS COUNTED AFTER DEDUP. Counting before it counts certificates rather
+// than records; see ValidationRecords.
+const MaxRelayed = 64
+
 // maxServingProofValue bounds the relayed TXT value at DNS's own limit — one TXT
 // character-string carries at most 255 octets.
 //
@@ -172,15 +197,6 @@ func ValidationRecords(ctx context.Context, ca CertificateAuthority, hosts []str
 	if len(records) == 0 {
 		return nil, nil
 	}
-	// A plan holds dnsplan.MaxRecords records and no more, so a longer answer
-	// cannot be published in any case. It is refused HERE, by name, because
-	// carrying it further turns it into dnsplan's ErrPlanPreparing — which the
-	// caller reports as a retryable wait, and a customer would sit in front of a
-	// "preparing" that resolves on no pass ever.
-	if len(records) > dnsplan.MaxRecords {
-		return nil, fmt.Errorf("%w: %d validation records for %d hosts, past the %d a plan holds",
-			ErrUnexpectedRecord, len(records), len(wanted), dnsplan.MaxRecords)
-	}
 	seen := make(map[string]struct{}, len(records))
 	out := make([]dnsplan.Record, 0, len(records))
 	for _, record := range records {
@@ -194,6 +210,35 @@ func ValidationRecords(ctx context.Context, ca CertificateAuthority, hosts []str
 		}
 		seen[identity] = struct{}{}
 		out = append(out, checked)
+	}
+	// 🔴 THE BOUND IS TAKEN AFTER DEDUP, AND AGAINST THE RELAY'S SHARE OF THE
+	// PLAN — NOT AGAINST THE WHOLE PLAN'S BUDGET.
+	//
+	// Both halves of that were wrong once and each failed silently in its own
+	// direction.
+	//
+	// Counting BEFORE dedup counts certificates, not records. ACM returns one
+	// DomainValidationOption per SAN per certificate, and a host that has been
+	// re-issued many times has many certificates naming it — so a lane-1
+	// registration asking about three hosts can legitimately produce well over a
+	// hundred rows that dedup to three. Refusing on the raw count turned an
+	// ordinary certificate estate into ErrUnexpectedRecord, which the caller
+	// downgrades to a warning: record 5 then never appears and the customer's AWS
+	// certificate never validates, with nothing anywhere saying why.
+	//
+	// Counting against dnsplan.MaxRecords was the wrong number even when the
+	// count was right. The derived records are already in the plan by the time a
+	// relayed one is merged, so an answer exactly at the whole-plan bound
+	// overflows it — and dnsplan spells that overflow ErrPlanPreparing, which the
+	// caller reports as a retryable wait. That is verbatim the outcome this check
+	// exists to prevent: a customer sitting in front of a "preparing" that
+	// resolves on no pass, ever.
+	//
+	// MaxRelayed is therefore a reserve, sized so that the largest derived plan
+	// plus a full relay still fits. See its declaration for the arithmetic.
+	if len(out) > MaxRelayed {
+		return nil, fmt.Errorf("%w: %d distinct validation records for %d hosts, past the %d this relay may add to a plan",
+			ErrUnexpectedRecord, len(out), len(wanted), MaxRelayed)
 	}
 	// 🔴 SORTED, BECAUSE THE PLAN DIGEST IS ORDER-SENSITIVE. api-platform hashes
 	// the record list in order before the customer authorizes, and this service

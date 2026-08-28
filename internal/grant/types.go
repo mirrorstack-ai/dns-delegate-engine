@@ -63,10 +63,20 @@ type PublishRequest struct {
 	// ExpectedDigest is the hex SHA-256 api-platform stored on the attempt
 	// BEFORE the customer authorized.
 	//
-	// 🔴 THIS IS THE CROSS-BOUNDARY INTEGRITY CHECK. This service recomputes the
-	// digest from Records and refuses the write if it differs. A buggy — or
-	// hostile — api-platform therefore cannot publish a plan the customer never
-	// reviewed, even though it is the side that derives the plan.
+	// 🔴 IT IS OPTIONAL, AND THAT MAKES IT A CLAIM RATHER THAN A CONTROL. This
+	// service recomputes the digest from Records and refuses the write if it
+	// differs — but only when the field is present. `omitempty` is not
+	// decoration: Publish skips the comparison entirely when the caller sends
+	// nothing, so a buggy or hostile caller does not have to defeat the check,
+	// it can decline to request it.
+	//
+	// This comment used to say the opposite. It claimed a hostile api-platform
+	// could not publish a plan the customer never reviewed; that was never true
+	// of this surface, and a false claim in a public repository is worse than a
+	// missing one. The intent surface's `Complete` requires the digest and
+	// refuses an empty value — though see its own comments for why even a
+	// mandatory digest is not a bound on the caller. This field is retained
+	// until api-platform stops calling Publish.
 	ExpectedDigest string `json:"expectedDigest,omitempty"`
 
 	Code         string `json:"code,omitempty"`

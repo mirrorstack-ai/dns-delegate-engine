@@ -28,8 +28,10 @@ action is deleted.
 
 ## The anchor
 
-The anchor is the hostname you are connecting. It is the only bound on what a
-delegated write can reach:
+The anchor is the hostname you are connecting. On the intent surface it is the
+only bound on what a delegated write can reach. On the legacy surface it is a
+field on the request, which is a different thing entirely — read to the end of
+this section before relying on the table:
 
 | connecting | anchor | reachable | never reachable |
 |---|---|---|---|
@@ -44,10 +46,17 @@ The suffix is matched with a leading dot, so `evilexample.com` is not under
 Who chooses the anchor, and what proves it, is the one thing that differs most
 between the two surfaces:
 
-🔴 **On the legacy `publish(records)` surface the anchor is chosen by
-MirrorStack's private half, and the record that is supposed to prove it is one
-we write ourselves.** The gate on connecting a hostname is a public lookup for
-that same record, so the proof is satisfied by our own write and proves nothing.
+🔴 **On the legacy `publish(records)` surface the anchor is a field on the
+publish request.** It is not derived from anything, and on the authorization-code
+path nothing binds it to anything you proved — so the table above does not
+describe that surface. Connecting `shop.example.com` yields a credential your
+provider scoped to the whole `example.com` zone, and a publish naming
+`example.com` as its anchor reaches `www.example.com` with every check in this
+repository passing.
+
+The ownership TXT does not close that either, because on this surface **we write
+it ourselves**, and the gate on connecting a hostname is a public lookup for that
+same record — so the proof is satisfied by our own write and proves nothing.
 That surface is still routed.
 
 ✅ **On the intent surface the proof is yours.** The anchor comes out of a
@@ -58,7 +67,8 @@ consent URL and again on every later pass. That is what makes the anchor a bound
 you set rather than one we assert.
 
 Until the legacy action is deleted, the first of those is what your zone is
-actually bounded by. See [`DESIGN.md`](DESIGN.md)'s status block.
+actually bounded by — which is to say, by your provider's zone scope and not by
+an anchor at all. See [`DESIGN.md`](DESIGN.md)'s status block.
 
 ---
 
@@ -126,6 +136,13 @@ with an app whose slug is `blog`:
 - **The credential is standing**, because the records it exists to write are for
   apps that do not exist yet, and its expiry slides forward each time it
   publishes. That is the trade to think hardest about on this repository.
+- 🔴 **On the intent surface this lane cannot be authorized on this build at
+  all.** It is the one lane that requires this service's own consent page to have
+  been acknowledged — a wildcard is the one grant whose scope you cannot
+  enumerate for yourself — and nothing in the deployed binary mints an
+  acknowledgement. So `authorize` refuses it every time. What runs today for this
+  lane is the legacy record-list path. [`DESIGN.md`](DESIGN.md) §4 has the
+  reasoning and why refusing is the safe end of the failure.
 
 ---
 
