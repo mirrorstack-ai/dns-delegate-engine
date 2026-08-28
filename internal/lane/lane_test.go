@@ -407,6 +407,36 @@ func TestValidateDomainAccepts(t *testing.T) {
 	}
 }
 
+// 🔴 A RESERVED SUFFIX WRITTEN WITH A LEADING DOT PROTECTED NOTHING.
+//
+// Suffixes are often WRITTEN with a leading dot, so an operator setting
+// MS_RESERVED_DOMAIN_SUFFIXES=".staging.example" is writing what looks like a
+// suffix. NormalizeName trims a trailing root dot and not a leading one, so the
+// entry survived non-empty, the malformed-list guard did not fire, and Contains
+// then tested for a suffix "..staging.example" that no DNS name can end in.
+//
+// The entry read like protection and enforced none — which is the exact failure
+// ValidateDomain's own doc comment says must never happen, one spelling further
+// out. Found by fuzzing internal/derive.
+func TestAReservedSuffixWithALeadingDotIsRefusedRatherThanIgnored(t *testing.T) {
+	// The shape that used to pass silently.
+	if _, err := ValidateDomain("sub.staging.example", []string{".staging.example"}); err == nil {
+		t.Fatal("a leading-dot reserved entry must be refused, not silently ignored")
+	}
+	// It must fail LOUDLY for every domain, not only ones that would have matched
+	// — a malformed guard is a configuration defect, not a per-name outcome.
+	if _, err := ValidateDomain("unrelated.example.net", []string{".staging.example"}); err == nil {
+		t.Fatal("a malformed reserved list must refuse every domain")
+	}
+	// And the correct spelling must still work.
+	if _, err := ValidateDomain("sub.staging.example", []string{"staging.example"}); err == nil {
+		t.Fatal("a well-formed reserved entry must still refuse names under it")
+	}
+	if _, err := ValidateDomain("unrelated.example.net", []string{"staging.example"}); err != nil {
+		t.Fatalf("a well-formed reserved entry must not refuse unrelated names: %v", err)
+	}
+}
+
 func TestValidateDomainRefuses(t *testing.T) {
 	cases := []struct{ name, input string }{
 		{"empty", ""},

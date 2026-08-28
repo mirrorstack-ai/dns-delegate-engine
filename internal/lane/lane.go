@@ -301,6 +301,23 @@ func ValidateIdentity(s string) (string, error) {
 // every domain instead of quietly protecting none. A guard that protects nothing
 // while reading like protection is worse than no guard at all.
 func ValidateDomain(name string, reserved []string) (string, error) {
+	// 🔴 STRUCTURAL ILLEGALITY IS CHECKED ON THE RAW NAME, BEFORE NORMALIZING.
+	//
+	// This used to lean on NormalizeName preserving the defect: "example.com.."
+	// normalized to "example.com.", whose empty last label labelReason then
+	// caught. That made a REFUSAL depend on a normalizer being incomplete, and
+	// when NormalizeName was made idempotent — which it had to be, because
+	// Validate re-normalizes what NewSnapshot stored and a disagreement strands a
+	// customer mid-connect — the doubled dot folded away and the refusal
+	// evaporated with it.
+	//
+	// Normalizing is total and validating is strict; a rule that needs the first
+	// one to be lossy is a rule in the wrong place. An empty label is illegal in
+	// a DNS name however it is spelled, so it is refused here on what the caller
+	// actually sent.
+	if strings.Contains(strings.TrimSpace(name), "..") {
+		return "", fmt.Errorf("%w: %q has an empty label", ErrInvalid, echo(strings.TrimSpace(name)))
+	}
 	normalized := dnsplan.NormalizeName(name)
 	if normalized == "" {
 		return "", fmt.Errorf("%w: empty domain", ErrInvalid)
@@ -331,6 +348,26 @@ func ValidateDomain(name string, reserved []string) (string, error) {
 		if suffix == "" {
 			slog.Error("lane: refusing every domain because the reserved-suffix list carries an entry that normalizes to nothing")
 			return "", fmt.Errorf("%w: the reserved suffix list is malformed", ErrInvalid)
+		}
+		// 🔴 A LEADING DOT IS THE SAME FAILURE ONE SPELLING FURTHER OUT.
+		//
+		// Suffixes are often WRITTEN with a leading dot, and an operator setting
+		// MS_RESERVED_DOMAIN_SUFFIXES=".staging.example" is writing what looks
+		// like a suffix. NormalizeName trims a trailing root dot and not a
+		// leading one, so the entry survives non-empty, the guard above does not
+		// fire, and Contains then tests for the suffix "..staging.example" —
+		// which no DNS name can end in. The entry protects nothing while reading
+		// like protection, which is exactly what the paragraph above says must
+		// never happen; it was found by fuzzing internal/derive.
+		//
+		// Refused rather than repaired: stripping the dot would guess at intent,
+		// and the entry is a NAME by contract. An operator who sees this error
+		// fixes their configuration in one edit.
+		if strings.HasPrefix(suffix, ".") {
+			slog.Error("lane: refusing every domain because a reserved-suffix entry is written with a leading dot",
+				"entry", suffix)
+			return "", fmt.Errorf("%w: the reserved suffix %q is written with a leading dot; it must be a name",
+				ErrInvalid, echo(suffix))
 		}
 		suffixes = append(suffixes, suffix)
 	}
