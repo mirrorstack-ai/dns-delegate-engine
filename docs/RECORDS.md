@@ -4,6 +4,10 @@ The complete reference. If a record is not described here, no code path in this
 service can produce it — the vocabulary is `CNAME` and `TXT` only, and every
 record must sit at or under the anchor.
 
+**The two lanes are listed separately**, because they do not write the same
+records. An app domain never gets an AWS certificate record; a platform domain
+never gets a wildcard. Read the one you are doing.
+
 Each entry says **who writes it**, because that is changing. See
 [`DESIGN.md`](DESIGN.md) for the shape being built; where the two disagree, this
 file describes what runs **today**.
@@ -12,8 +16,8 @@ file describes what runs **today**.
 
 ## The anchor
 
-The anchor is the hostname the customer is connecting. It is the only bound on
-what a delegated write can reach:
+The anchor is the hostname you are connecting. It is the only bound on what a
+delegated write can reach:
 
 | connecting | anchor | reachable | never reachable |
 |---|---|---|---|
@@ -26,66 +30,107 @@ The suffix is matched with a leading dot, so `evilexample.com` is not under
 
 🔴 **Today the anchor is chosen by MirrorStack's private half, and the record
 that is supposed to prove it is one we write ourselves.** That is the defect
-[`DESIGN.md`](DESIGN.md) exists to fix: the proof becomes the customer's to
-publish, and is re-checked on every pass.
+[`DESIGN.md`](DESIGN.md) exists to fix: the proof becomes yours to publish, and
+is re-checked on every pass.
 
 ---
 
-## 1 — ownership · `_mirrorstack-challenge.<anchor>` TXT
+## A custom platform domain
 
-One per connected domain, at the anchor itself. Everything downstream is gated on
-it: no custom hostname is created until a public lookup returns the token, and no
-certificate record can exist before a custom hostname does.
+Your MirrorStack console on a hostname you own. Connecting `example.com`
+registers up to four sibling hosts, and this is everything that lands:
 
-**Written by:** MirrorStack today. **The customer, in the target design** — which
-also makes it a stop control: delete it and every write from this service stops.
+| record | type | for | count |
+|---|---|---|---|
+| `_mirrorstack-challenge.example.com` | TXT | ownership | **one**, shared by all four hosts |
+| `account.example.com` | CNAME | routing | one per host |
+| `api.example.com` | CNAME | routing | ” |
+| `apps.example.com` | CNAME | routing | ” |
+| `cdn.example.com` | CNAME | routing | ” |
+| `_<token>.account.example.com` | CNAME | AWS certificate | one per host that owns one |
+| `_<token>.api.example.com` | CNAME | AWS certificate | ” |
+| `_<token>.apps.example.com` | CNAME | AWS certificate | ” |
+| `_acme-challenge.<host>` | TXT | certificate | one per host |
+| `_cf-custom-hostname.<host>` | TXT | serving | one per host, when asked for |
+
+Three things that table is saying quietly:
+
+- **`cdn` has no AWS certificate row, and that is not an omission.** A content
+  host is terminated before it ever reaches AWS, so it owns no certificate there
+  and is owed no validation record. The other three do.
+- **There is one ownership proof, not four.** It is anchored at the domain all
+  four hosts have in common, which is what lets a single record cover the set.
+- **The credential is held 24 hours**, because this record set is finite and
+  known up front. See [lifetimes](#lifetimes).
+
+---
+
+## A custom app domain
+
+One parent, and every app you deploy gets a hostname under it. Connecting
+`example.app` and deploying an app called `blog`:
+
+| record | type | for | count |
+|---|---|---|---|
+| `*.example.app` | CNAME | routing | **one, ever** |
+| `_mirrorstack-challenge.example.app` | TXT | ownership | one |
+| `_acme-challenge.blog.example.app` | TXT | certificate | **one per app** |
+| `_cf-custom-hostname.blog.example.app` | TXT | serving | one per app, when asked for |
+
+- **No AWS certificate records on this lane, at all.** An app custom domain is a
+  pure Cloudflare-for-SaaS hostname: it stays DNS-only and hands the request
+  straight to MirrorStack's own zone, never reaching AWS from your edge. So the
+  `_<token>.<host>` → `acm-validations.aws` row above simply has no counterpart
+  here.
+- **One wildcard is all the routing you ever publish — but it is not all the
+  DNS.** `*.example.app` matches exactly one label, so it covers
+  `blog.example.app` and never `_acme-challenge.blog.example.app`. Each app
+  still owes certificate records of its own. A wildcard *custom hostname*, which
+  would remove that, is Enterprise-only on the account this runs against. It is a
+  real requirement, not a shortcut.
+- **The credential is standing**, because the records it exists to write are for
+  apps that do not exist yet, and its expiry slides forward each time it
+  publishes. That is the trade to think hardest about on this repository.
+
+---
+
+## What each kind of record does
+
+Identical in both lanes, so described once.
+
+### ownership · `_mirrorstack-challenge.<anchor>` TXT
+
+Proves the domain is yours. Everything downstream is gated on it: no custom
+hostname is created until a public lookup returns the token, and no certificate
+record can exist before a custom hostname does.
+
+**Written by** MirrorStack today; **by you, in the target design** — which also
+makes it a stop control: delete it and every write from this service stops.
 
 **Retained.** Deleting it does nothing today; a later re-check fails.
 
----
-
-## 2 — routing · `<host>` or `*.<domain>` CNAME
+### routing · `<host>` or `*.<domain>` CNAME
 
 **The only record kind a browser ever follows.** Deleting one takes that hostname
-down; everything else here is read by machines.
-
-| lane | records |
-|---|---|
-| console | one per sibling host — `account.` `api.` `apps.` `cdn.` |
-| app domain | one wildcard, `*.<domain>` |
-| app host | the hostname itself |
-
-The target is shown before you authorize and is inside the digest you approve.
+down; everything else here is read by machines. The target is shown before you
+authorize and is inside the digest you approve.
 
 **In a zone you own these are DNS-only.** MirrorStack does not enable your
-provider's proxy in your zone. Records inside MirrorStack's own zones are
-proxied — a different zone, not yours — and that decision is made in the private
-half, so read this as a description of what we do rather than a bound this
-repository enforces today.
+provider's proxy in your zone. Records inside MirrorStack's own zones are proxied
+— a different zone, not yours — and that decision is made in the private half, so
+read this as a description of what we do rather than a bound this repository
+enforces today.
 
-### The wildcard is not all the DNS
-
-`*.example.app` matches exactly one label. It routes `blog.example.app` and does
-**not** cover `_acme-challenge.blog.example.app`, so each app still owes a
-certificate record of its own. A wildcard *custom hostname*, which would remove
-that requirement, is Enterprise-only on the account this runs against. It is a
-real requirement, not an implementation shortcut — and it is why the app-domain
-grant is standing rather than 24 hours.
-
----
-
-## 3 — certificate · read by a certificate authority
-
-Two shapes, both under a reserved underscore name no browser resolves.
+### certificate · read by a certificate authority
 
 ```
-_<token>.<host>          CNAME   <token>.acm-validations.aws   ← AWS
-_acme-challenge.<host>   TXT     <the DV token>                ← Cloudflare, usual form
+_<token>.<host>          CNAME   <token>.acm-validations.aws   ← AWS, platform lane only
+_acme-challenge.<host>   TXT     <the DV token>                ← Cloudflare, both lanes
 _acme-challenge.<host>   CNAME   <uuid>.dcv.cloudflare.com     ← delegated form, OFF in production
 ```
 
-**Written by:** this service, relaying bytes verbatim from AWS and Cloudflare.
-It derives *that* a proof must exist; neither half chooses the token.
+**Written by** this service, relaying bytes verbatim from AWS and Cloudflare. It
+derives *that* a proof must exist; neither half chooses the token.
 
 Only ever one form at `_acme-challenge`. A CNAME and a TXT cannot coexist at one
 name, and publishing the wrong one does not merely fail to help — it blocks the
@@ -96,29 +141,26 @@ later. Cloudflare accepts `proxied: true` on them with no error and then answers
 with addresses instead of the token, so issuance — or a much later renewal —
 fails with every dashboard still green.
 
----
-
-## 4 — serving · `_cf-custom-hostname.<host>` TXT
+### serving · `_cf-custom-hostname.<host>` TXT
 
 🔴 **A second, separate proof, and not a certificate record.**
 
-Cloudflare returns `ownership_verification` when it cannot confirm from the
-routing record alone that the zone may serve the name, and **withholds routing
-until the TXT exists**. Missing it produces a **526 while the certificate status
-reads active** — the hardest shape of this failure to diagnose, because DNS, the
-certificate and the console all read healthy.
+Cloudflare returns it when it cannot confirm from the routing record alone that
+the zone may serve the name, and **withholds routing until the TXT exists**.
+Missing it produces a **526 while the certificate status reads active** — the
+hardest shape of this failure to diagnose, because DNS, the certificate and the
+console all read healthy.
 
 | | reads it | missing → |
 |---|---|---|
 | `_acme-challenge` | a certificate authority | renewal fails months later, silently |
 | `_cf-custom-hostname` | the edge, before it will route | **526 now**, certificate healthy |
 
-Its wait is also different: Cloudflare mints this when the custom hostname is
-**created** (after the shared proof resolves); it mints the DV challenge after
-that host's own routing record resolves. Describing them with one word names the
-wrong blocker.
+Its wait differs too: Cloudflare mints this when the custom hostname is
+**created**, and mints the DV challenge after that host's routing record
+resolves. Describing them with one word names the wrong blocker.
 
-**Written by:** this service, verbatim from Cloudflare. **Retained.**
+**Written by** this service, verbatim from Cloudflare. **Retained.**
 
 ---
 
@@ -158,22 +200,22 @@ fails to authenticate, which releases the grant rather than widening it.
 
 Cloudflare rotates the refresh token on every use, so each publish replaces the
 stored envelope. A publish that fails *after* that rotation still returns the new
-sealed token, so it can be persisted — reporting only the failure would leave the
+sealed token so it can be persisted — reporting only the failure would leave the
 private half holding a token the provider had already replaced.
 
-🔴 **One caveat on the table above, stated because it is currently true.** The
-key and the OAuth client are read from two secrets that the private half's
-account role *also* still holds read access to, left from the pre-cutover
-in-process path. No code uses it — the delegated path runs entirely here — but the
-grant exists, so "ciphertext it holds no key for" is a property of the code and
-not yet of the permissions. Removing those grants is the outstanding half of the
-cutover.
+🔴 **One caveat on that table, stated because it is currently true.** The key and
+the OAuth client are read from two secrets that the private half's account role
+*also* still holds read access to, left from the pre-cutover in-process path. No
+code uses it — the delegated path runs entirely here — but the grant exists, so
+"ciphertext it holds no key for" is a property of the code and not yet of the
+permissions. Removing those grants is the outstanding half of the cutover.
 
 ### Lifetimes
 
-| lane | lifetime |
-|---|---|
-| console domain | held **24 hours**, then revoked; not shortened when the last record lands |
-| app domain | **standing**, extended each time it publishes |
+| | platform domain | app domain |
+|---|---|---|
+| held for | **24 hours** | **standing** |
+| ends when | the window closes — **not** when the last record lands | you revoke, or stop deploying for long enough |
+| why | the record set is finite and known up front | the records it exists to write are for apps that do not exist yet |
 
 Both are revocable at your provider at any time, independently of MirrorStack.
