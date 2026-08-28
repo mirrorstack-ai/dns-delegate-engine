@@ -118,8 +118,9 @@ nothing beside it in that zone is reachable.
   Cloudflare-for-SaaS hostname that never reaches AWS from your edge.
 - **The identity is the app and its owner**, which may be a person rather than an
   org. That is why this lane cannot be folded into lane 2.
-- **The grant is standing**, because the certificate renews months later against
-  a freshly minted challenge.
+- **The credential is held 24 hours, exactly as lane 1**, because this record set
+  is closed too. It is also the fastest of the three to finish, having no AWS leg
+  to wait on.
 
 > **Not migrated yet.** Today this lane runs on an older path in MirrorStack's
 > private half, where you paste a Cloudflare API token — no anchor, no ownership
@@ -248,10 +249,19 @@ permissions. Removing those grants is the outstanding half of the cutover.
 
 | | 1 · org platform | 2 · org app domain | 3 · each app domain |
 |---|---|---|---|
-| held for | **24 hours** | **standing** | **standing** |
-| ends when | the window closes — **not** when the last record lands | you revoke, or stop deploying for long enough | you revoke, or remove the domain |
-| why | the record set is finite and known up front | the records it exists to write are for apps that do not exist yet | the certificate renews months later |
+| held for | **24 hours** | **standing** | **24 hours** |
+| ends when | the window closes — **not** when the last record lands | you revoke, or stop deploying for long enough | the window closes |
+| why | the record set is closed and knowable up front | the records it exists to write are for apps that **do not exist yet** | the record set is closed, and smaller than lane 1 |
 
 All three are revocable at your provider at any time, independently of
 MirrorStack, and all three stop within one tick if you delete the ownership
 proof.
+
+🔴 **Renewal is not covered by a 24-hour window.** Cloudflare re-mints the DV
+token under the same name when a certificate renews, months later — the reported
+set stays authoritative per name, so a fresh value replaces the old one rather
+than sitting beside it. By then lanes 1 and 3 hold no credential, so that write
+needs a fresh authorization or a manual record. The permanent fix is the
+delegated form of `_acme-challenge` — a CNAME pointing at Cloudflare, which
+answers every future renewal without anyone writing anything. It is built and
+switched off; see record form 3 above.

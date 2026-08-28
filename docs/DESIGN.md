@@ -58,7 +58,7 @@ does not have, which is worse than today.
 | identity | the org | the org | **the app and its owner — which may be a person** |
 | anchor | `example.com` | `example.net` | `example.org` |
 | hosts | `account.` `api.` `apps.` `cdn.` | auto-routed, one per app | itself |
-| grant | 24 hours | standing | standing, for renewals |
+| grant | 24 hours | standing | 24 hours |
 
 All three are authorized the same way — a provider grant scoped to one zone, held
 by this service — and all three are bounded by a proof you published at the
@@ -294,9 +294,10 @@ The self-arrows are the point. Step by step this is a script; the loop is what
 makes it converge, and the re-check inside it is what makes your stop control
 real rather than advisory.
 
-Lanes 2 and 3 have the same skeleton with a loop that does not end — for lane 2,
-each newly auto-routed app owes certificate records; for lane 3, renewals. That
-is the honest picture of a standing grant.
+Lane 3 has the same skeleton and the shortest run of the three: one host, no AWS
+leg, one closed record set. Only lane 2's loop does not end, because each newly
+auto-routed app owes certificate records — which is the one honest reason for a
+standing grant.
 
 Ordering that is genuinely forced, rather than incidental:
 
@@ -324,7 +325,14 @@ agreeing to:
    that grants more authority. So the honest description is not "we write once
    when you authorize" but "we hold write access and continuously enforce a
    desired state in your zone, until you stop us."
-3. **The scheduler.** The loop body moves here; the clock that fires it does not,
+3. **Renewal outlives the window.** Cloudflare re-mints the DV token under the
+   same name months later, and a 24-hour grant is long gone — so lanes 1 and 3
+   need a fresh authorization at renewal, or the record added by hand. The
+   delegated form of `_acme-challenge` removes rotation entirely and is built but
+   switched off. Turning it on is the fix; until then this is a step that comes
+   back to the customer, and it should be said on the first page rather than
+   discovered.
+4. **The scheduler.** The loop body moves here; the clock that fires it does not,
    at least at first. "The polling service is in this repository" will be true of
    every decision the loop makes and false of when it runs, and the documentation
    has to say which.

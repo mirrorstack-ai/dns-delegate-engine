@@ -113,7 +113,7 @@ service at all. Read the one you are doing.
 | who owns it | the org | the org | the app — **including a personal app, with no org** |
 | routing records | one per sibling host, ×4 | **one wildcard**, `*.example.net` | one, for that hostname |
 | AWS certificate records | `account` `api` `apps` — not `cdn` | **none** | **none** |
-| the credential | held **24 hours** | **standing** | **standing**, for renewals |
+| the credential | held **24 hours** | **standing** | held **24 hours** |
 
 The diagrams below are today's flow, defect included.
 
@@ -289,10 +289,13 @@ sequenceDiagram
 Two differences from the org lanes:
 
 - **No AWS certificate record**, for the same reason as lane 2 — it is a
-  Cloudflare-for-SaaS hostname that never reaches AWS from your edge.
-- **The grant is standing rather than 24 hours**, because a certificate renews
-  months later against a freshly minted challenge. Same trade as lane 2, and the
-  same two stop controls: delete the proof TXT, or revoke at your provider.
+  Cloudflare-for-SaaS hostname that never reaches AWS from your edge. That also
+  makes this the **fastest** of the three: lane 1 waits on AWS *and* Cloudflare,
+  this lane waits on Cloudflare alone.
+- **The credential is held 24 hours, exactly as lane 1.** The record set here is
+  closed — one host, four records, all knowable — so a longer window buys
+  nothing. Only lane 2 is standing, and only because apps that do not exist yet
+  will need records.
 
 > **Not migrated yet.** Today this lane still runs on an older path in
 > MirrorStack's private half, where you paste a Cloudflare API token instead —
@@ -357,16 +360,24 @@ happened. It never retries the write. A retry is how one record becomes two.
 Set out per lane above, and summarised here because it is the question people
 come back for.
 
-| | platform domain | app domain |
-|---|---|---|
-| held for | **24 hours** | **standing** |
-| ends when | the window closes — **not** when the last record lands | you revoke, or you stop deploying for long enough |
-| why | the record set is finite and known up front | the records it exists to write are for apps that do not exist yet |
+| | 1 · org platform | 2 · org app domain | 3 · each app domain |
+|---|---|---|---|
+| held for | **24 hours** | **standing** | **24 hours** |
+| ends when | the window closes — **not** when the last record lands | you revoke, or stop deploying for long enough | the window closes |
+| why | the record set is closed and knowable up front | the records it exists to write are for apps that **do not exist yet** | the record set is closed, and smaller than lane 1 |
 
 The 24-hour window is not cut short when publication finishes. A platform-domain
 grant that wrote everything on its first pass still holds the credential until
 the window closes; revoking at your provider ends it immediately, and by then
 there is nothing left to write.
+
+**What a 24-hour window does not cover is renewal.** Cloudflare re-mints the DV
+token under the same name when a certificate renews, months later, and by then
+neither lane 1 nor lane 3 holds a credential — so that write needs a fresh
+authorization, or the record added by hand. The permanent fix is the delegated
+form of that record, a CNAME pointing at Cloudflare that answers every future
+renewal without anyone writing anything; it is built and currently switched off.
+Until it is on, treat certificate renewal as a step that comes back to you.
 
 Revocation at your provider always works, whether or not we are involved, and
 takes effect immediately. It is the one control here that does not depend on
