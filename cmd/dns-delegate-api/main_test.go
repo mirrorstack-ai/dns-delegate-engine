@@ -21,6 +21,7 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/grant"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/intent"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/observe"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/sealed"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfoauth"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
@@ -711,4 +712,77 @@ func newSealer(t *testing.T) *grantcrypto.Sealer {
 		key[i] = byte(i*7 + 1)
 	}
 	return testsupport.SealerWithKey(t, "k1", key)
+}
+
+// 🔴 A deployment that cannot reach enough vantage points to meet its own
+// threshold verifies nothing: every proof reads `unknown` and every
+// authorization is refused. It is out of service whether or not it admits it,
+// and mirrorstack-infra's probe is what acts on the admission.
+func TestHealthFailsWhenTooFewVantagePointsAreReachable(t *testing.T) {
+	// Two vantage points, both of which must agree: the rule a customer would
+	// have read from Capabilities before authorizing.
+	svc := func(reach intent.ReachProbe) *dispatcher {
+		return &dispatcher{intents: &intent.Service{
+			OAuth: testsupport.StubOAuth{Cfg: &cfoauth.Config{Config: oauth2.Config{ClientID: "cid"}}},
+			Keys:  testsupport.StubKeys{Held: newSealer(t)},
+			Resolver: observe.Quorum{
+				Resolvers: []observe.Resolver{unusedResolver{}, unusedResolver{}},
+				Threshold: 2,
+			},
+			Reach: reach,
+		}}
+	}
+
+	got := svc(stubReach{threshold: 2, reachable: 1}).health(context.Background())
+	if got.OK {
+		t.Fatalf("1 reachable vantage point under a threshold of 2 must fail health: %#v", got)
+	}
+	if got.Resolution == nil || got.Resolution.Threshold != 2 || !got.Resolution.Reachability.Degraded {
+		t.Fatalf("health must carry the reading it refused on: %#v", got.Resolution)
+	}
+	// 🔴 And the rule is republished whole. A degraded deployment reports a
+	// threshold it cannot meet; it never reports one it can.
+	if got.Resolution.Vantages != 2 {
+		t.Fatalf("resolution %#v; the declared rule must survive the failure unchanged", got.Resolution)
+	}
+
+	if got := svc(stubReach{threshold: 2, reachable: 2}).health(context.Background()); !got.OK {
+		t.Fatalf("a deployment that can meet its own threshold is healthy: %#v", got)
+	}
+
+	// Unmeasured is not unreachable. Failing health over a probe nobody wired
+	// would take out every deployment running as this service did before it.
+	if got := svc(nil).health(context.Background()); !got.OK {
+		t.Fatalf("an unmeasured deployment must stay in rotation: %#v", got)
+	}
+}
+
+// stubReach is a measurement a test dictates; the vantage points are only as
+// real as the count.
+type stubReach struct {
+	threshold int
+	reachable int
+}
+
+func (s stubReach) Reach(context.Context) observe.Reach {
+	out := observe.Reach{Threshold: s.threshold, CheckedAt: time.Unix(1_700_000_000, 0)}
+	for i := range s.threshold {
+		out.Vantages = append(out.Vantages, observe.Reachability{
+			Vantage:   fmt.Sprintf("192.0.2.%d:53", i+1),
+			Reachable: i < s.reachable,
+		})
+	}
+	return out
+}
+
+// unusedResolver exists so Capabilities has a resolver to report a policy from.
+// No test in this package resolves a name.
+type unusedResolver struct{}
+
+func (unusedResolver) LookupCNAME(context.Context, string) (string, error) {
+	panic("no test here resolves a name")
+}
+
+func (unusedResolver) LookupTXT(context.Context, string) ([]string, error) {
+	panic("no test here resolves a name")
 }

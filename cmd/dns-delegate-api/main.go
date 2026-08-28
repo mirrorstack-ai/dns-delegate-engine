@@ -340,6 +340,12 @@ type healthResponse struct {
 	// (client and keyset), "no-keyset" (client only — grants can be published but
 	// not held), or "unconfigured".
 	Delegation string `json:"delegation"`
+
+	// Resolution is the vantage-point rule and this deployment's own measurement
+	// of whether it can reach those vantage points, republished from
+	// IntentCapabilities so the thing that takes a Lambda out of rotation reads
+	// it too. Absent when no intent surface is wired.
+	Resolution *intent.ResolutionCapability `json:"resolution,omitempty"`
 }
 
 // health is the arming check for a deploy. It resolves the credentials the same
@@ -358,24 +364,45 @@ type healthResponse struct {
 // is missing; failing health over it would take a deployment out of rotation for
 // a capability the live caller does not yet use — the same reason "no-keyset" is
 // healthy rather than failing.
+//
+// 🔴 UNREACHABLE RESOLVERS ARE THE OTHER WAY: THEY FAIL HEALTH. A deployment
+// that cannot reach enough vantage points to meet its own threshold verifies
+// nothing — every proof reads `unknown` and every authorization is refused — so
+// it is already out of service, and the only choice here is whether it says so
+// or serves refusals that look like customer mistakes. The threshold is never
+// lowered to fit what is reachable; see observe.Probe.
 func (d *dispatcher) health(ctx context.Context) healthResponse {
 	var available, canHold bool
+	var resolution *intent.ResolutionCapability
 	switch {
 	case d.intents != nil:
 		caps := d.intents.Capabilities(ctx)
 		available, canHold = caps.Available, caps.CanHold
+		resolution = &caps.Resolution
 	case d.grants != nil:
 		caps := d.grants.Capabilities(ctx)
 		available, canHold = caps.Available, caps.CanHold
 	}
+	out := healthResponse{Commit: commit, Resolution: resolution}
 	switch {
 	case !available:
-		return healthResponse{Commit: commit, Delegation: "unconfigured"}
+		out.Delegation = "unconfigured"
+		return out
 	case !canHold:
-		return healthResponse{OK: true, Commit: commit, Delegation: "no-keyset"}
+		out.Delegation = "no-keyset"
 	default:
-		return healthResponse{OK: true, Commit: commit, Delegation: "ready"}
+		out.Delegation = "ready"
 	}
+	out.OK = !resolversDegraded(resolution)
+	return out
+}
+
+// resolversDegraded reads the probe's verdict. Unmeasured is not degraded: a
+// deployment with no probe wired is where this service was before the probe
+// existed, and failing health over an absent measurement would take it out of
+// rotation for something nobody measured.
+func resolversDegraded(r *intent.ResolutionCapability) bool {
+	return r != nil && r.Reachability != nil && r.Reachability.Degraded
 }
 
 func main() {
@@ -390,19 +417,46 @@ func main() {
 	// selector here; every safety rule stays in reconcile.
 	publisher := reconcile.Publisher{Provider: cloudflare.Client{}}
 
+	// How public DNS is read, and how much a positive reading is worth. The
+	// default is the container's single recursive resolver — this service's
+	// behaviour before the quorum existed — and DNS_DELEGATE_RESOLVERS /
+	// DNS_DELEGATE_AUTHORITATIVE widen it; observe.ResolverFromEnv documents why
+	// hardening is opt-in. The policy is logged and republished through
+	// IntentCapabilities, so a deployment cannot claim more vantage points than
+	// it wired.
+	resolver := observe.ResolverFromEnv()
+	policy := observe.PolicyOf(resolver)
+	slog.Info("dns-delegate-api: public DNS vantage points",
+		"vantages", policy.Vantages, "threshold", policy.Threshold,
+		"authoritative", policy.Authoritative, "dnssec", false)
+
+	// 🔴 THE POLICY ABOVE IS A DECLARATION UNTIL SOMETHING MEASURES IT. Whether
+	// this Lambda can egress port 53 to addresses a customer's zone chose is not
+	// knowable from configuration, and an unreachable vantage point answers
+	// `unknown`, which refuses every Authorize. So the running service probes its
+	// own vantage points and publishes the result through Capabilities and
+	// health, instead of an operator having to remember to check.
+	//
+	// The org routing target is the probe name because it is a name this
+	// deployment already publishes and every lane's records point at: it must
+	// resolve wherever this runs, and it costs an operator nothing to configure.
+	derived := derive.ConfigFromEnv()
+	reach := &observe.Probe{Resolver: resolver, Name: derived.OrgRoutingTarget}
+
 	d := &dispatcher{
 		grants: &grant.Service{OAuth: oauth, Keys: keys, Publisher: publisher},
 		intents: &intent.Service{
 			OAuth:     oauth,
 			Keys:      keys,
 			Publisher: publisher,
-			Derive:    derive.ConfigFromEnv(),
+			Derive:    derived,
 
 			// Wired explicitly, never defaulted inside the package: a
 			// package-level default would mean a test that forgot a fake
 			// silently resolved real names. A binary is the one place that may
 			// say yes.
-			Resolver: observe.NetResolver{},
+			Resolver: resolver,
+			Reach:    reach,
 
 			Certificates: certificateAuthority(context.Background()),
 

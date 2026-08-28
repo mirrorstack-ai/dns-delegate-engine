@@ -38,6 +38,7 @@ package intent
 
 import (
 	"errors"
+	"time"
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/derive"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/observe"
@@ -258,6 +259,21 @@ type RecordView struct {
 	// Orphans). An empty State means nothing was looked up, never "absent".
 	State string   `json:"state,omitempty"`
 	Found []string `json:"found,omitempty"`
+
+	// Agreement says how many independent vantage points State rests on. Absent
+	// means no lookup was issued for this row.
+	Agreement *AgreementView `json:"agreement,omitempty"`
+}
+
+// AgreementView is one reading's vantage-point count, so "the proof is
+// published" can be read for what it is worth rather than taken on trust.
+type AgreementView struct {
+	// Asked is how many vantage points were queried, Agreed how many served this
+	// reading, and Threshold how many had to. `1 / 1 / 1` is a single recursive
+	// resolver, believed on its own.
+	Asked     int `json:"asked"`
+	Agreed    int `json:"agreed"`
+	Threshold int `json:"threshold"`
 }
 
 func recordView(item derive.Item) RecordView {
@@ -289,10 +305,24 @@ func observedView(item derive.Item, obs observe.Observation) RecordView {
 	view := recordView(item)
 	view.State = string(obs.State)
 	view.Found = obs.Found
+	view.Agreement = agreementView(obs)
 	if obs.Explain != "" {
 		view.Explain = obs.Explain
 	}
 	return view
+}
+
+// agreementView projects a reading's vantage-point count. Nil when no lookup was
+// issued, which is not the same as a lookup nobody agreed on.
+func agreementView(obs observe.Observation) *AgreementView {
+	if obs.Agreement.Asked == 0 {
+		return nil
+	}
+	return &AgreementView{
+		Asked:     obs.Agreement.Asked,
+		Agreed:    obs.Agreement.Agreed,
+		Threshold: obs.Agreement.Threshold,
+	}
 }
 
 // RegisteredResponse is what all three registration intents return. None of them
@@ -561,6 +591,92 @@ type CapabilitiesResponse struct {
 	IntervalSeconds    int64 `json:"intervalSeconds"`
 	JitterSeconds      int64 `json:"jitterSeconds"`
 	MinIntervalSeconds int64 `json:"minIntervalSeconds"`
+
+	// Resolution is how this deployment reads the ownership proof, published
+	// BEFORE anything is authorized because it is what a positive verification is
+	// worth (docs/THREAT-MODEL.md, "We assume public DNS tells us the truth").
+	Resolution ResolutionCapability `json:"resolution"`
+}
+
+// ResolutionCapability is the deployment's vantage-point rule, from
+// observe.PolicyOf on the resolver the binary actually wired, beside a
+// measurement of whether those vantage points can be reached from where it runs.
+type ResolutionCapability struct {
+	// Vantages is how many independent resolvers are asked and Threshold how many
+	// must agree before a proof counts as published. `1` and `1` is a single
+	// recursive resolver.
+	Vantages  int `json:"vantages"`
+	Threshold int `json:"threshold"`
+
+	// Authoritative reports that one vantage point asks the zone's own
+	// nameservers rather than a recursive resolver.
+	Authoritative bool `json:"authoritative"`
+
+	// DNSSEC is always false. Nothing in this repository validates a signature,
+	// and the field exists so that is answerable from the API rather than only
+	// from a source file.
+	DNSSEC bool `json:"dnssec"`
+
+	// Reachability is what the vantage points above actually answered. Absent
+	// means unmeasured — no probe is wired — which is not the same as
+	// unreachable.
+	Reachability *ReachabilityView `json:"reachability,omitempty"`
+}
+
+// ReachabilityView answers the question a configuration file cannot: can this
+// deployment reach the resolvers it was configured with? It comes from
+// observe.Probe, which resolves a name that must always resolve at each vantage
+// point on a TTL.
+type ReachabilityView struct {
+	// Reachable is how many vantage points answered, out of Vantages above, and
+	// CheckedAt when they were last asked.
+	Reachable int    `json:"reachable"`
+	CheckedAt string `json:"checkedAt"`
+
+	// Degraded means the reachable vantage points can no longer meet Threshold.
+	//
+	// 🔴 THAT IS A BROKEN DEPLOYMENT, NEVER A SMALLER QUORUM. Threshold above
+	// still stands, so every proof reads `unknown` and every authorization is
+	// refused until the egress is fixed — the health check fails for the same
+	// reason.
+	Degraded bool `json:"degraded"`
+
+	// Points names each vantage point and whether it answered: what an operator
+	// acts on.
+	Points []VantageView `json:"points"`
+}
+
+// VantageView is one vantage point's reachability.
+type VantageView struct {
+	// Vantage is how it is addressed — a nameserver address, or the container's
+	// own resolver.
+	Vantage   string `json:"vantage"`
+	Reachable bool   `json:"reachable"`
+
+	// Explain is why it did not answer.
+	Explain string `json:"explain,omitempty"`
+}
+
+// reachabilityView projects a probe reading. Nil when no sweep has run, which is
+// not the same as a sweep in which nothing answered.
+func reachabilityView(r observe.Reach) *ReachabilityView {
+	if r.CheckedAt.IsZero() {
+		return nil
+	}
+	out := &ReachabilityView{
+		Reachable: r.Reachable(),
+		CheckedAt: r.CheckedAt.UTC().Format(time.RFC3339),
+		Degraded:  r.Degraded(),
+		Points:    make([]VantageView, 0, len(r.Vantages)),
+	}
+	for _, v := range r.Vantages {
+		out.Points = append(out.Points, VantageView{
+			Vantage:   v.Vantage,
+			Reachable: v.Reachable,
+			Explain:   v.Explain,
+		})
+	}
+	return out
 }
 
 // LaneCapability is one lane, described in the terms a customer decides on.

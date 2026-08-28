@@ -392,6 +392,12 @@ binary was built from. The publish workflow stamps it at the one build that
 produces a deployed artifact; any other build reports `unknown`, so a missing
 stamp is visible rather than silent.
 
+Both also carry `resolution`: how many independent vantage points read your
+ownership proof, how many must agree, and whether this deployment can actually
+reach them. A deployment that cannot meet its own threshold fails `health()`
+rather than lowering it — see
+[`docs/THREAT-MODEL.md`](THREAT-MODEL.md#we-assume-public-dns-tells-us-the-truth).
+
 The commit is what turns "I read this repository" into "this is the revision
 holding my credential", and that step is worth one honest caveat: `Health` sits
 behind the same IAM-gated transport as everything else, so today it is auditable

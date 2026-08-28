@@ -41,6 +41,17 @@ type keyLoader interface {
 	Sealer(ctx context.Context) *grantcrypto.Sealer
 }
 
+// ReachProbe measures whether the wired Resolver's vantage points can be
+// reached. An interface, like Resolver, so no test in this package needs a
+// network to check what the answer is published as.
+//
+// 🔴 CAPABILITIES IS ITS ONLY CALLER. A reachability reading never reaches a
+// lookup, a verification or a write — it cannot narrow a quorum it is not read
+// by. See observe.Probe.
+type ReachProbe interface {
+	Reach(ctx context.Context) observe.Reach
+}
+
 // zoneReader is the READ-ONLY view of a DNS provider that Orphans is given.
 //
 // 🔴 "A REPORT, NEVER A MUTATION" IS A PROPERTY OF THIS TYPE, NOT A PROMISE IN A
@@ -76,6 +87,13 @@ type Service struct {
 	// fake silently resolve real names. A binary wires the real one explicitly.
 	Resolver observe.Resolver
 
+	// Reach measures whether Resolver's vantage points can be reached from where
+	// this runs, so a deployment wired for a quorum it has no egress to SAYS SO
+	// instead of refusing every authorization with `unknown`. Nil leaves the
+	// reading unmeasured, which Capabilities reports as absent rather than as
+	// nothing being reachable.
+	Reach ReachProbe
+
 	// Certificates and Edge are the two OPTIONAL upstream relays: AWS ACM for
 	// record 5 and Cloudflare for SaaS for record 7. Both are read with
 	// MIRRORSTACK's own credentials and never with the customer's grant — the
@@ -105,6 +123,15 @@ func (s *Service) oauthConfig(ctx context.Context) *cfoauth.Config {
 		return nil
 	}
 	return s.OAuth.Config(ctx)
+}
+
+// reach is the deployment's own egress measurement; the zero Reach is
+// "unmeasured".
+func (s *Service) reach(ctx context.Context) observe.Reach {
+	if s.Reach == nil {
+		return observe.Reach{}
+	}
+	return s.Reach.Reach(ctx)
 }
 
 func (s *Service) sealer(ctx context.Context) *grantcrypto.Sealer {
@@ -148,6 +175,20 @@ func (s *Service) Capabilities(ctx context.Context) CapabilitiesResponse {
 	out.IntervalSeconds = int64(cadence.Interval / time.Second)
 	out.JitterSeconds = int64(cadence.Jitter / time.Second)
 	out.MinIntervalSeconds = int64(cadence.MinInterval / time.Second)
+
+	// Read off the wired resolver, never a constant: a claim about vantage points
+	// that the binary's wiring cannot contradict. The probe beside it turns the
+	// rule from a declaration into a measurement — the threshold published here
+	// is worthless if this deployment cannot reach the resolvers it names.
+	if s.Resolver != nil {
+		policy := observe.PolicyOf(s.Resolver)
+		out.Resolution = ResolutionCapability{
+			Vantages:      policy.Vantages,
+			Threshold:     policy.Threshold,
+			Authoritative: policy.Authoritative,
+			Reachability:  reachabilityView(s.reach(ctx)),
+		}
+	}
 
 	if err := s.Derive.Validate(); err != nil {
 		// Reported rather than swallowed: an unconfigured deployment and a
@@ -383,6 +424,11 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (VerifyResponse
 			State:   string(check.observation.State),
 			Found:   check.observation.Found,
 			Explain: check.observation.Explain,
+
+			// What the reading is worth. Verify is the one call whose whole answer
+			// is a boolean, so the number of vantage points behind it has to travel
+			// with it.
+			Agreement: agreementView(check.observation),
 		},
 	}
 	// 🔴 A LOOKUP THAT DID NOT COMPLETE IS NOT A NEGATIVE — AND IT IS NOT AN RPC

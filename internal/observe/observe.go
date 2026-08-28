@@ -18,6 +18,20 @@
 // Nothing here writes: no provider client, no credential, no path that reaches
 // one. Observation and mutation live in different packages so reading the
 // imports tells you which you have.
+//
+// # How much a positive reading is worth
+//
+// A Resolver may be one recursive resolver (NetResolver), the zone's own
+// nameservers (Authoritative), or several of either behind a Quorum that reports
+// only what a threshold of them agree on. Every reading carries an Agreement
+// saying which it was, because "the proof is published" means something
+// different at one vantage point than at three.
+//
+// 🔴 NONE OF IT VALIDATES DNSSEC. Go's net.Resolver does not, nothing here adds
+// it, and no signature is checked anywhere in this repository. Quorum closes a
+// single lying recursive resolver and an off-path cache poisoner; it does not
+// close an attacker holding the customer's registrar or authoritative
+// nameservers. docs/THREAT-MODEL.md states the residue.
 package observe
 
 import (
@@ -120,6 +134,12 @@ type NetResolver struct {
 	// Timeout bounds ONE lookup, not the whole report; zero means
 	// defaultTimeout. The caller's ctx bounds everything above it.
 	Timeout time.Duration
+
+	// Server, when set, is the ONE nameserver this resolver asks (host:port),
+	// through net.Resolver's Dial hook. Empty is the container's
+	// /etc/resolv.conf. Authoritative sets it to a server the customer's own zone
+	// named, which is what takes the recursive cache out of an answer.
+	Server string
 }
 
 // LookupCNAME implements Resolver.
@@ -143,8 +163,23 @@ func (n NetResolver) timeout() time.Duration {
 	return n.Timeout
 }
 
+// dialTimeout bounds ONE connection to a nameserver named by a zone we do not
+// control.
+const dialTimeout = 3 * time.Second
+
 func (n NetResolver) resolver() *net.Resolver {
-	return &net.Resolver{PreferGo: true}
+	r := &net.Resolver{PreferGo: true}
+	if n.Server == "" {
+		return r
+	}
+	// The address is fixed here and the one net/dns would have chosen is
+	// discarded, so a Server field can only ever narrow where a query goes.
+	server := n.Server
+	r.Dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		d := net.Dialer{Timeout: dialTimeout}
+		return d.DialContext(ctx, network, server)
+	}
+	return r
 }
 
 // rooted appends the root dot.
@@ -210,6 +245,11 @@ type Observation struct {
 	// side by side. Populated on every state with something to show, INCLUDING
 	// present: a report saying "yes" without saying what it saw is uncheckable.
 	Found []string
+
+	// Agreement is how many vantage points this State rests on. The zero value
+	// means no lookup was issued, which is not the same as a lookup nobody
+	// agreed on — see Agreement.
+	Agreement Agreement
 
 	// Purpose and Source are carried through from the derived item unchanged.
 	// This package classifies what is published and has no opinion about why a
@@ -336,6 +376,7 @@ func Plan(ctx context.Context, r Resolver, p derive.Plan) ([]Observation, error)
 		for _, i := range groups[key] {
 			state, found, diagnosis := classify(key, observations[i].Want, answer)
 			observations[i].State = state
+			observations[i].Agreement = answer.agree
 			// Copied, not shared: two items in one group get the same answer, and
 			// a caller sorting or trimming one report's Found would otherwise
 			// reorder an observation it never touched. A nil stays nil, keeping
@@ -393,7 +434,8 @@ func Proof(ctx context.Context, r Resolver, name string, accepted []string) (ok 
 	// displaying all would put every retired key's value into a customer-facing
 	// report. The value to SHOW is proof.Prover.Expected, which the caller
 	// holds.
-	values, lookupErr := r.LookupTXT(ctx, obs.Name)
+	values, agree, lookupErr := attestedTXT(ctx, r, obs.Name)
+	obs.Agreement = agree
 	if lookupErr != nil {
 		if isNotFound(lookupErr) {
 			obs.State = StateAbsent
@@ -430,6 +472,7 @@ type lookupKey struct {
 // can turn a failure into an empty result.
 type answer struct {
 	values []string
+	agree  Agreement
 	err    error
 }
 
@@ -464,20 +507,20 @@ func resolveAll(ctx context.Context, r Resolver, keys []lookupKey) map[lookupKey
 				return
 			}
 			if key.recordType == "CNAME" {
-				value, err := r.LookupCNAME(ctx, key.name)
+				value, agree, err := attestedCNAME(ctx, r, key.name)
 				if err != nil {
-					results[i] = answer{err: err}
+					results[i] = answer{agree: agree, err: err}
 					return
 				}
-				results[i] = answer{values: []string{dnsplan.NormalizeName(value)}}
+				results[i] = answer{values: []string{dnsplan.NormalizeName(value)}, agree: agree}
 				return
 			}
-			values, err := r.LookupTXT(ctx, key.name)
+			values, agree, err := attestedTXT(ctx, r, key.name)
 			if err != nil {
-				results[i] = answer{err: err}
+				results[i] = answer{agree: agree, err: err}
 				return
 			}
-			results[i] = answer{values: normalizeTXTValues(values)}
+			results[i] = answer{values: normalizeTXTValues(values), agree: agree}
 		}(i, key)
 	}
 	wg.Wait()
