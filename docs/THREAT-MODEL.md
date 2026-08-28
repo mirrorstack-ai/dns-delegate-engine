@@ -49,6 +49,63 @@ is yours.
 
 ---
 
+## Where authorization lives, and why not here
+
+The first thing most readers look for in this repository is a permission check,
+and there is not one. That is deliberate, and the reasoning is the same reasoning
+as everything above.
+
+**Who inside your organization may connect a domain is decided in MirrorStack's
+private half** — an RBAC permission (`domains.write`), a membership probe, and a
+role check, all of which this repository cannot see. **This service has no role,
+permission or actor concept at all.** Grep for one; there is nothing to find.
+
+It could not have one honestly. This service owns no database, so it cannot read
+who is a member of what. The only way it could perform an authorization check is
+to accept a claim *from its caller* about that caller's own rights — and the
+caller is precisely the party this document says you should not have to trust. A
+check evaluated on the attacker's assertion about itself is not a control.
+
+It would also be worse than nothing. A reader seeing an authorization check in a
+public repository would reasonably conclude authorization is bounded here, and
+they would be wrong. A guard that reads like protection and enforces none is a
+recurring failure this codebase refuses in several other places by name; adding
+one at the front door would be the largest instance of it.
+
+**So the substitute is different in kind: the bound is not WHO ASKED, it is WHAT
+WAS PROVEN.** Anchor containment and the ownership proof bind the outcome no
+matter who the caller claims to be. Identity is still bound cryptographically —
+the sealed registration and the grant AAD both carry `lane‖identity‖anchor`, so a
+grant issued for one organization cannot be replayed onto another's row by a
+database write alone — but that is binding, not permission, and the difference is
+the point.
+
+### The gap this leaves, stated plainly
+
+This service cannot tell whether its caller is entitled to act for the
+organization it names. A compromised private half could register a domain **it
+owns** against **your** organization's id, and nothing here would refuse it.
+
+That is a real gap and only the private half's RBAC closes it. Note its
+direction, though, because it is not the direction this repository is about: it
+is a tenancy problem inside MirrorStack, not a problem in your DNS. Whatever
+organization is named, **nothing is written into any zone that somebody did not
+prove they control** — and an attacker proving control of their own domain has
+gained nothing over yours.
+
+The two layers are not substitutes and neither covers the other's case:
+
+| | protects | against |
+|---|---|---|
+| RBAC, in the private half | MirrorStack's tenancy model | your own users, and each other's organizations |
+| the proof and the anchor, here | **your zone** | **MirrorStack** |
+
+RBAC would not have helped you with the question this repository exists to
+answer, because the party it constrains is not the party you are being asked to
+trust.
+
+---
+
 ## What we assume, and what breaks if the assumption is wrong
 
 An honest threat model is mostly a list of assumptions. These are ours.
