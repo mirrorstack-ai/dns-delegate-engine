@@ -147,7 +147,7 @@ sequenceDiagram
     CF-->>Engine: authorization code
 
     Note over Engine: refuse unless every NAME is at or<br/>under example.com. The VALUES are<br/>not checked against anything.
-    Engine->>CF: ownership TXT + routing CNAMEs
+    Engine->>CF: ownership TXT + routing CNAMEs<br/>+ _acme-challenge pointers (no token, nothing to wait for)
     Engine-->>Console: sealed credential, held 24h
 
     loop every 5 minutes, for up to 24 hours
@@ -155,7 +155,7 @@ sequenceDiagram
         Console->>ACM: has the validation record appeared?
         Console->>Edge: has the custom hostname minted its proofs?
         Console->>Engine: publish what is new
-        Engine->>CF: _9f8c….account.example.com, _acme-challenge.account.example.com,<br/>_cf-custom-hostname.account.example.com
+        Engine->>CF: _9f8c….account.example.com,<br/>_cf-custom-hostname.account.example.com
     end
 
     Note over Engine: 24 hours after you authorized
@@ -206,7 +206,7 @@ sequenceDiagram
         Edge-->>Console: DV challenge + ownership proof
         Console->>Console: re-derive the record list
         Console->>Engine: publish what is new
-        Engine->>CF: _acme-challenge.blog.example.net,<br/>_cf-custom-hostname.blog.example.net
+        Engine->>CF: _acme-challenge.blog.example.net (pointer),<br/>_cf-custom-hostname.blog.example.net
         Note over Engine: the credential's expiry slides forward
     end
 
@@ -281,12 +281,12 @@ sequenceDiagram
 
     You->>CF: authorize (zone.read, dns.write — one zone)
     CF-->>Engine: code, redeemed against the sealed state
-    Engine->>CF: example.org CNAME
+    Engine->>CF: example.org CNAME + _acme-challenge pointer
 
     loop advance, until serving and at every renewal
         Engine->>Engine: re-derive, and re-check the proof TXT
         Engine->>Edge: has the custom hostname minted its proofs?
-        Engine->>CF: _acme-challenge.example.org,<br/>_cf-custom-hostname.example.org
+        Engine->>CF: _cf-custom-hostname.example.org
     end
 
     Note over You,CF: delete the proof TXT and every write stops within one tick
@@ -392,13 +392,16 @@ grant that wrote everything on its first pass still holds the credential until
 the window closes; revoking at your provider ends it immediately, and by then
 there is nothing left to write.
 
-**What a 24-hour window does not cover is renewal.** Cloudflare re-mints the DV
-token under the same name when a certificate renews, months later, and by then
-neither lane 1 nor lane 3 holds a credential — so that write needs a fresh
-authorization, or the record added by hand. The permanent fix is the delegated
-form of that record, a CNAME pointing at Cloudflare that answers every future
-renewal without anyone writing anything; it is built and currently switched off.
-Until it is on, treat certificate renewal as a step that comes back to you.
+**Renewal needs no credential**, which is what makes a 24-hour window enough.
+The record we publish at `_acme-challenge` is a **pointer, not a token**:
+Cloudflare mints and rotates the real tokens behind it, in its own zone, for
+every future renewal. Your zone never changes again, so an expired grant has
+nothing it would have needed to write.
+
+That matters more than it sounds. Cloudflare's DCV tokens live 7 days on Let's
+Encrypt and 14 on Google Trust Services — a form that put the token *in your
+zone* would need republishing on that clock, forever, by a credential that is
+deliberately short-lived.
 
 Revocation at your provider always works, whether or not we are involved, and
 takes effect immediately. It is the one control here that does not depend on

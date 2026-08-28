@@ -52,7 +52,7 @@ registers up to four sibling hosts, and this is everything that lands:
 | `_<token>.account.example.com` | CNAME | AWS certificate | one per host that owns one |
 | `_<token>.api.example.com` | CNAME | AWS certificate | ” |
 | `_<token>.apps.example.com` | CNAME | AWS certificate | ” |
-| `_acme-challenge.<host>` | TXT | certificate | one per host |
+| `_acme-challenge.<host>` | CNAME | certificate | one per host, **permanent** |
 | `_cf-custom-hostname.<host>` | TXT | serving | one per host, when asked for |
 
 Three things that table is saying quietly:
@@ -78,7 +78,7 @@ with an app whose slug is `blog`:
 |---|---|---|---|
 | `*.example.net` | CNAME | routing | **one, ever** |
 | `_mirrorstack-challenge.example.net` | TXT | ownership | one |
-| `_acme-challenge.blog.example.net` | TXT | certificate | **one per app** |
+| `_acme-challenge.blog.example.net` | CNAME | certificate | **one per app**, permanent |
 | `_cf-custom-hostname.blog.example.net` | TXT | serving | one per app, when asked for |
 
 - **The per-app rows appear when that app is deployed**, not when you connect
@@ -115,7 +115,7 @@ nothing beside it in that zone is reachable.
 |---|---|---|---|
 | `_mirrorstack-challenge.example.org` | TXT | ownership | one |
 | `example.org` | CNAME | routing | one |
-| `_acme-challenge.example.org` | TXT | certificate | one, re-minted at renewal |
+| `_acme-challenge.example.org` | CNAME | certificate | one, **permanent** |
 | `_cf-custom-hostname.example.org` | TXT | serving | one, when asked for |
 
 - **No AWS certificate record**, for the same reason as lane 2: it is a
@@ -163,22 +163,33 @@ enforces today.
 ### certificate · read by a certificate authority
 
 ```
-_<token>.<host>          CNAME   <token>.acm-validations.aws   ← AWS, platform lane only
-_acme-challenge.<host>   TXT     <the DV token>                ← Cloudflare, both lanes
-_acme-challenge.<host>   CNAME   <uuid>.dcv.cloudflare.com     ← delegated form, OFF in production
+_<token>.<host>          CNAME   <token>.acm-validations.aws            ← AWS, platform lane only
+_acme-challenge.<host>   CNAME   <host>.<uuid>.dcv.cloudflare.com       ← Cloudflare, all lanes
 ```
 
-**Written by** this service, relaying bytes verbatim from AWS and Cloudflare. It
-derives *that* a proof must exist; neither half chooses the token.
+**The `_acme-challenge` record carries no token.** It is a *pointer*, and both
+halves of it are known before anything is asked of anyone: the hostname is what
+you just connected, and the uuid is fixed configuration for MirrorStack's zone.
 
-Only ever one form at `_acme-challenge`. A CNAME and a TXT cannot coexist at one
-name, and publishing the wrong one does not merely fail to help — it blocks the
-record issuance needs, silently.
+The token still exists — it lives at the far end, in Cloudflare's own zone,
+placed by Cloudflare. A certificate authority looking up
+`_acme-challenge.example.com` follows the pointer and reads the token there.
 
-**Retained, and never proxied.** A certificate **renews** against these months
-later. Cloudflare accepts `proxied: true` on them with no error and then answers
-with addresses instead of the token, so issuance — or a much later renewal —
-fails with every dashboard still green.
+Two things follow, and they are the reason this form is used:
+
+- **Nothing to wait for.** It is publishable in the first pass, before a
+  certificate has been requested or a custom hostname created.
+- **Nothing to republish, ever.** Cloudflare mints, rotates and re-mints tokens
+  behind the pointer for every future renewal. Your zone never changes again.
+
+The AWS record above is different: its value is a token AWS chooses, so it is
+relayed verbatim and arrives only once AWS has answered.
+
+**Retained, and never proxied.** Deleting the pointer takes TLS down at the next
+renewal — silently, months later. And Cloudflare accepts `proxied: true` on these
+names with no error, then answers with addresses instead of following the
+delegation, so issuance or a much later renewal fails with every dashboard still
+green.
 
 ### serving · `_cf-custom-hostname.<host>` TXT
 
@@ -192,7 +203,7 @@ console all read healthy.
 
 | | reads it | missing → |
 |---|---|---|
-| `_acme-challenge` | a certificate authority | renewal fails months later, silently |
+| `_acme-challenge` | a certificate authority, via the delegation | renewal fails months later, silently |
 | `_cf-custom-hostname` | the edge, before it will route | **526 now**, certificate healthy |
 
 Its wait differs too: Cloudflare mints this when the custom hostname is
@@ -261,11 +272,10 @@ All three are revocable at your provider at any time, independently of
 MirrorStack, and all three stop within one tick if you delete the ownership
 proof.
 
-🔴 **Renewal is not covered by a 24-hour window.** Cloudflare re-mints the DV
-token under the same name when a certificate renews, months later — the reported
-set stays authoritative per name, so a fresh value replaces the old one rather
-than sitting beside it. By then lanes 1 and 3 hold no credential, so that write
-needs a fresh authorization or a manual record. The permanent fix is the
-delegated form of `_acme-challenge` — a CNAME pointing at Cloudflare, which
-answers every future renewal without anyone writing anything. It is built and
-switched off; see record form 3 above.
+**Renewal needs no credential at all.** Cloudflare's DCV tokens expire on a short
+clock — 7 days for Let's Encrypt, 14 for Google Trust Services — so a form that
+put the token *in your zone* would need republishing at every renewal, forever,
+by a grant that no longer exists. The delegation pointer sidesteps that entirely:
+the tokens rotate behind it, in Cloudflare's zone, and nothing in yours is
+touched. A 24-hour window is therefore sufficient for a closed lane, and that is
+why lanes 1 and 3 can have one.
