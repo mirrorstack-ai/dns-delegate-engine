@@ -28,7 +28,10 @@ const (
 // cannot be reached answers unknown, which refuses every Authorize.
 //
 // Whatever it returns, PolicyOf reports it and intent.Capabilities publishes it,
-// so a deployment running on the default says so rather than implying more.
+// so a deployment running on the default says so rather than implying more. The
+// measurement that raises it is Probe's, taken by the running service rather
+// than by hand: reachable vantage points are what makes a higher
+// DNS_DELEGATE_QUORUM safe to set.
 func ResolverFromEnv() Resolver {
 	container := NetResolver{}
 	vantages := make([]Resolver, 0, 4)

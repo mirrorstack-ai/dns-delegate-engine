@@ -143,6 +143,32 @@ A quorum is opt-in (`DNS_DELEGATE_RESOLVERS`, `DNS_DELEGATE_AUTHORITATIVE`,
 `DNS_DELEGATE_QUORUM`) because a vantage point a deployment cannot reach answers
 `unknown`, and `unknown` refuses every authorization.
 
+#### The deployment measures its own egress
+
+Whether a given deployment can reach a nameserver on port 53 is a property of
+where it runs, not of this code, so the running service answers it rather than
+an operator remembering to. `observe.Probe` resolves a name that must always
+resolve at every configured vantage point, on a five-minute TTL, and the result
+appears in `IntentCapabilities` and on the health check:
+
+```
+resolution.reachability: {reachable, checkedAt, degraded, points: [{vantage, reachable, explain}]}
+```
+
+**What you do with it.** If every vantage point you added is `reachable`, this
+deployment has the egress the hardening needs — raise `DNS_DELEGATE_QUORUM` and
+the customer-visible `threshold` rises with it. If one is not, that vantage point
+cannot verify anything, and the fix is the network, not the threshold.
+
+🔴 **`degraded` means broken, not "running with a smaller quorum."** The probe
+reports; it never drops an unreachable vantage point so the survivors can meet a
+lower bar. Doing that would turn a network fault into a silent reduction of the
+threshold a customer read before authorizing — a "2 of 3" verified by one — which
+is the exact failure the quorum exists to prevent. So when the reachable set
+cannot meet the declared threshold, the published rule stays as it is, every
+verification reads `unknown`, and **the health check fails** so the deployment
+leaves rotation instead of serving refusals that look like customer mistakes.
+
 What a quorum closes: a single lying recursive resolver, and an off-path cache
 poisoner, who has to win the race at every vantage point rather than at one.
 

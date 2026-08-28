@@ -1,7 +1,10 @@
 package intent
 
 import (
+	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/observe"
@@ -156,5 +159,119 @@ func TestDescribeRowsCarryTheirVantagePointCount(t *testing.T) {
 	}
 	if looked == 0 {
 		t.Fatal("no row in the report was looked up at all")
+	}
+}
+
+// ─── reachability ───────────────────────────────────────────────────────────
+
+// A deployment cannot check its own egress from a configuration file, so the
+// service measures it and publishes what it found. These tests hold the
+// published answer to the measurement — and hold the measurement out of every
+// path that decides anything.
+
+// stubReach is a measurement a test dictates, counting the calls so a publish
+// path can be proven not to make any.
+type stubReach struct {
+	reach observe.Reach
+	calls int
+}
+
+func (s *stubReach) Reach(context.Context) observe.Reach {
+	s.calls++
+	return s.reach
+}
+
+func measured(threshold int, reachable ...bool) *stubReach {
+	out := observe.Reach{Threshold: threshold, CheckedAt: time.Unix(1_700_000_000, 0)}
+	for i, ok := range reachable {
+		v := observe.Reachability{Vantage: fmt.Sprintf("192.0.2.%d:53", i+1), Reachable: ok}
+		if !ok {
+			v.Explain = "no answer"
+		}
+		out.Vantages = append(out.Vantages, v)
+	}
+	return &stubReach{reach: out}
+}
+
+func TestCapabilitiesPublishesWhichVantagePointsAnswered(t *testing.T) {
+	h := newHarness(t)
+	h.svc.Resolver = observe.Quorum{
+		Resolvers: []observe.Resolver{emptyResolver(), emptyResolver(), emptyResolver()},
+		Threshold: 2,
+	}
+	h.svc.Reach = measured(2, true, true, false)
+
+	got := h.svc.Capabilities(t.Context()).Resolution
+	if got.Reachability == nil {
+		t.Fatal("a measured deployment must publish what it measured")
+	}
+	if got.Reachability.Reachable != 2 || got.Reachability.Degraded {
+		t.Fatalf("reachability %+v; 2 of 3 against a threshold of 2 is a working deployment", got.Reachability)
+	}
+	if got.Reachability.CheckedAt == "" {
+		t.Fatal("a reading nobody can date is a reading nobody can act on")
+	}
+	if len(got.Reachability.Points) != 3 {
+		t.Fatalf("%d points; every configured vantage point must be named", len(got.Reachability.Points))
+	}
+	if got.Reachability.Points[2].Reachable || got.Reachability.Points[2].Explain == "" {
+		t.Fatalf("point %+v; the one to fix must be identifiable and say why", got.Reachability.Points[2])
+	}
+}
+
+// 🔴 An unreachable vantage point is reported, and the rule it belongs to is
+// republished UNCHANGED. Nothing may quietly re-cut a customer's "2 of 3" into
+// a "1 of 1" because one leg went dark.
+func TestAnUnreachableVantagePointNeverShrinksThePublishedRule(t *testing.T) {
+	h := newHarness(t)
+	h.svc.Resolver = observe.Quorum{
+		Resolvers: []observe.Resolver{emptyResolver(), emptyResolver(), emptyResolver()},
+		Threshold: 2,
+	}
+	h.svc.Reach = measured(2, true, false, false)
+
+	got := h.svc.Capabilities(t.Context()).Resolution
+	if got.Vantages != 3 || got.Threshold != 2 {
+		t.Fatalf("resolution %+v; the rule a customer authorized against must not move", got)
+	}
+	if !got.Reachability.Degraded {
+		t.Fatalf("reachability %+v; 1 reachable under a threshold of 2 is a broken deployment", got.Reachability)
+	}
+}
+
+// Unmeasured is not unreachable: a deployment with no probe wired says nothing
+// rather than something alarming.
+func TestCapabilitiesReportsAnUnmeasuredDeploymentAsUnmeasured(t *testing.T) {
+	h := newHarness(t)
+	if got := h.svc.Capabilities(t.Context()).Resolution; got.Reachability != nil {
+		t.Fatalf("reachability %+v; nothing was asked, so nothing may be reported", got.Reachability)
+	}
+}
+
+// 🔴 The probe is an egress measurement, not a step in a registration. Nothing
+// a customer waits on may pay for it, and — the reason that matters — nothing
+// that decides whether to write may read it.
+func TestThePublishPathNeverProbesReachability(t *testing.T) {
+	h := newHarness(t)
+	reach := measured(1, false)
+	h.svc.Reach = reach
+
+	out := h.register(t, lane.OrgPlatformDomain, testOrg, platformDomain)
+	h.publishProof(t, out)
+	state := h.authorize(t, out)
+	pass, err := h.svc.Complete(t.Context(), CompleteRequest{
+		State: state, Code: "auth-code", CodeVerifier: "verifier", ExpectDigest: out.Digest,
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if pass.Result != ResultPublished {
+		t.Fatalf("a deployment whose probe found nothing must still publish for a proof it can read: %#v", pass)
+	}
+	if _, err := h.svc.Verify(t.Context(), VerifyRequest{Registration: out.Registration}); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if reach.calls != 0 {
+		t.Fatalf("%d probe calls on the register→authorize→publish→verify path; the probe belongs to Capabilities alone", reach.calls)
 	}
 }
