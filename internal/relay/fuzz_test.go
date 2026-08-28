@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 )
 
 // ---------------------------------------------------------------------------
@@ -280,11 +281,11 @@ func FuzzServingProofsAreAlwaysBounded(f *testing.F) {
 			Type: recType, Name: recName, Value: recValue, Proxied: true,
 		}}
 
-		record, ready, err := ServingProof(context.Background(), edge, host)
+		record, ready, err := ServingProof(context.Background(), edge, lane.OrgPlatformDomain, host)
 
 		// ServingProofs is the call internal/intent actually makes; a bound that
 		// held only on the singular form would be a bound production never runs.
-		proofs, pluralErr := ServingProofs(context.Background(), edge, []string{host})
+		proofs, pluralErr := ServingProofs(context.Background(), edge, lane.OrgPlatformDomain, []string{host})
 
 		if err != nil {
 			if ready {

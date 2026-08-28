@@ -61,6 +61,13 @@ order.
 
 Four more things this file would rather you heard from us than found yourself:
 
+- **Whether record 7 appears is a property of the deployment, not of the code.**
+  Cloudflare's serving proof is read from MirrorStack's own zone, and the org
+  lane and the app lane are different zones — so a deployment names one id per
+  lane, and `capabilities` publishes both so you can check which. A lane that
+  names none produces no `_cf-custom-hostname`, and a hostname on it can resolve,
+  hold a certificate whose status reads active, and still answer 526.
+  [`docs/RECORDS.md`](docs/RECORDS.md) describes the record and that failure.
 - **Lane 2 cannot be authorized on the deployed build at all.** The wildcard lane
   requires this service's own consent page to have been acknowledged, and an
   acknowledgement is a MAC under a key that never leaves this deployment. Nothing
@@ -68,12 +75,6 @@ Four more things this file would rather you heard from us than found yourself:
   every time. It fails closed on purpose — the alternative is minting your
   agreement somewhere you were not — and it stays that way until the
   customer-facing consent route is settled.
-- **Record 7, Cloudflare's serving proof, never appears.** `relay.Edge` is not
-  wired in this build (the reason is written out at its wiring site in
-  `cmd/dns-delegate-api/main.go`), so `_cf-custom-hostname` is in no pass on any
-  lane. [`docs/RECORDS.md`](docs/RECORDS.md) lists it and marks it, because the
-  record is needed and simply absent: until Edge is wired, a hostname can
-  resolve, hold a certificate whose status reads active, and still answer 526.
 - **The digest is required on `Complete`, and it is still not the cross-boundary
   control §4 implies.** It compares a plan derived here against a hex string this
   service handed the caller — `derive(reg) == derive(reg)` — so it catches a bug
@@ -282,8 +283,7 @@ about each:
   makes deleting it a control rather than a gesture.
 - **Three records arrive late** because they are answers from AWS and Cloudflare
   that do not exist when you authorize. That is why the credential is held rather
-  than spent once, and it is not going to change. (Fewer of them today: record 7
-  is not produced by this build — see the Status section.)
+  than spent once, and it is not going to change.
 
 ---
 
@@ -340,11 +340,11 @@ Three differences from the platform lane that matter:
   certificate records. If the parent still holds a live authorization they are
   published for you; if it does not — you never authorized, or you revoked —
   **nothing is written and you get the records to add yourself**. Revoking
-  does not break deploys; it turns them manual. 🔴 **Today that hand-back is one
-  record where two are needed**, because `relay.Edge` is not wired in this build
-  and `_cf-custom-hostname` therefore appears in no pass, on any lane.
-  [`docs/RECORDS.md`](docs/RECORDS.md) marks the missing one; the symptom is a
-  526 from a hostname whose certificate reads perfectly healthy.
+  does not break deploys; it turns them manual. That hand-back is both records
+  wherever this deployment reads the serving proof for the lane, and only the
+  `_acme-challenge` pointer where it does not — `capabilities` names the zone
+  each lane reads it from, and the symptom of a lane that has none is a 526 from
+  a hostname whose certificate reads perfectly healthy.
 - **One wildcard is all the routing you ever publish — but it is not all the
   DNS.** `*.example.net` matches exactly one label, so it covers
   `blog.example.net` and never `_acme-challenge.blog.example.net`. Each app still
@@ -395,8 +395,7 @@ so nothing is derived beneath it and nothing beside it is reachable — connecti
 zone.
 
 The diagram below is the **intent** flow, and every step of it is in this
-repository — with one exception, marked in the Status section: the last write in
-that loop, `_cf-custom-hostname`, is not produced by this build at all.
+repository.
 
 ```mermaid
 sequenceDiagram
@@ -601,7 +600,8 @@ dns-delegate-engine/
 │   │                           that does the writing, plus the acknowledgement
 │   ├── observe/                what PUBLIC DNS says about a plan, right now
 │   ├── relay/                  records 5 and 7, read verbatim from AWS and
-│   │                           Cloudflare and bounded before anyone sees them
+│   │                           Cloudflare — with OUR credentials, in OUR zones,
+│   │                           bounded before anyone sees them
 │   ├── sealed/                 the two envelopes: a registration, and one
 │   │                           authorization in progress
 │   ├── schedule/               the declared cadence — a declaration, not a control
@@ -612,7 +612,8 @@ dns-delegate-engine/
 │   ├── reconcile/              the publisher, and every safety rule
 │   ├── dnsprovider/            the provider seam; safety rules live ABOVE it
 │   ├── provider/cloudflare/    the first adapter
-│   ├── shared/                 the OAuth client, the sealing keyset, the JSON envelope
+│   ├── shared/                 the OAuth client, the sealing keyset, MirrorStack's
+│   │                           own edge token, the JSON envelope
 │   │
 │   │   ─── the legacy record-list surface ───
 │   └── grant/                  🔴 DEPRECATED and still routed: authorize,

@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfedge"
 )
 
 // edgeAPIBase is Cloudflare's v4 API root. Deliberately a second copy of the
@@ -28,33 +31,70 @@ const edgeAPIBase = "https://api.cloudflare.com/client/v4"
 // answer nobody sent.
 const maxEdgeResponse = 1 << 20 // 1 MiB
 
-// TokenSource yields MirrorStack's own Cloudflare zone credential for one call. A
-// function rather than a string so the token can be re-read from Secrets Manager on
-// a TTL and rotate underneath a running process.
-type TokenSource func(ctx context.Context) (string, error)
+// EdgeZones names the MirrorStack zone each lane's custom hostnames live in.
+//
+// 🔴 ONE ZONE ID CANNOT SERVE THREE LANES. MirrorStack's org zone and its
+// app/SaaS zone are separate, and a lane's routing target says which — lane 1 is
+// CNAMEd into the org zone and lanes 2 and 3 into the app zone (docs/DESIGN.md
+// §6, records 2 through 4). One id against all three reads two lanes out of a
+// zone holding none of their custom hostnames and finds nothing, which is
+// spelled exactly like the ordinary "Cloudflare has not minted it yet".
+//
+// Both ids are reported through IntentCapabilities, per lane, so which zone a
+// deployment reads for which lane is answerable from outside it.
+type EdgeZones struct {
+	// OrgPlatform holds the account/api/apps/cdn custom hostnames: lane 1.
+	OrgPlatform string
 
-// StaticToken adapts a token already in hand. Intended for local runs and tests;
-// production reads a rotating secret.
-func StaticToken(token string) TokenSource {
-	return func(context.Context) (string, error) { return token, nil }
+	// App holds every app hostname: lanes 2 and 3.
+	App string
+}
+
+// Configured reports whether any zone is named at all.
+func (z EdgeZones) Configured() bool {
+	return strings.TrimSpace(z.OrgPlatform) != "" || strings.TrimSpace(z.App) != ""
+}
+
+// ForLane picks the zone this lane's serving proof is read from.
+//
+// 🔴 THE LANE SELECTS, NEVER THE HOSTNAME. A hostname is the customer's string
+// and it carries no zone in it: inferring one would mean matching a customer's
+// name against a table and picking a MirrorStack zone from the result, so a
+// customer could choose which of our zones we authenticate against. The lane is
+// fixed by the entry point (internal/intent) and is inside the ownership HMAC.
+//
+// An unrecognised lane is refused rather than defaulted, on lane.Parse's rule: a
+// defaulted lane picks a zone the customer never consented to anything in.
+func (z EdgeZones) ForLane(l lane.Lane) (string, error) {
+	var zoneID string
+	switch l {
+	case lane.OrgPlatformDomain:
+		zoneID = strings.TrimSpace(z.OrgPlatform)
+	case lane.OrgAppDomain, lane.AppDomain:
+		zoneID = strings.TrimSpace(z.App)
+	default:
+		return "", fmt.Errorf("relay: no MirrorStack zone is defined for lane %q", l)
+	}
+	if zoneID == "" {
+		return "", fmt.Errorf("relay: no MirrorStack zone is configured for lane %q, so its serving proof cannot be read", l)
+	}
+	return zoneID, nil
 }
 
 // Edge reads record 7 — the serving proof — from Cloudflare for SaaS.
 //
-// 🔴 ZoneID IS MIRRORSTACK'S ZONE, AND Token IS MIRRORSTACK'S TOKEN. Reading a
+// 🔴 Zones ARE MIRRORSTACK'S ZONES, AND Token IS MIRRORSTACK'S TOKEN. Reading a
 // custom hostname in OUR zone needs the SSL and Certificates permission there,
 // which a customer's delegated grant — zone.read and dns.write on the one zone
-// they picked — could not perform even if it were offered it. There is no field on
-// this struct that a customer credential belongs in.
+// they picked — could not perform even if it were offered it. Token is a
+// cfedge.Source, whose Token is a defined type: the customer's plain-string
+// credential does not fit in any field on this struct.
 type Edge struct {
-	// ZoneID is the MirrorStack SaaS zone holding the custom hostname. The org
-	// lane and the app lane use different zones; the caller supplies the right
-	// one for the lane.
-	ZoneID string
+	// Zones is the per-lane zone table. See EdgeZones.
+	Zones EdgeZones
 
-	// Token resolves MirrorStack's zone credential. Nil is a configuration
-	// error, not a wait — see ServingProof.
-	Token TokenSource
+	// Token resolves MirrorStack's own Cloudflare credential.
+	Token cfedge.Source
 
 	// Base overrides the API root. Tests point it at an httptest server.
 	Base string
@@ -63,7 +103,15 @@ type Edge struct {
 	HTTPClient *http.Client
 }
 
-var _ EdgeHostnames = Edge{}
+var (
+	_ EdgeHostnames    = Edge{}
+	_ EdgeZoneReporter = Edge{}
+)
+
+// EdgeZones reports the zone table this reader was configured with, so
+// IntentCapabilities publishes what is ACTUALLY read rather than a second copy
+// of the same environment variables. See EdgeZoneReporter in relay.go.
+func (e Edge) EdgeZones() EdgeZones { return e.Zones }
 
 // customHostname is Cloudflare's read shape, reduced to the two fields this
 // service reads. The certificate's status, its pending validation records and the
@@ -78,7 +126,7 @@ type customHostname struct {
 	} `json:"ownership_verification"`
 }
 
-// ServingProof reads the _cf-custom-hostname TXT for one host.
+// ServingProof reads the _cf-custom-hostname TXT for one host on one lane.
 //
 // 🔴 RECORD 7 IS A SECOND, SEPARATE PROOF, READ BY THE EDGE AND NOT BY A
 // CERTIFICATE AUTHORITY. MISSING IT PRODUCES A 526 WHILE THE CERTIFICATE STATUS
@@ -90,31 +138,40 @@ type customHostname struct {
 // certificate challenge only after that host's routing record resolves, so on an
 // early pass this is ready and the certificate record is not.
 //
-// ready=false with a nil error is the normal early state: the custom hostname does
-// not exist yet, or exists and Cloudflare has not asked for a proof. The only
-// errors this method returns are a failed call and a missing credential. A record
+// ready=false with a nil error is the normal early state: the custom hostname
+// does not exist yet, exists with no proof asked for, or this deployment holds no
+// edge credential (cfedge.ErrNotConfigured). The only errors are a failed call, a
+// credential that could not be READ, and a lane with no zone. A record
 // Cloudflare's own contract says it cannot return is refused one level up, by the
-// free ServingProof in relay.go, so that refusal holds for every implementation of
-// EdgeHostnames rather than for this one.
-func (e Edge) ServingProof(ctx context.Context, host string) (dnsplan.Record, bool, error) {
+// free ServingProof in relay.go, so that refusal holds for every implementation
+// of EdgeHostnames rather than for this one.
+func (e Edge) ServingProof(ctx context.Context, l lane.Lane, host string) (dnsplan.Record, bool, error) {
 	host = dnsplan.NormalizeName(host)
 	if host == "" || len(host) > dnsplan.MaxDNSName {
 		return dnsplan.Record{}, false, fmt.Errorf("relay: %q is not a DNS name", host)
 	}
-	if strings.TrimSpace(e.ZoneID) == "" {
-		return dnsplan.Record{}, false, fmt.Errorf("relay: no MirrorStack zone configured for the serving proof")
+	zoneID, err := e.Zones.ForLane(l)
+	if err != nil {
+		return dnsplan.Record{}, false, err
 	}
-	// A missing token is a configuration fault reported as a fault. Reporting it
-	// as not-ready would be indistinguishable from Cloudflare being slow — and
-	// would stay indistinguishable forever.
+	// A nil source is a wiring mistake — the binary passes a nil INTERFACE when
+	// this deployment has no credential, which never reaches here.
 	if e.Token == nil {
 		return dnsplan.Record{}, false, fmt.Errorf("relay: no MirrorStack zone credential configured for the serving proof")
 	}
 	token, err := e.Token(ctx)
-	if err != nil {
+	switch {
+	case errors.Is(err, cfedge.ErrNotConfigured):
+		// Nothing to read WITH is the same answer to the customer as nothing to
+		// read: the proof is not available yet. cfedge logs which it was.
+		return dnsplan.Record{}, false, nil
+	case err != nil:
 		return dnsplan.Record{}, false, fmt.Errorf("relay: resolve the MirrorStack zone credential: %w", err)
 	}
-	if strings.TrimSpace(token) == "" {
+	// A source that returns a blank token and NO error is a fault reported as a
+	// fault. Reported as not-ready it would be indistinguishable from Cloudflare
+	// being slow — and would stay indistinguishable forever.
+	if strings.TrimSpace(string(token)) == "" {
 		return dnsplan.Record{}, false, fmt.Errorf("relay: the MirrorStack zone credential is empty")
 	}
 
@@ -126,7 +183,7 @@ func (e Edge) ServingProof(ctx context.Context, host string) (dnsplan.Record, bo
 		} `json:"errors"`
 		Result []customHostname `json:"result"`
 	}
-	path := "/zones/" + url.PathEscape(strings.TrimSpace(e.ZoneID)) +
+	path := "/zones/" + url.PathEscape(zoneID) +
 		"/custom_hostnames?" + url.Values{"hostname": {host}}.Encode()
 	if err := e.get(ctx, token, path, &env); err != nil {
 		return dnsplan.Record{}, false, err
@@ -201,12 +258,15 @@ func (e Edge) client() *http.Client {
 // here, and that is not an accident of what was needed: a custom hostname belongs
 // to api-platform's lifecycle, and giving the half that holds credentials a write
 // method against MirrorStack's own zone would put the two halves back together.
-func (e Edge) get(ctx context.Context, token, path string, out any) error {
+//
+// This is also the ONLY place the token is converted back to a string. Everywhere
+// else it is a cfedge.Token, which redacts itself under every fmt verb.
+func (e Edge) get(ctx context.Context, token cfedge.Token, path string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.base()+path, nil)
 	if err != nil {
 		return fmt.Errorf("relay: build custom hostname request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", "Bearer "+string(token))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := e.client().Do(req)
 	if err != nil {

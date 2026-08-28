@@ -22,7 +22,9 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/intent"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/observe"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/relay"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/sealed"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfedge"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfoauth"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport"
@@ -785,4 +787,41 @@ func (unusedResolver) LookupCNAME(context.Context, string) (string, error) {
 
 func (unusedResolver) LookupTXT(context.Context, string) ([]string, error) {
 	panic("no test here resolves a name")
+}
+
+// 🔴 AN UNCONFIGURED EDGE IS WIRED AS NIL, WHICH internal/relay REPORTS AS "NOT
+// YET". Anything else would put a warning on every pass of a deployment nobody
+// had finished configuring — and a fake reader would be worse still, since an
+// invented serving proof is published into a customer's zone.
+func TestTheEdgeRelayIsWiredOnlyWhenBothAZoneAndACredentialAreNamed(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"nothing set":         {},
+		"zones but no token":  {edgeOrgZoneEnv: "org-zone", edgeAppZoneEnv: "app-zone"},
+		"a token but no zone": {cfedge.TokenEnv: "ms-token"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(edgeOrgZoneEnv, env[edgeOrgZoneEnv])
+			t.Setenv(edgeAppZoneEnv, env[edgeAppZoneEnv])
+			t.Setenv(cfedge.TokenEnv, env[cfedge.TokenEnv])
+			t.Setenv(cfedge.SecretIDEnv, "")
+			if edge := edgeHostnames(); edge != nil {
+				t.Fatalf("want a nil reader, got %#v", edge)
+			}
+		})
+	}
+
+	t.Setenv(edgeOrgZoneEnv, "org-zone")
+	t.Setenv(edgeAppZoneEnv, "app-zone")
+	t.Setenv(cfedge.TokenEnv, "ms-token")
+	t.Setenv(cfedge.SecretIDEnv, "")
+	edge := edgeHostnames()
+	reporter, ok := edge.(relay.EdgeZoneReporter)
+	if !ok {
+		t.Fatalf("a wired reader must be able to name its zones, got %T", edge)
+	}
+	// The two zones must arrive from the two variables, not one from both: the
+	// swap has no symptom other than hosts that never start serving.
+	if zones := reporter.EdgeZones(); zones.OrgPlatform != "org-zone" || zones.App != "app-zone" {
+		t.Fatalf("the per-lane zones are mis-wired: %#v", zones)
+	}
 }

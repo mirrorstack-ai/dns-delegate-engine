@@ -103,6 +103,11 @@ type Service struct {
 	// Nil means "not wired": a lane that never had those records, or a deployment
 	// not configured for them. Never an error — a lane must still publish what it
 	// CAN derive.
+	//
+	// Edge reads a DIFFERENT MirrorStack zone per lane (relay.EdgeZones), which is
+	// why it takes the lane rather than the hostname alone. Capabilities publishes
+	// those ids when this one can report them, so a lane pointed at the wrong zone
+	// is visible from outside rather than only as hosts that never start serving.
 	Certificates relay.CertificateAuthority
 	Edge         relay.EdgeHostnames
 
@@ -167,7 +172,7 @@ func (s *Service) Capabilities(ctx context.Context) CapabilitiesResponse {
 		OrgRoutingTarget:  s.Derive.OrgRoutingTarget,
 		AppRoutingTarget:  s.Derive.AppRoutingTarget,
 		DCVDelegationUUID: s.Derive.DCVDelegationUUID,
-		Lanes:             laneCapabilities(),
+		Lanes:             laneCapabilities(s.edgeZones()),
 	}
 	// The declared clock, so DESIGN §8's promise — that what runs, and when, is
 	// public — is answerable from this API, not only from a source file.
@@ -206,6 +211,21 @@ func (s *Service) Capabilities(ctx context.Context) CapabilitiesResponse {
 	return out
 }
 
+// edgeZones names the MirrorStack zones record 7 is read from, per lane, or the
+// zero table when nothing is wired.
+//
+// Asserted rather than stored, so what Capabilities publishes is the table the
+// reader ACTUALLY uses; a second field holding a second copy of the same
+// environment variables is the copy that goes stale, and it would go stale in the
+// direction of claiming a configuration that is not in force.
+func (s *Service) edgeZones() relay.EdgeZones {
+	reporter, ok := s.Edge.(relay.EdgeZoneReporter)
+	if !ok {
+		return relay.EdgeZones{}
+	}
+	return reporter.EdgeZones()
+}
+
 func (s *Service) providerName() string {
 	if s.Publisher.Provider == nil {
 		return ""
@@ -214,8 +234,9 @@ func (s *Service) providerName() string {
 }
 
 // laneCapabilities describes the three lanes in the terms a customer decides on:
-// what is anchored, what is derived beneath it, and how long a credential lives.
-func laneCapabilities() []LaneCapability {
+// what is anchored, what is derived beneath it, how long a credential lives, and
+// which MirrorStack zone this deployment reads that lane's serving proof from.
+func laneCapabilities(zones relay.EdgeZones) []LaneCapability {
 	out := make([]LaneCapability, 0, 3)
 	for _, l := range []lane.Lane{lane.OrgPlatformDomain, lane.OrgAppDomain, lane.AppDomain} {
 		description := ""
@@ -227,12 +248,17 @@ func laneCapabilities() []LaneCapability {
 		case lane.AppDomain:
 			description = "the hostname itself, and nothing beneath it"
 		}
+		// An unconfigured lane reports the empty string rather than a refusal:
+		// this is a description of the deployment, and "no zone" is the truth
+		// about one whose edge relay is not wired.
+		zoneID, _ := zones.ForLane(l)
 		out = append(out, LaneCapability{
 			Lane:         string(l),
 			Hosts:        description,
 			Anchor:       "the domain you connect, and every record sits at or under it",
 			GrantSeconds: grantSeconds(l),
 			ConsentPage:  consent.Required(l),
+			EdgeZone:     zoneID,
 		})
 	}
 	return out
@@ -1205,7 +1231,7 @@ func (s *Service) relayInto(ctx context.Context, plan derive.Plan) (derive.Plan,
 	}
 
 	if hosts := servingHosts(plan); len(hosts) > 0 {
-		records, err := relay.ServingProofs(ctx, s.Edge, hosts)
+		records, err := relay.ServingProofs(ctx, s.Edge, plan.Lane, hosts)
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("the edge could not be read: %v", err))
 		}

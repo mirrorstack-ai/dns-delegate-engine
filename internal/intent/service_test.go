@@ -23,6 +23,7 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/observe"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/proof"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/reconcile"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/relay"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/sealed"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfoauth"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
@@ -1813,15 +1814,86 @@ func (f *fakeCA) ValidationRecords(_ context.Context, hosts []string) ([]dnsplan
 
 type fakeEdge struct {
 	asked  []string
+	lanes  []lane.Lane
 	proofs map[string]dnsplan.Record
 	err    error
 }
 
-func (f *fakeEdge) ServingProof(_ context.Context, host string) (dnsplan.Record, bool, error) {
+func (f *fakeEdge) ServingProof(_ context.Context, l lane.Lane, host string) (dnsplan.Record, bool, error) {
 	f.asked = append(f.asked, host)
+	f.lanes = append(f.lanes, l)
 	if f.err != nil {
 		return dnsplan.Record{}, false, f.err
 	}
 	record, ready := f.proofs[host]
 	return record, ready, nil
+}
+
+// 🔴 THE EDGE IS ASKED WITH THE PLAN'S OWN LANE, because the lane picks which
+// MirrorStack zone the proof is read from — lane 1 lives in the org zone and
+// lanes 2 and 3 in the app zone. A lane guessed here reads the wrong zone, finds
+// nothing, and reports it as the ordinary "not minted yet".
+func TestTheEdgeIsAskedWithTheLaneThePlanWasDerivedFor(t *testing.T) {
+	for _, tc := range []struct {
+		lane   lane.Lane
+		id     string
+		anchor string
+	}{
+		{lane.OrgPlatformDomain, testOrg, platformDomain},
+		{lane.AppDomain, testApp, appHostname},
+	} {
+		h := newHarness(t)
+		edge := &fakeEdge{proofs: map[string]dnsplan.Record{}}
+		h.svc.Edge = edge
+		out := h.register(t, tc.lane, tc.id, tc.anchor)
+		h.publishProof(t, out)
+		if _, err := h.svc.Advance(t.Context(), AdvanceRequest{Registration: out.Registration}); err != nil {
+			t.Fatalf("%s: Advance: %v", tc.lane, err)
+		}
+		if len(edge.lanes) == 0 {
+			t.Fatalf("%s: the edge was never asked", tc.lane)
+		}
+		for _, asked := range edge.lanes {
+			if asked != tc.lane {
+				t.Fatalf("%s: the edge was asked as %q", tc.lane, asked)
+			}
+		}
+	}
+}
+
+// 🔴 THE PER-LANE ZONE IS PUBLISHED SO IT IS AUDITABLE FROM OUTSIDE. One id
+// against all three lanes, or the two swapped, has no symptom but hosts that
+// answer 526 with a healthy certificate; naming both here is what lets somebody
+// check the deployment without reading its environment.
+func TestCapabilitiesNamesTheZoneEachLaneReadsItsServingProofFrom(t *testing.T) {
+	h := newHarness(t)
+	zones := relay.EdgeZones{OrgPlatform: "org-zone-id", App: "app-zone-id"}
+	h.svc.Edge = relay.Edge{Zones: zones}
+
+	got := map[string]string{}
+	for _, l := range h.svc.Capabilities(t.Context()).Lanes {
+		got[l.Lane] = l.EdgeZone
+	}
+	want := map[string]string{
+		string(lane.OrgPlatformDomain): zones.OrgPlatform,
+		string(lane.OrgAppDomain):      zones.App,
+		string(lane.AppDomain):         zones.App,
+	}
+	for l, zone := range want {
+		if got[l] != zone {
+			t.Fatalf("lane %s must report zone %q, got %q", l, zone, got[l])
+		}
+	}
+	if got[string(lane.OrgPlatformDomain)] == got[string(lane.AppDomain)] {
+		t.Fatal("the org lane and the app lane must not report the same zone")
+	}
+
+	// An unwired deployment names no zone rather than an invented one: the
+	// serving proof simply does not appear on any lane.
+	h.svc.Edge = nil
+	for _, l := range h.svc.Capabilities(t.Context()).Lanes {
+		if l.EdgeZone != "" {
+			t.Fatalf("an unwired edge must name no zone, lane %s reported %q", l.Lane, l.EdgeZone)
+		}
+	}
 }

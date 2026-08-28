@@ -88,7 +88,7 @@ registers up to four sibling hosts, and this is everything that lands:
 | `_<token>.api.example.com` | CNAME | AWS certificate | ” |
 | `_<token>.apps.example.com` | CNAME | AWS certificate | ” |
 | `_acme-challenge.<host>` | CNAME | certificate | one per host, **permanent** |
-| `_cf-custom-hostname.<host>` | TXT | serving | one per host, when asked for — 🔴 **not produced by this build** |
+| `_cf-custom-hostname.<host>` | TXT | serving | one per host, when asked for |
 
 Three things that table is saying quietly:
 
@@ -114,14 +114,15 @@ with an app whose slug is `blog`:
 | `*.example.net` | CNAME | routing | **one, ever** |
 | `_mirrorstack-challenge.example.net` | TXT | ownership | one |
 | `_acme-challenge.blog.example.net` | CNAME | certificate | **one per app**, permanent |
-| `_cf-custom-hostname.blog.example.net` | TXT | serving | one per app, when asked for — 🔴 **not produced by this build** |
+| `_cf-custom-hostname.blog.example.net` | TXT | serving | one per app, when asked for |
 
 - **The per-app rows appear when that app is deployed**, not when you connect
   the parent. If the parent holds a live authorization they are written for you;
   if not, they are handed back for you to add by hand. Either way the wildcard
-  already routes the app, so what is outstanding is only its certificate.
-  🔴 **On this build that hand-back is one record, not the two above**, because
-  the serving proof is not produced — see [serving](#serving--_cf-custom-hostnamehost-txt).
+  already routes the app, so what is outstanding is only its certificate. It is
+  both records above wherever this deployment reads the serving proof for the
+  lane, and only the `_acme-challenge` pointer where it does not — see
+  [serving](#serving--_cf-custom-hostnamehost-txt).
 - **No AWS certificate records on this lane, at all.** An app custom domain is a
   pure Cloudflare-for-SaaS hostname: it stays DNS-only and hands the request
   straight to MirrorStack's own zone, never reaching AWS from your edge. So the
@@ -160,7 +161,7 @@ nothing beside it in that zone is reachable.
 | `_mirrorstack-challenge.example.org` | TXT | ownership | one |
 | `example.org` | CNAME | routing | one |
 | `_acme-challenge.example.org` | CNAME | certificate | one, **permanent** |
-| `_cf-custom-hostname.example.org` | TXT | serving | one, when asked for — 🔴 **not produced by this build** |
+| `_cf-custom-hostname.example.org` | TXT | serving | one, when asked for |
 
 - **No AWS certificate record**, for the same reason as lane 2: it is a
   Cloudflare-for-SaaS hostname that never reaches AWS from your edge.
@@ -278,22 +279,24 @@ resolves. Describing them with one word names the wrong blocker.
 
 **Written by** this service, verbatim from Cloudflare. **Retained.**
 
-🔴 **AND NOT PRODUCED BY THIS BUILD, ON ANY LANE.** The relay that would fetch
-it exists in `internal/relay` and nothing wires it: it needs MirrorStack's own
-Cloudflare API token and the id of the SaaS zone the custom hostname sits in,
-and that zone differs between the org lane and the app lane while the field that
-would hold it does not. Both have to be settled before it can be filled in.
+🔴 **AND IT IS READ PER LANE, FROM A DIFFERENT MIRRORSTACK ZONE.** The custom
+hostname is ours, not yours: lane 1's lives in MirrorStack's org zone and lanes 2
+and 3 in its app/SaaS zone, and the **lane** picks between them — never your
+hostname, which would let a name you chose select which of our zones we
+authenticate against.
 
-Two consequences worth being blunt about. **Every lane can therefore land in the
-526-with-a-healthy-certificate state above** — the row that makes this the
-hardest failure here to diagnose is the row that is missing. And a
-`BindAppToOrgAppDomain` that falls back to the manual path hands you **one**
-record where lane 2's table lists two; the `_acme-challenge` pointer is the one
-you get.
+Two things follow, and both are things you can check. A deployment reading the
+wrong zone finds no custom hostname for your host, which is indistinguishable
+from a proof Cloudflare has not minted yet — so `capabilities` names the zone id
+for each lane, and a lane naming none will not produce this record at all. And
+where a lane is unconfigured, a `BindAppToOrgAppDomain` falling back to the
+manual path hands you **one** record where lane 2's table lists two; the
+`_acme-challenge` pointer is the one you get.
 
-It is left unwired rather than approximated because an absent row is visibly
-incomplete and an invented one is confidently wrong. Nothing else in a plan is
-affected: everything derivable is still published.
+Nothing else in a plan depends on it: an unreadable edge is a warning on the
+pass, never a refusal, and everything derivable is still published. The value is
+never approximated — an absent row is visibly incomplete and an invented one is
+confidently wrong.
 
 ---
 

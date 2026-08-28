@@ -690,6 +690,18 @@ type LaneCapability struct {
 	// consent screen.
 	GrantSeconds int64 `json:"grantSeconds"`
 	ConsentPage  bool  `json:"consentPage"`
+
+	// EdgeZone is the MirrorStack Cloudflare zone this deployment reads record 7,
+	// the serving proof, from for this lane. Empty means the relay is not wired
+	// for it, and that lane's `_cf-custom-hostname` will not appear in any plan.
+	//
+	// 🔴 PUBLISHED SO THE PER-LANE ZONE IS AUDITABLE FROM OUTSIDE. Lane 1 lives in
+	// MirrorStack's org zone and lanes 2 and 3 in the app/SaaS zone, so one id
+	// against all three, or the two swapped, is a misconfiguration whose only
+	// other symptom is hosts that answer 526 with a healthy certificate. A zone id
+	// is an identifier and not a credential; it appears in every Cloudflare
+	// dashboard URL.
+	EdgeZone string `json:"edgeZone,omitempty"`
 }
 
 // Failure describes an outcome that reached the provider, or the reason there is
