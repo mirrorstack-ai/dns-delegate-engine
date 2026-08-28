@@ -129,6 +129,58 @@ func TestInvalidUTF8CannotCollideTwoPlansIntoOneDigest(t *testing.T) {
 	}
 }
 
+// 🔴 THE SUFFIX-CONFUSION CASE, PINNED DIRECTLY AGAINST Contains.
+//
+// This test exists because a mutation found the gap: deleting the leading dot
+// from Contains — so that `evilexample.com` counts as being under
+// `example.com` — SURVIVED this package's entire suite. The table below names a
+// "suffix-confusion neighbour", but its anchor is `app.example.com`, and
+// `evilexample.com` is not a near-miss for that anchor: it does not end in it at
+// all, with or without the dot. The case read correct and asserted nothing.
+//
+// The property did hold, but only because packages elsewhere happened to
+// exercise it. That is not a bound a customer can rely on — deleting an
+// unrelated test in internal/lane or internal/relay would have left the most
+// quoted claim in the README unguarded. It is pinned here now, next to the code
+// it is about.
+func TestContainsRequiresALabelBoundary(t *testing.T) {
+	cases := []struct {
+		anchor, name string
+		want         bool
+	}{
+		{"example.com", "example.com", true},
+		{"example.com", "account.example.com", true},
+		{"example.com", "*.example.com", true},
+		{"example.com", "_acme-challenge.api.example.com", true},
+
+		// Each of these ENDS WITH the anchor string and must still be refused,
+		// because the character before it is not a dot. This is the shape the
+		// mutation exposed.
+		{"example.com", "evilexample.com", false},
+		{"example.com", "notexample.com", false},
+		{"example.com", "xexample.com", false},
+		{"app.example.com", "evilapp.example.com", false},
+		{"shop.example.com", "myshop.example.com", false},
+
+		// The anchor is not under its own child, and a parent is never reachable.
+		{"shop.example.com", "example.com", false},
+		{"example.com", "com", false},
+
+		// Normalization must not open a hole: case and a trailing dot are the
+		// two spellings the same name arrives in.
+		{"EXAMPLE.com", "Account.Example.COM.", true},
+		{"example.com", "evilexample.com.", false},
+
+		{"", "example.com", false},
+		{"example.com", "", false},
+	}
+	for _, tc := range cases {
+		if got := Contains(tc.anchor, tc.name); got != tc.want {
+			t.Errorf("Contains(%q, %q) = %v, want %v", tc.anchor, tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestContainmentRefusesEscape(t *testing.T) {
 	cases := []struct {
 		name   string
