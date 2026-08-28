@@ -48,6 +48,12 @@ Run 2026-08-28 against `test/security-properties`.
 | 11 | a slug is one label | remove the explicit dot check | **equivalent mutant** — see finding 2 |
 | 12 | the consent token is compared in constant time | `hmac.Equal` → `==` | **unkillable by behavioural tests** — see finding 3 |
 
+Row 5's two tests belonged to the record-list surface and were deleted with it.
+The same invariant is asserted on the surviving formula by
+`TestGrantAADBindsToTheWholeRegistration` in `internal/intent`, which the run did
+not cover: this table records what was mutated on 2026-08-28 and is not edited to
+match a later tree.
+
 ---
 
 ## Finding 1 · a test that read correct and asserted nothing

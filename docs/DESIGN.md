@@ -1,9 +1,8 @@
 # The intent-based API
 
-The shape this service is being rebuilt into: MirrorStack's private half names a
-**domain and an intent**, and on this surface cannot name a DNS record at all.
-It is a surface rather than the whole deployment, and the difference is the
-first thing below.
+The shape this service was rebuilt into: MirrorStack's private half names a
+**domain and an intent**, and cannot name a DNS record at all. It is the whole
+wire surface, which is what §1 is about.
 
 > **Status: built, and not finished.** This file described a proposal until
 > 2026-08-28 and describes the deployed surface now. Everything below is
@@ -17,36 +16,30 @@ first thing below.
 > - **Lane 2's consent page is served by no deployment.** The flow is built —
 >   the page carries a challenge, posting it back mints the acknowledgement
 >   `authorize` requires — but nothing routes that path, so the lane is still
->   refused every time. What the acknowledgement does and does not prove is §4.
+>   refused every time. Nothing weaker sits behind that refusal any more, so the
+>   lane is added by hand until the page is routed. What the acknowledgement does
+>   and does not prove is §4.
 > - **The rate floor in `internal/schedule` is declared and enforced nowhere.**
 >   §8.
 >
-> 🔴 **And the surface §1 is about is still routed in the same binary, behind
-> the same OAuth client.** `publish(records)` and the legacy `authorize` that
-> takes a caller-supplied state are both live, and MirrorStack's private half
-> still calls them. They are reachable with the credential this flow obtains:
-> run the intent flow, get your genuine consent on your provider's screen, and
-> then redeem the resulting authorization code against `publish` with a record
-> list instead of against `complete`. `publish` takes the **anchor** as a request
-> field too, and on the authorization-code path nothing binds it to anything you
-> proved — so the reach is not the domain you connected, it is any `CNAME` or
-> `TXT` anywhere in the zone your provider authorized. The two records §1 opens
-> with are the mild case. **Until that action is deleted, your answer to
-> "could MirrorStack break our website?" is unchanged by everything below
-> it.** Deleting it is the next step and it is a change to two repositories,
-> caller first.
+> ✅ **The record-list surface §1 is about is deleted.** `publish(records)`, the
+> `authorize` that took a caller-supplied state, and the `capabilities` and
+> `revoke` beside them are gone from the dispatcher, along with the package that
+> implemented them. Nothing routes them, so the bound below is a property of the
+> deployment rather than of one surface within it — which is the claim this
+> document could not make while both were live.
 >
 > [`../README.md`](../README.md) opens with the same status, shorter, and then
-> walks the code. [`RECORDS.md`](RECORDS.md) lists every record, on both
-> surfaces, and says which surface writes it.
+> walks the code. [`RECORDS.md`](RECORDS.md) lists every record this service can
+> write, per lane.
 
 ---
 
-## 1 · Why the record list has to go
+## 1 · Why the record list had to go
 
-Today this service takes `Publish(records)`. Every byte that reaches your zone
-comes from that list. Anchor containment bounds a record's **name** to a suffix
-of the anchor, and **nothing bounds its value**. So the private half can publish,
+This service used to take `Publish(records)`. Every byte that reached your zone
+came from that list. Anchor containment bounds a record's **name** to a suffix of
+the anchor, and **nothing bounds its value**. So the private half could publish,
 with every check here passing:
 
 ```
@@ -60,23 +53,23 @@ for your hostname — and the never-replace rule is CNAME-only, because TXT reco
 always *add*, and a certificate authority accepts any matching TXT among several
 at one owner.
 
-Reading this repository tells you **where** we can write and nothing about
-**what**. That is what the rebuild fixes.
+Reading this repository told you **where** we could write and nothing about
+**what**. That is what the rebuild fixed.
 
-There is a second defect, and it is the one everything else follows from: **the
-anchor is not proven.** The ownership TXT is inside the record set *we* publish,
-and the gate on creating a custom hostname is a public lookup for that same
-record. The proof is satisfied by our own write.
+There was a second defect, and it is the one everything else follows from: **the
+anchor was not proven.** The ownership TXT sat inside the record set *we*
+published, and the gate on creating a custom hostname was a public lookup for
+that same record. The proof was satisfied by our own write.
 
-So the change is not only "send an intent instead of a record list". It is:
+So the change was not only "send an intent instead of a record list". It is:
 
 > **The record that proves the anchor becomes one you publish, and it is
 > re-checked on every pass.**
 
-Without that, an intent API still lets a compromised private half aim this
-service at any name inside a zone you authorized — your provider's consent
-screen names the *zone*, never the subdomain — and it would claim a property it
-does not have, which is worse than today.
+Without that, an intent API would still let a compromised private half aim this
+service at any name inside a zone you authorized — your provider's consent screen
+names the *zone*, never the subdomain — and it would claim a property it does not
+have, which is worse than the surface it replaced.
 
 ---
 
@@ -99,8 +92,9 @@ they are listed together.
 On this build two of the three are not yet reachable on those terms: lane 2 is
 refused at `authorize` because nothing mints a consent acknowledgement (§4), and
 lane 3 still runs on the caller's older pasted-token path (the migration note
-below). The design is what the table describes; the status block at the top of
-this document is what runs.
+below). Both refusals now end in the manual path rather than in a weaker one. The
+design is what the table describes; the status block at the top of this document
+is what runs.
 
 Lane 3 is the one to read carefully. It is not "an app under the org's parent" —
 it is a domain someone attaches to a single app, and it must work when there is
@@ -156,11 +150,10 @@ domain, it returns you to the path everyone starts on.
 
 ## 3 · What MirrorStack can ask for
 
-These are the entry points on the intent surface — not the only entry points
-on the deployment, which still routes the legacy actions the status block names.
-Three of them register a domain, and each takes a name and an identity and
-returns the proof you must publish before anything else happens. The fourth runs
-later, per app.
+These are the entry points, and there are no others on the deployment. Three of
+them register a domain, and each takes a name and an identity and returns the
+proof you must publish before anything else happens. The fourth runs later, per
+app.
 
 **The wire action names are these**, and they are what you will see in a log,
 a trace or an IAM policy:
@@ -182,20 +175,14 @@ a trace or an IAM policy:
 | `Health` | `health`, §4 | no |
 
 So **three actions can change your zone**: `Complete`, `Advance` and
-`BindAppToOrgAppDomain`. Everything else derives, reads, seals or revokes. The
-legacy `Publish` is a fourth, and it is the one that takes its records from the
-caller.
+`BindAppToOrgAppDomain`. Everything else derives, reads, seals or revokes. This
+table is the whole of it — the four record-list actions that used to sit beside
+these are deleted, and sending one gets `unknown_action`.
 
-🔴 **`IntentAuthorize` and `IntentCapabilities` are spelled apart from the
-legacy `Authorize` and `Capabilities` deliberately, and the two pairs must never
-become aliases.** The legacy `Authorize` takes the OAuth `state` as a request
-field; this one mints it. A caller that reached the wrong one would be
-authorized with none of the checks in §4 and would receive no error saying so —
-the quietest way to lose the property this surface exists to add. Two distinct
-names turn that mistake into an `unknown_action` refusal. It is the caller's
-request *shape* that selects the weaker check, not the name it happens to be
-behind, so neither name may ever be pointed at the other implementation as a
-migration convenience.
+🔴 **`IntentAuthorize` and `IntentCapabilities` keep their prefixes.** They are
+the names on the wire, so respelling either to the shorter form the record-list
+surface used is a version skew, and it presents as `unknown_action` on every
+connect rather than as a failed build.
 
 ### `AddOrgPlatformDomain(orgId, domain)`
 
@@ -457,9 +444,6 @@ behind the same IAM-gated transport as everything else, so today it is auditable
 ## 5 · What the caller can send, in full
 
 Across every function above, the private half supplies these and nothing else.
-(Above, meaning on this surface. The legacy `publish(records)` in the status
-block takes a record list, an anchor and a target id of the caller's choosing,
-and none of the following bounds it.)
 
 | field | where | validation |
 |---|---|---|
@@ -488,9 +472,9 @@ having been thought of.
 
 ## 6 · What lands in your zone
 
-This is the intent surface. Record 1 is the one that changes hands: on the
-legacy action it is written by us, which is the second defect in §1.
-[`RECORDS.md`](RECORDS.md) gives every row on both surfaces, per lane.
+Record 1 is the one that changed hands: the record-list surface wrote it itself,
+which is the second defect in §1. [`RECORDS.md`](RECORDS.md) gives every row,
+per lane.
 
 | # | name | type | value | lane | written by |
 |---|---|---|---|---|---|
@@ -606,10 +590,9 @@ domain. Deploys keep working; they just hand you records to add instead of
 adding them.
 
 Everything else in this document is a bound we enforce on ourselves and you can
-read — with the two exceptions this file admits rather than omits: the rate
-floor, which is declared here and enforced nowhere, and the legacy record-list
-action, which none of this bounds. These two controls are different in kind:
-they are bounds *you* enforce on *us*, and we cannot read them.
+read — with the one exception this file admits rather than omits: the rate floor,
+which is declared here and enforced nowhere. These two controls are different in
+kind: they are bounds *you* enforce on *us*, and we cannot read them.
 
 ### What runs, and when, is declared here — and enforced nowhere
 

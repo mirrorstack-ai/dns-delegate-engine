@@ -10,9 +10,9 @@
 //
 // Neither envelope holds a secret. They are sealed for INTEGRITY, not
 // confidentiality: the private half already knows the org id and the domain it sent
-// us, and what is bought is that it cannot retype them. Unlike internal/grant's
-// sealed refresh token, whose AAD must name the row the ciphertext sits beside
-// (grant.GrantAAD) or a database write alone could move the credential to another
+// us, and what is bought is that it cannot retype them. Unlike the sealed refresh
+// token, whose AAD must name the registration the ciphertext sits beside
+// (intent.GrantAAD) or a database write alone could move the credential to another
 // one, this ciphertext CARRIES the identity — so there is nothing to bind it to but
 // its own type, which is what the two domain separators below are for.
 //
@@ -462,7 +462,8 @@ func decode(payload string, into any) error {
 }
 
 // noSealer is the answer when this deployment holds no keyset. A deployment can
-// legitimately be in that state (see grant.Service), so it is a refusal a caller
+// legitimately be in that state — a client and no keyset — so it is a refusal a
+// caller
 // can map onto a real outcome rather than a panic inside a Lambda. The grantcrypto
 // sentinel is carried through so "no keyset here" stays distinguishable from "this
 // envelope is wrong".

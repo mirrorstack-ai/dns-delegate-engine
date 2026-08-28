@@ -958,7 +958,6 @@ func TestTheRelayNeverImportsTheCustomerCredentialPath(t *testing.T) {
 	forbidden := []string{
 		"internal/dnsprovider", // the write interface, whose every method takes the customer's token
 		"internal/provider/",   // its adapters
-		"internal/grant",       // the surface that holds sealed customer grants
 		"internal/reconcile",   // the publisher that spends one
 	}
 	files, err := filepath.Glob("*.go")

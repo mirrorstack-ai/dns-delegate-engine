@@ -819,7 +819,7 @@ func (s *Service) Complete(ctx context.Context, req CompleteRequest) (PassRespon
 	if err != nil {
 		// The code is single-use and now spent, but no token was ever issued, so
 		// there is nothing to persist and nothing to revoke. This is the one
-		// post-boundary case that stays an RPC error, as in internal/grant.
+		// post-boundary case that stays an RPC error.
 		return PassResponse{}, fmt.Errorf("%w: exchange authorization code: %w", ErrUnavailable, err)
 	}
 	s.write(ctx, cfg, reg, token, false, write, &out)
@@ -1548,10 +1548,9 @@ func writeSnapshot(
 // hand the second a live write credential on the first's zone — by a database
 // write alone, in a store this service does not own.
 //
-// 🔴 THE LANE IS IN IT, WHICH internal/grant's VERSION HAD NO WAY TO DO. One org
-// can connect the same domain on two lanes: two consents, two ownership proofs,
-// two grants. Without the lane, a grant obtained for the wildcard lane would open
-// in the platform lane's row.
+// 🔴 THE LANE IS IN IT. One org can connect the same domain on two lanes: two
+// consents, two ownership proofs, two grants. Without the lane, a grant obtained
+// for the wildcard lane would open in the platform lane's row.
 //
 // It takes the opened Registration rather than three strings: the only way to
 // hold one is to have opened an envelope this service sealed, so a caller cannot

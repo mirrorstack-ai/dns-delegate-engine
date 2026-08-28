@@ -70,14 +70,14 @@ func TestSealOpenRoundTrip(t *testing.T) {
 // against org A's zone on org B's behalf.
 func TestOpenRefusesADifferentAAD(t *testing.T) {
 	s := sealerFor(t, "k1")
-	env, _, err := s.Seal("secret", "cf-dns-grant\x00org-A\x00dom-1\x00acme.example")
+	env, _, err := s.Seal("secret", "ms-dns-grant/v1\x00org_platform_domain\x00org-A\x00acme.example")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, wrong := range []string{
-		"cf-dns-grant\x00org-B\x00dom-1\x00acme.example", // moved between orgs
-		"cf-dns-grant\x00org-A\x00dom-2\x00acme.example", // moved between domains
-		"cf-dns-grant\x00org-A\x00dom-1\x00other.example",
+		"ms-dns-grant/v1\x00org_platform_domain\x00org-B\x00acme.example", // moved between orgs
+		"ms-dns-grant/v1\x00org_app_domain\x00org-A\x00acme.example",      // moved between lanes
+		"ms-dns-grant/v1\x00org_platform_domain\x00org-A\x00other.example",
 		"",
 	} {
 		if _, err := s.Open(env, wrong); err == nil {
