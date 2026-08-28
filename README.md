@@ -241,7 +241,8 @@ effect immediately.
 
 [`docs/DESIGN.md`](docs/DESIGN.md) describes the shape being built, where the
 loop, the derivation and the proof all move — and explains each function of the
-intent-based API that replaces the record list.
+intent-based API that replaces the record list. The diagrams above are the flow;
+that document is the contract.
 
 ---
 
