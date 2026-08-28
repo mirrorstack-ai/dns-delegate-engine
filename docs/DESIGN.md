@@ -237,6 +237,53 @@ The self-arrows are the point. Step by step this is a script; the loop is what
 makes it converge, and the re-check inside it is what makes the customer's stop
 control real rather than advisory.
 
+### The app-domain lane
+
+Same skeleton, one wildcard, and a loop with no end — which is the honest picture
+of a standing grant. The proof is separate from the console lane's, because the
+lane is inside the HMAC: authorizing a console does not authorize a wildcard.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant Console as MirrorStack console
+    participant Engine as dns-delegate-engine<br/>(this repository)
+    participant CF as Your DNS provider
+    participant Edge as MirrorStack edge
+
+    Console->>Engine: Register(org, app domain, example.app)
+    Engine-->>Console: proof TXT — a DIFFERENT value to the console lane
+    Console-->>You: publish this one TXT yourself
+
+    You->>CF: _mirrorstack-challenge.example.app
+    Console->>Engine: Authorize
+    Engine->>Engine: Verify — public DNS only
+    You->>CF: authorize (one zone)
+    CF-->>Engine: code, redeemed against the sealed state
+    Engine->>CF: *.example.app
+
+    loop every app you deploy, from now on
+        Console->>Engine: AddHost(parent, "blog")
+        Console->>Edge: create the custom hostname
+        Engine->>Engine: re-derive, and re-check the proof TXT
+        Engine->>CF: _acme-challenge.blog.example.app,<br/>_cf-custom-hostname.blog.example.app
+    end
+
+    Note over You,CF: delete the proof TXT and the loop stops
+```
+
+`AddHost` carries the one caller-chosen string that survives anywhere in this
+design: a single label under an already-proven parent. It selects **which** name,
+never **what** is written there, and it cannot spell `_acme-challenge`, `_dmarc`,
+`_domainkey`, a sibling console name, or a wildcard.
+
+Note step 2. A console proof and an app-domain proof are different values for the
+same domain, because `lane` is inside the HMAC — so a customer who proved a
+console anchor has not thereby authorized a wildcard over every name under it.
+That is a deliberate second act, and §9 argues it needs a consent surface of its
+own on top.
+
 Ordering that is genuinely forced, rather than incidental:
 
 - The custom hostname is not created until the proof TXT resolves publicly, so

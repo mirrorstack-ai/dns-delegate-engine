@@ -100,11 +100,32 @@ MirrorStack, see [`docs/RECORDS.md`](docs/RECORDS.md).
 
 ---
 
-## What actually happens when you connect a domain
+## Two lanes, and they are not the same
 
-This is today's flow, defect included. Read step 2 first: **the record list is
-chosen entirely by MirrorStack's private half**, and the only thing this service
-checks is that each name sits under your domain.
+They write different records, wait on different things, and — the part worth your
+attention — hold the credential for very different lengths of time. Read the one
+you are doing.
+
+| | platform domain | app domain |
+|---|---|---|
+| you connect | `example.com`, for your console | `example.app`, a parent for your apps |
+| routing records | one per sibling host — `account.` `api.` `apps.` `cdn.` | **one wildcard**, `*.example.app` |
+| certificate records | per host, from AWS **and** Cloudflare | per app, from Cloudflare |
+| the credential | held **24 hours**, then revoked | **standing** — see lane 2 |
+
+Both diagrams below are today's flow, defect included.
+
+---
+
+## What happens: a custom platform domain
+
+Your MirrorStack console, on a hostname you own. The record set is known up front
+and finite, so the credential is held only long enough for the two certificate
+authorities to answer.
+
+Read step 2 before anything else: **the record list is chosen entirely by
+MirrorStack's private half**, and the only thing this service checks is that each
+name sits under your domain.
 
 ```mermaid
 sequenceDiagram
@@ -139,7 +160,7 @@ sequenceDiagram
     Engine->>CF: revoke the credential
 ```
 
-Three things that diagram makes obvious, and which the rebuild changes:
+Three things this diagram makes obvious, and which the rebuild changes:
 
 - **The loop belongs to the private half.** Every re-derivation, every decision
   about what to publish next, happens where you cannot read it. This service is
@@ -151,7 +172,66 @@ Three things that diagram makes obvious, and which the rebuild changes:
   that do not exist when you authorize. That is why the credential is held rather
   than spent once, and it is not going to change.
 
-[`docs/DESIGN.md`](docs/DESIGN.md) has the same diagram for the shape being built,
+---
+
+## What happens: a custom app domain
+
+One parent, and every app you deploy gets a hostname under it. The record set is
+**not** known up front, because the apps do not exist yet — which is the whole
+reason this lane's credential behaves differently.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant Console as MirrorStack console<br/>(private)
+    participant Engine as dns-delegate-engine<br/>(this repository)
+    participant CF as Your DNS provider
+    participant Edge as MirrorStack edge
+
+    You->>Console: connect example.app as an app domain
+    Console->>Console: derive the record list
+    Console-->>You: here are the records, and their SHA-256
+
+    You->>CF: authorize (zone.read, dns.write — one zone)
+    CF-->>Engine: authorization code
+    Engine->>CF: *.example.app + _mirrorstack-challenge.example.app
+    Engine-->>Console: sealed credential, STANDING
+
+    loop every app you deploy, from now on
+        You->>Console: deploy blog
+        Console->>Edge: create the custom hostname
+        Edge-->>Console: DV challenge + ownership proof
+        Console->>Console: re-derive the record list
+        Console->>Engine: publish what is new
+        Engine->>CF: _acme-challenge.blog.example.app,<br/>_cf-custom-hostname.blog.example.app
+        Note over Engine: the credential's expiry slides forward
+    end
+
+    Note over You,CF: revoke at your provider whenever you want
+```
+
+Two differences from the platform lane that matter:
+
+- **One wildcard is all the routing you ever publish — but it is not all the
+  DNS.** `*.example.app` matches exactly one label, so it covers
+  `blog.example.app` and never `_acme-challenge.blog.example.app`. Each app still
+  owes a certificate record of its own. A wildcard *custom hostname*, which would
+  remove that, is an Enterprise-only feature on the account this runs against. It
+  is a real requirement, not a shortcut we took.
+- **The credential does not expire while you keep deploying.** That is what
+  "standing" means, and it is the honest cost of not asking you to re-authorize
+  every time you ship an app. Its expiry slides forward on each publish, so an
+  active app domain holds a live grant indefinitely. Lane 1's 24 hours has no
+  equivalent here.
+
+That is the trade to think hardest about on this repository. Three things bound
+it: the anchor — the grant can only ever reach names under the parent you
+delegated; the refusal to take over any name already in use inside it; and your
+provider's own revocation, which works whether or not we are involved and takes
+effect immediately.
+
+[`docs/DESIGN.md`](docs/DESIGN.md) has both diagrams for the shape being built,
 where the loop, the derivation and the proof all move.
 
 ---
@@ -166,18 +246,15 @@ So the credential does not live there. `api-platform` never holds a DNS provider
 token, and this service never derives what records to create. The two halves are
 split on purpose:
 
-```
-api-platform  (private)                     dns-delegate-engine  (this repo, public)
-──────────────────────────                  ─────────────────────────────────────────
-authenticates the operator                  holds the provider credential
-works out which records are needed
-                          ──── plan ───►    ✅ refuses any record outside the anchor
-                                            ✅ refuses any plan whose digest moved
-                                            ✅ creates and updates; never deletes
-                                            ✅ one bounded window, then it stops
-                                                   │
-                                                   ▼
-                                            your DNS provider
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 460}}}%%
+flowchart LR
+    P["api-platform · PRIVATE<br/><br/>authenticates the operator<br/>works out which records are needed"]
+    E["dns-delegate-engine · PUBLIC — you are reading it<br/><br/>holds the credential<br/>✅ nothing outside the anchor<br/>✅ nothing whose digest moved<br/>✅ creates and updates, never deletes<br/>✅ never takes over a name in use<br/>✅ one bounded window, then it stops"]
+    DNS["your DNS provider"]
+
+    P ==>|the plan| E
+    E ==>|writes| DNS
 ```
 
 The call only ever goes left to right. A bug — or a bad actor — on the private
@@ -210,23 +287,23 @@ happened. It never retries the write. A retry is how one record becomes two.
 
 ## Grant lifetimes
 
-There are two kinds of grant, and they are deliberately different.
+Set out per lane above, and summarised here because it is the question people
+come back for.
 
-**Platform domain** (your MirrorStack console at your own hostname) — the record
-set is known up front and finite. The grant is held for at most **24 hours**,
-long enough to cover certificate validation records that your provider has not
-published yet, and then it is released.
+| | platform domain | app domain |
+|---|---|---|
+| held for | **24 hours** | **standing** |
+| ends when | the window closes — **not** when the last record lands | you revoke, or you stop deploying for long enough |
+| why | the record set is finite and known up front | the records it exists to write are for apps that do not exist yet |
 
-**App domain** (`*.apps.yourcompany.com`, where each app you deploy gets a
-hostname) — the record set is *not* known up front, because the apps have not
-been created yet. This grant is standing: it exists so that deploying a new app
-does not require a fresh authorization each time.
+The 24-hour window is not cut short when publication finishes. A platform-domain
+grant that wrote everything on its first pass still holds the credential until
+the window closes; revoking at your provider ends it immediately, and by then
+there is nothing left to write.
 
-A standing grant is a real trade-off, and it is the one to think hardest about.
-Two things bound it: the anchor containment above — the grant can only ever reach
-names under the app domain you delegated — and your provider's own revocation,
-which works whether or not we are involved. Revoking at the provider is always
-available to you and takes effect immediately.
+Revocation at your provider always works, whether or not we are involved, and
+takes effect immediately. It is the one control here that does not depend on
+MirrorStack behaving.
 
 ---
 
