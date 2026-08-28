@@ -11,7 +11,7 @@ The shape this service is being rebuilt into: MirrorStack's private half names a
 
 ---
 
-## Why the current shape cannot answer the question
+## 1 · Why the record list has to go
 
 Today this service takes `Publish(records)`. Every byte that reaches your zone
 comes from that list. Anchor containment bounds a record's **name** to a suffix
@@ -49,7 +49,7 @@ does not have, which is worse than today.
 
 ---
 
-## The three lanes
+## 2 · Which lane you are on
 
 | | 1 · org platform domain | 2 · org app domain | 3 · each app domain |
 |---|---|---|---|
@@ -80,7 +80,44 @@ nothing beside it in that zone is reachable.
 
 ---
 
-## The intents
+### Or none of it — the manual path
+
+Every lane can be done by hand. You add the records in your own provider and
+never grant MirrorStack anything. That path has no credential, so nothing in this
+service writes on it — but the **list you are told to add comes from here all the
+same**, through `describe`.
+
+That is not a technicality, it is the point:
+
+- **One derivation, two paths.** Today the console renders its list from one
+  place in the private half and the delegated writer builds its own from another.
+  Two implementations of the same question drift, and the loose one is the one
+  that matters. After this, the records you are asked to add by hand are the same
+  bytes we would have written — because they are produced by the same function.
+- **A customer who grants nothing still gets this repository.** If you never
+  authorize, no credential of yours exists anywhere in MirrorStack, and you can
+  still read exactly what you will be asked to publish, and why each record is
+  there, before you type any of it.
+- **`describe` also reports what it observes** — present, absent, conflicting, or
+  the wrong type — so "I added it and nothing happened" has an answer that does
+  not require a support reply.
+
+So the split is by capability rather than by path:
+
+| | manual | delegated |
+|---|---|---|
+| who derives the records | this service | this service |
+| who writes them | **you** | this service, under your grant |
+| credential held | none, anywhere | one, here |
+| what a failure looks like | a record reported absent | a refusal with a reason |
+
+The delegated path is the manual path plus a credential and a writer. Nothing
+else about it differs, which is what makes revoking safe: it does not break the
+domain, it returns you to the path everyone starts on.
+
+---
+
+## 3 · What MirrorStack can ask for
 
 These are the only entry points. Three register a domain, and each takes a name
 and an identity and returns the proof you must publish before anything else
@@ -154,7 +191,7 @@ becomes a list of records and an instruction.
 
 ---
 
-## The lifecycle functions
+## 4 · What happens after you authorize
 
 The same seven for all three lanes, which is the point: one implementation, one
 set of refusals, no lane with a weaker path.
@@ -175,6 +212,13 @@ nonce.
 
 **Refuses unless `verify` passes right now.** The caller echoes the state back
 and cannot author one.
+
+On the `org_app_domain` lane it additionally refuses unless this service's own
+consent page was served and acknowledged. A wildcard is the one grant whose
+scope you cannot enumerate for yourself, so the description you act on comes
+from here rather than from a console this repository cannot vouch for. The other
+two lanes keep the console's screen: their record sets are closed and listed in
+full below.
 
 ### `complete(state, code, codeVerifier, expectDigest)`
 
@@ -222,44 +266,7 @@ readable.
 
 ---
 
-## The manual path moves here too — the derivation, not the writing
-
-Every lane can be done by hand. You add the records in your own provider and
-never grant MirrorStack anything. That path has no credential, so nothing in this
-service writes on it — but the **list you are told to add comes from here all the
-same**, through `describe`.
-
-That is not a technicality, it is the point:
-
-- **One derivation, two paths.** Today the console renders its list from one
-  place in the private half and the delegated writer builds its own from another.
-  Two implementations of the same question drift, and the loose one is the one
-  that matters. After this, the records you are asked to add by hand are the same
-  bytes we would have written — because they are produced by the same function.
-- **A customer who grants nothing still gets this repository.** If you never
-  authorize, no credential of yours exists anywhere in MirrorStack, and you can
-  still read exactly what you will be asked to publish, and why each record is
-  there, before you type any of it.
-- **`describe` also reports what it observes** — present, absent, conflicting, or
-  the wrong type — so "I added it and nothing happened" has an answer that does
-  not require a support reply.
-
-So the split is by capability rather than by path:
-
-| | manual | delegated |
-|---|---|---|
-| who derives the records | this service | this service |
-| who writes them | **you** | this service, under your grant |
-| credential held | none, anywhere | one, here |
-| what a failure looks like | a record reported absent | a refusal with a reason |
-
-The delegated path is the manual path plus a credential and a writer. Nothing
-else about it differs, which is what makes revoking safe: it does not break the
-domain, it returns you to the path everyone starts on.
-
----
-
-## What the caller can send
+## 5 · What the caller can send, in full
 
 Across every function above, the private half supplies these and nothing else:
 
@@ -280,24 +287,7 @@ having been thought of.
 
 ---
 
-## Where state lives
-
-**This service still owns no database.** Not by sealing the lifecycle, but by
-deleting it: the certificate id, the custom-hostname id and the published-record
-cursor are removed from the model and re-read from AWS, from Cloudflare and from
-your own zone on every pass.
-
-What stays sealed is a credential and a clock, both monotone-safe under replay —
-rolling one back grants no authority it did not already carry. The private half
-stores the envelopes and hands them back; it cannot author, edit or reorder one.
-
-The honest limit: a sealed envelope can be **withheld**. The private half can
-always decline to advance a domain. What it cannot do is advance one further than
-you proved.
-
----
-
-## What each lane writes
+## 6 · What lands in your zone
 
 | # | name | type | value | lane | written by |
 |---|---|---|---|---|---|
@@ -321,7 +311,7 @@ anything is asked of anyone. So it is publishable in the first pass, and it neve
 changes again: Cloudflare mints and rotates the real tokens behind it, in its own
 zone, for every future renewal.
 
-That single choice removes a whole stage from the sequence below, and it is what
+That single choice removes a whole stage from the flow, and it is what
 lets a closed lane hold a credential for 24 hours rather than forever. Cloudflare's
 DCV tokens live 7 days on Let's Encrypt and 14 on Google Trust Services; a form
 that put the token in the customer's zone would need republishing on that clock,
@@ -335,83 +325,62 @@ domain on a single app. Each is a deliberate, separate act.
 
 ---
 
-## The sequence
+## 7 · Where your credential lives
 
-Two of these records are answers from someone else that do not exist when you
-authorize. That is why this is a convergence loop rather than a script, and why
-the credential is held rather than spent once.
+**This service still owns no database.** Not by sealing the lifecycle, but by
+deleting it: the certificate id, the custom-hostname id and the published-record
+cursor are removed from the model and re-read from AWS, from Cloudflare and from
+your own zone on every pass.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor You
-    participant Console as MirrorStack
-    participant Engine as dns-delegate-engine<br/>(this repository)
-    participant CF as Your DNS provider
-    participant ACM as AWS certificate manager
-    participant Edge as MirrorStack edge
+What stays sealed is a credential and a clock, both monotone-safe under replay —
+rolling one back grants no authority it did not already carry. The private half
+stores the envelopes and hands them back; it cannot author, edit or reorder one.
 
-    Console->>Engine: org_add_custom_platform_domain(org, example.com)
-    Engine-->>Console: proof TXT + the full record list + digest
-    Console-->>You: publish this one TXT yourself
-
-    You->>CF: _mirrorstack-challenge.example.com
-    Console->>Engine: authorize
-    Engine->>Engine: verify — public DNS only
-    Engine-->>Console: consent URL + sealed state
-
-    You->>CF: authorize (zone.read, dns.write — one zone)
-    CF-->>Engine: code, redeemed against the sealed state
-    Engine->>CF: routing CNAMEs + _acme-challenge pointers
-
-    loop advance, until serving or the window closes
-        Engine->>Engine: re-derive the record set
-        Engine->>ACM: has the validation record appeared?
-        Engine->>Edge: has the custom hostname minted its proofs?
-        Engine->>CF: publish whatever is new
-        Engine->>Engine: re-check the proof TXT still resolves
-    end
-
-    Note over You,CF: delete the proof TXT and every write stops within one tick
-```
-
-The self-arrows are the point. Step by step this is a script; the loop is what
-makes it converge, and the re-check inside it is what makes your stop control
-real rather than advisory.
-
-Lane 3 has the same skeleton and the shortest run of the three: one host, no AWS
-leg, one closed record set. Only lane 2's loop does not end, because each newly
-auto-routed app owes certificate records — which is the one honest reason for a
-standing grant.
-
-Ordering that is genuinely forced, rather than incidental:
-
-- The custom hostname is not created until the proof TXT resolves publicly, so
-  record 7 cannot precede record 1.
-- Record 6 is forced by nothing. It is derived, so it goes out in the first pass
-  beside the routing records — which is the whole point of choosing the delegated
-  form over a minted token.
-- AWS returns a certificate id immediately and its validation record seconds
-  later, so a fresh host is routinely "requested, record not known yet" for the
-  first minutes of its life. That is a wait, not a fault.
+The honest limit: a sealed envelope can be **withheld**. The private half can
+always decline to advance a domain. What it cannot do is advance one further than
+you proved.
 
 ---
 
-## Still open
+## 8 · What you can stop, and what you cannot
 
-Recorded here rather than settled quietly, because each changes what you are
-agreeing to:
+Two controls, and both are yours alone.
 
-1. **The wildcard lane needs its own consent surface.** A proof per lane forces a
-   separate act, but `*.<anchor>` covers every name you have not listed, and the
-   only description of that today comes from a console this repository cannot
-   vouch for.
-2. **We re-create a record you delete.** A service with no state cannot count
-   deletions, and a counter in a sealed blob is rollback-able in the direction
-   that grants more authority. So the honest description is not "we write once
-   when you authorize" but "we hold write access and continuously enforce a
-   desired state in your zone, until you stop us."
-3. **The scheduler.** The loop body moves here; the clock that fires it does not,
-   at least at first. "The polling service is in this repository" will be true of
-   every decision the loop makes and false of when it runs, and the documentation
-   has to say which.
+**Delete the ownership proof.** Every write from this service stops within one
+tick — it is re-checked on every pass, so there is no window in which we are
+still writing and you have already said no. Nothing needs to reach MirrorStack
+for this to take effect.
+
+**Revoke at your provider.** Works whether or not we cooperate, takes effect
+immediately, and returns you to the manual path above rather than breaking the
+domain. Deploys keep working; they just hand you records to add instead of
+adding them.
+
+Everything else in this document is a bound we enforce on ourselves and you can
+read. These two are bounds you enforce on us and we cannot read.
+
+### What runs, and when, is public as well
+
+It is not enough for this repository to own every *decision* about your zone if
+the schedule that fires them lives somewhere you cannot see. The loop that
+re-derives, re-checks your proof and publishes what is missing runs from here, on
+a clock that is declared here — so "how often could MirrorStack touch my zone,
+and under what conditions" is answerable from this repository rather than from a
+support reply.
+
+### The one we have not solved
+
+**We re-create a record you delete.**
+
+A service with no state cannot count deletions, and a counter in a sealed
+envelope is rollback-able in exactly the direction that grants more authority —
+so it cannot go there. The honest description of what you are agreeing to is
+therefore not "we write once when you authorize", it is:
+
+> we hold write access to names under your anchor, and we continuously enforce a
+> desired state there until you stop us.
+
+The two controls above are the stopping. What is missing is anything narrower
+than them: there is no way today to say *leave this one name alone* without
+revoking the whole grant. If that matters to you, the manual path is the answer,
+and it is a supported one rather than a fallback.

@@ -241,7 +241,8 @@ effect immediately.
 
 [`docs/DESIGN.md`](docs/DESIGN.md) describes the shape being built, where the
 loop, the derivation and the proof all move — and explains each function of the
-intent-based API that replaces the record list.
+intent-based API that replaces the record list. The diagrams above are the flow;
+that document is the contract.
 
 ---
 
@@ -446,15 +447,18 @@ ciphertext — and this service holds the key and the OAuth client with nowhere 
 persist anything. You do not have to reason about a schema to audit what can
 reach your zone.
 
-🔴 **One correction to that, because an earlier version of this file overstated
-it.** It said MirrorStack holds the ciphertext "as ciphertext it holds no key
-for". That is a property of the **code** and not yet of the **permissions**: the
-private half's account role still has read access to both the sealing keyset and
-the OAuth client, left behind by the pre-cutover in-process path that this
-service replaced. No code uses it — the delegated path runs entirely here — but a
-granted capability is not the same as an unused one, and this repository is not
-the place to describe a permission as absent because nothing exercises it.
-Removing those grants is the outstanding half of the cutover.
+**One correction to that, because an earlier version of this file overstated it.**
+It said MirrorStack holds the ciphertext "as ciphertext it holds no key for".
+That was a property of the **code** and not of the **permissions**: the private
+half's account role also held read access to the sealing keyset and the OAuth
+client, duplicated onto it at cutover rather than moved. No code used them — the
+delegated path runs entirely here — but a granted capability is not the same as
+an unused one, and this repository is not the place to describe a permission as
+absent because nothing exercises it.
+
+Those grants are being removed, together with the fallback to the legacy path
+that needed them. Once it deploys, no private MirrorStack function can read
+either secret.
 
 ## Running the checks yourself
 
