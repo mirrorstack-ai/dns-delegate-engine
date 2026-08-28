@@ -8,13 +8,12 @@ first thing below.
 > **Status: built, and not finished.** This file described a proposal until
 > 2026-08-28 and describes the deployed surface now. Everything below is
 > implemented and dispatched: the four intents, all seven lifecycle functions,
-> `capabilities` and `health`.
+> `capabilities`, `health`, and both upstream relays. Record 7 appears on a lane
+> once that deployment names the zone it reads and holds MirrorStack's own
+> Cloudflare token; `capabilities` says, per lane, which zone that is. §6.
 >
-> Three parts do not, and each is marked where it belongs:
+> Two parts do not, and each is marked where it belongs:
 >
-> - **Record 7, Cloudflare's serving proof, is never produced by this build.**
->   The relay is written and nothing wires it, so every lane can answer 526 with
->   a certificate that reads active. §6.
 > - **Lane 2 cannot be authorized at all.** Nothing in the deployed binary mints
 >   the consent acknowledgement its `authorize` requires, so that lane is
 >   refused every time. §4.
@@ -256,11 +255,12 @@ it is validated as a single LDH label, so it cannot spell `_acme-challenge`,
 That second row is the whole reason this is one call rather than two. A customer
 who never authorized — or who revoked, which they are entitled to do at any
 moment — gets a working answer instead of an error: here are the records, add
-them, and the app comes up. (On this build that list is **one** record, not the
-two [`RECORDS.md`](RECORDS.md) shows for this lane, because record 7 is not
-produced — see the status block.) The private half does not decide which path is
-taken and cannot ask for the first one; whether a usable credential exists is a
-fact this service establishes by opening the sealed grant and refreshing it.
+them, and the app comes up. (That list is both the records
+[`RECORDS.md`](RECORDS.md) shows for this lane wherever the edge relay is
+configured for it, and only the first where it is not — §6.) The private half
+does not decide which path is taken and cannot ask for the first one; whether a
+usable credential exists is a fact this service establishes by opening the sealed
+grant and refreshing it.
 
 The same rule holds everywhere else in this document. `advance` on any lane
 degrades the same way, so losing a credential never becomes a stuck domain — it
@@ -384,7 +384,8 @@ reported as such and never guessed at, because a grant we cannot name is one a
 human has to end by hand and saying so is the only useful answer.
 
 Two more exist and write nothing: `capabilities()` (`IntentCapabilities`),
-which publishes the routing targets, the DCV delegation identifier, the declared
+which publishes the routing targets, the DCV delegation identifier in force on
+each lane and whether it was read from Cloudflare or hand-set, the declared
 cadence, the per-lane grant lifetimes and whether a lane needs a consent page —
 none of them secret, every one of them a value that ends up in your own zone or
 on your own clock — and `health()` (`Health`), which publishes the git SHA this
@@ -451,23 +452,35 @@ legacy action it is written by us, which is the second defect in §1.
 | 4 | `<hostname>` | CNAME | the app routing target | 3 | this service |
 | 5 | `_<token>.<host>` | CNAME | `….acm-validations.aws` | 1 only | relayed from AWS |
 | 6 | `_acme-challenge.<host>` | CNAME | `<host>.<uuid>.dcv.cloudflare.com` | all three | this service — **derived** |
-| 7 | `_cf-custom-hostname.<host>` | TXT | the serving proof | all three | relayed from Cloudflare — 🔴 **not produced by this build** |
+| 7 | `_cf-custom-hostname.<host>` | TXT | the serving proof | all three | relayed from Cloudflare |
 
 **Records 5 and 7 are relayed, not derived.** This service derives *that* a proof
 must exist and *why*; their bytes come from AWS and Cloudflare. "The engine
 derives the record set" is true of which proofs exist and false of every byte,
 and both halves of that belong in public.
 
-🔴 **Record 7 never appears, on any lane, on this build.** The relay exists in
-`internal/relay` and nothing wires it: it needs MirrorStack's own Cloudflare API
-token and the id of the SaaS zone the custom hostname sits in, and that zone
-differs between the org lane and the app lane while the field does not. Both
-have to be settled first. The consequence is not cosmetic — Cloudflare withholds
-routing until that TXT exists, so a lane can answer **526 while its certificate
-reads active**, which is the hardest shape of this failure to diagnose.
-[`RECORDS.md`](RECORDS.md) describes it. It is left unwired rather than faked
-because an absent row is visibly incomplete and an invented one is confidently
-wrong.
+🔴 **Record 7 is read with MirrorStack's own Cloudflare token, in MirrorStack's
+own zone, and the zone is chosen by the LANE.** The org zone and the app/SaaS
+zone are separate zones — lane 1's hostnames are CNAMEd into the first and lanes
+2 and 3 into the second, which is rows 2 through 4 above seen from the other end
+— so one zone id cannot serve three lanes. `CF_SAAS_ORG_ZONE_ID` and
+`CF_SAAS_APP_ZONE_ID` name them, the lane selects between them
+(`relay.EdgeZones`), and **a hostname never does**: inferring a zone from a
+customer's name would let the customer pick which of our zones we authenticate
+against.
+
+Both ids come back in `capabilities`, per lane, so a deployment reading lane 1
+out of the app zone is visible from outside it. That matters because the
+misconfiguration has no other symptom: the wrong zone holds no custom hostname
+for the host asked about, which is spelled exactly like a proof Cloudflare has
+not minted yet, and the host answers **526 while its certificate reads active**.
+
+The credential is MirrorStack's, not the customer's, and that is a compiler rule
+rather than a comment: `internal/shared/cfedge` gives it a defined type the
+customer's plain-string grant cannot be assigned to, and `internal/relay` imports
+neither the write interface nor any provider adapter. A deployment naming no
+zone or no token wires the reader as `nil`, and record 7 is then reported as not
+yet available rather than as an error — everything derivable is still published.
 
 **Record 6 is the exception, and it is the most consequential choice here.** It
 carries no token — it is a *pointer* at Cloudflare's delegated DCV location, and
@@ -475,6 +488,19 @@ both halves of it (the hostname you connected, a per-zone uuid) are known before
 anything is asked of anyone. So it is publishable in the first pass, and it never
 changes again: Cloudflare mints and rotates the real tokens behind it, in its own
 zone, for every future renewal.
+
+🔴 **The uuid is read from Cloudflare rather than configured.** It belongs to a
+zone — `GET /zones/{zone_id}/dcv_delegation/uuid`, under the same MirrorStack
+token record 7 is read with — so a deployment holding that credential takes it
+per lane, and `CF_ORG_DCV_DELEGATION_UUID` is the fallback for one that cannot
+ask. **When the two disagree the configured value loses and the disagreement is
+logged at ERROR**; `capabilities` reports, per lane, which source won. A hand-set
+label silently overriding the provider is how this record came to point at a name
+nobody had ever verified.
+
+What that read does *not* settle is the form around the uuid: the endpoint
+returns an identifier and no target, so whether the value carries the `<host>.`
+prefix is exactly as open as it was, and `derive.DCVTarget` says so.
 
 That single choice removes a whole stage from the flow, and it is what
 lets a closed lane hold a credential for 24 hours rather than forever. Cloudflare's

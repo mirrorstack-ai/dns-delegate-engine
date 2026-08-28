@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -14,6 +18,8 @@ import (
 	acmtypes "github.com/aws/aws-sdk-go-v2/service/acm/types"
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfedge"
 )
 
 // 🔴 NO TEST IN THIS FILE REACHES THE NETWORK, AN AWS ACCOUNT OR A CLOUDFLARE
@@ -330,13 +336,17 @@ func TestACMDescribesCertificatesWhoseSANListWasTruncated(t *testing.T) {
 	}
 }
 
+// testZones is one id per zone, deliberately unequal: a test that passed with
+// both lanes reading the same zone would prove nothing about the selection.
+var testZones = EdgeZones{OrgPlatform: "mirrorstack-org-zone", App: "mirrorstack-app-zone"}
+
 func edgeFor(t *testing.T, h http.HandlerFunc) Edge {
 	t.Helper()
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return Edge{
-		ZoneID:     "mirrorstack-saas-zone",
-		Token:      StaticToken("ms-zone-token"),
+		Zones:      testZones,
+		Token:      cfedge.Static("ms-zone-token"),
 		Base:       srv.URL,
 		HTTPClient: srv.Client(),
 	}
@@ -366,7 +376,7 @@ func TestServingProofAbsenceIsNotReadyAndNotAnError(t *testing.T) {
 		e := edgeFor(t, func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = io.WriteString(w, body)
 		})
-		record, ready, err := ServingProof(context.Background(), e, "account.example.com")
+		record, ready, err := ServingProof(context.Background(), e, lane.OrgPlatformDomain, "account.example.com")
 		if err != nil {
 			t.Fatalf("%s: want no error, got %v", name, err)
 		}
@@ -387,7 +397,7 @@ func TestServingProofReadsTheOwnershipVerificationTXT(t *testing.T) {
 		    "name":"_cf-custom-hostname.account.example.com",
 		    "value":"ac4a9a9d-0f4a-4e5e-9a3f-2f1c1b0d9e8a"}}]}`)
 	})
-	record, ready, err := ServingProof(context.Background(), e, "account.example.com")
+	record, ready, err := ServingProof(context.Background(), e, lane.OrgPlatformDomain, "account.example.com")
 	if err != nil || !ready {
 		t.Fatalf("want a ready proof, got %+v / %v / %v", record, ready, err)
 	}
@@ -410,7 +420,7 @@ func TestServingProofDoesNotTrimATrailingDotFromATXTValue(t *testing.T) {
 		  "ownership_verification":{"type":"txt",
 		    "name":"_cf-custom-hostname.account.example.com","value":"proof-value."}}]}`)
 	})
-	record, ready, err := ServingProof(context.Background(), e, "account.example.com")
+	record, ready, err := ServingProof(context.Background(), e, lane.OrgPlatformDomain, "account.example.com")
 	if err != nil || !ready {
 		t.Fatalf("want a ready proof, got %v / %v", ready, err)
 	}
@@ -429,7 +439,7 @@ func TestServingProofMatchesTheHostExactlyRatherThanTakingTheFirstResult(t *test
 		  {"hostname":"account.example.com",
 		   "ownership_verification":{"type":"txt","name":"_cf-custom-hostname.account.example.com","value":"right"}}]}`)
 	})
-	record, ready, err := ServingProof(context.Background(), e, "account.example.com")
+	record, ready, err := ServingProof(context.Background(), e, lane.OrgPlatformDomain, "account.example.com")
 	if err != nil || !ready {
 		t.Fatalf("want a ready proof, got %v / %v", ready, err)
 	}
@@ -451,7 +461,7 @@ func TestServingProofRefusesARecordThatDoesNotNameTheHost(t *testing.T) {
 			_, _ = io.WriteString(w, `{"success":true,"result":[{"hostname":"account.example.com",
 			  "ownership_verification":`+proof+`}]}`)
 		})
-		record, ready, err := ServingProof(context.Background(), e, "account.example.com")
+		record, ready, err := ServingProof(context.Background(), e, lane.OrgPlatformDomain, "account.example.com")
 		if !errors.Is(err, ErrUnexpectedRecord) {
 			t.Fatalf("%s: want ErrUnexpectedRecord, got %v", name, err)
 		}
@@ -470,7 +480,7 @@ func TestServingProofSendsTheZoneCredentialAsABearerAndNowhereElse(t *testing.T)
 		auth, target = r.Header.Get("Authorization"), r.URL.String()
 		_, _ = io.WriteString(w, `{"success":true,"result":[]}`)
 	})
-	if _, _, err := ServingProof(context.Background(), e, "account.example.com"); err != nil {
+	if _, _, err := ServingProof(context.Background(), e, lane.OrgPlatformDomain, "account.example.com"); err != nil {
 		t.Fatalf("ServingProof: %v", err)
 	}
 	if auth != "Bearer ms-zone-token" {
@@ -479,7 +489,7 @@ func TestServingProofSendsTheZoneCredentialAsABearerAndNowhereElse(t *testing.T)
 	if strings.Contains(target, "ms-zone-token") {
 		t.Fatalf("the credential must never appear in a URL, got %q", target)
 	}
-	if !strings.Contains(target, "/zones/mirrorstack-saas-zone/custom_hostnames") {
+	if !strings.Contains(target, "/zones/"+testZones.OrgPlatform+"/custom_hostnames") {
 		t.Fatalf("the read must be against MirrorStack's own zone, got %q", target)
 	}
 }
@@ -488,21 +498,23 @@ func TestServingProofSendsTheZoneCredentialAsABearerAndNowhereElse(t *testing.T)
 // not-ready it would be indistinguishable from Cloudflare being slow, forever.
 func TestServingProofRefusesToRunWithoutAZoneAndACredential(t *testing.T) {
 	for name, e := range map[string]Edge{
-		"no zone":          {Token: StaticToken("t")},
-		"no token source":  {ZoneID: "z"},
-		"an empty token":   {ZoneID: "z", Token: StaticToken("  ")},
-		"a failing source": {ZoneID: "z", Token: func(context.Context) (string, error) { return "", errors.New("secret unavailable") }},
+		"no zone for this lane": {Zones: EdgeZones{App: "z"}, Token: cfedge.Static("t")},
+		"no token source":       {Zones: testZones},
+		"an empty token":        {Zones: testZones, Token: func(context.Context) (cfedge.Token, error) { return "  ", nil }},
+		"a failing source": {Zones: testZones, Token: func(context.Context) (cfedge.Token, error) {
+			return "", errors.New("secret unavailable")
+		}},
 	} {
-		if _, ready, err := ServingProof(context.Background(), e, "account.example.com"); err == nil || ready {
+		if _, ready, err := ServingProof(context.Background(), e, lane.OrgPlatformDomain, "account.example.com"); err == nil || ready {
 			t.Fatalf("%s: want a refusal, got ready=%v err=%v", name, ready, err)
 		}
 	}
 }
 
 func TestServingProofRejectsAHostThatIsNotADNSName(t *testing.T) {
-	e := Edge{ZoneID: "z", Token: StaticToken("t")}
+	e := Edge{Zones: testZones, Token: cfedge.Static("t")}
 	for _, host := range []string{"", "   ", strings.Repeat("a", dnsplan.MaxDNSName+1)} {
-		if _, _, err := ServingProof(context.Background(), e, host); err == nil {
+		if _, _, err := ServingProof(context.Background(), e, lane.OrgPlatformDomain, host); err == nil {
 			t.Fatalf("want a refusal for %q", host)
 		}
 	}
@@ -513,7 +525,7 @@ func TestServingProofSurfacesACloudflareRefusal(t *testing.T) {
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = io.WriteString(w, `{"success":false,"errors":[{"code":9109,"message":"Unauthorized to access requested resource"}]}`)
 	})
-	_, ready, err := ServingProof(context.Background(), e, "account.example.com")
+	_, ready, err := ServingProof(context.Background(), e, lane.OrgPlatformDomain, "account.example.com")
 	if err == nil || ready {
 		t.Fatalf("a failed read of our own zone is a fault, got ready=%v err=%v", ready, err)
 	}
@@ -529,11 +541,11 @@ func TestNilAdaptersReportNotYetRatherThanFailing(t *testing.T) {
 	if err != nil || records != nil {
 		t.Fatalf("nil CertificateAuthority: want no records and no error, got %v / %v", records, err)
 	}
-	record, ready, err := ServingProof(ctx, nil, "account.example.com")
+	record, ready, err := ServingProof(ctx, nil, lane.OrgPlatformDomain, "account.example.com")
 	if err != nil || ready || record != (dnsplan.Record{}) {
 		t.Fatalf("nil EdgeHostnames: want not-ready and no error, got %+v / %v / %v", record, ready, err)
 	}
-	proofs, err := ServingProofs(ctx, nil, []string{"account.example.com"})
+	proofs, err := ServingProofs(ctx, nil, lane.OrgPlatformDomain, []string{"account.example.com"})
 	if err != nil || proofs != nil {
 		t.Fatalf("nil EdgeHostnames: want no proofs and no error, got %v / %v", proofs, err)
 	}
@@ -549,7 +561,7 @@ type stubEdge struct {
 	err   error
 }
 
-func (s stubEdge) ServingProof(_ context.Context, host string) (dnsplan.Record, bool, error) {
+func (s stubEdge) ServingProof(_ context.Context, _ lane.Lane, host string) (dnsplan.Record, bool, error) {
 	if s.err != nil {
 		return dnsplan.Record{}, false, s.err
 	}
@@ -568,7 +580,7 @@ func TestServingProofsCollectWhatIsReadyInHostOrder(t *testing.T) {
 		"account.example.com": "a", "apps.example.com": "c",
 	}}
 	hosts := []string{"account.example.com", "api.example.com", "apps.example.com"}
-	proofs, err := ServingProofs(context.Background(), edge, hosts)
+	proofs, err := ServingProofs(context.Background(), edge, lane.OrgPlatformDomain, hosts)
 	if err != nil {
 		t.Fatalf("ServingProofs: %v", err)
 	}
@@ -581,7 +593,7 @@ func TestServingProofsCollectWhatIsReadyInHostOrder(t *testing.T) {
 
 func TestServingProofsSurfaceAFailedRead(t *testing.T) {
 	edge := stubEdge{err: errors.New("cloudflare unavailable")}
-	if _, err := ServingProofs(context.Background(), edge, []string{"account.example.com"}); err == nil {
+	if _, err := ServingProofs(context.Background(), edge, lane.OrgPlatformDomain, []string{"account.example.com"}); err == nil {
 		t.Fatal("a failed read must not be reported as an empty set of proofs")
 	}
 }
@@ -652,7 +664,7 @@ func (h hostileCA) ValidationRecords(context.Context, []string) ([]dnsplan.Recor
 // hostileEdge is the same for EdgeHostnames, and always claims to be ready.
 type hostileEdge struct{ record dnsplan.Record }
 
-func (h hostileEdge) ServingProof(context.Context, string) (dnsplan.Record, bool, error) {
+func (h hostileEdge) ServingProof(context.Context, lane.Lane, string) (dnsplan.Record, bool, error) {
 	return h.record, true, nil
 }
 
@@ -731,12 +743,12 @@ func TestAHostileEdgeIsRefusedAboveTheInterface(t *testing.T) {
 			Type: "TXT", Name: ServingProofPrefix + host, Value: "proof\nlog-line-forged"},
 	} {
 		edge := hostileEdge{record: record}
-		if _, ready, err := ServingProof(context.Background(), edge, host); !errors.Is(err, ErrUnexpectedRecord) || ready {
+		if _, ready, err := ServingProof(context.Background(), edge, lane.OrgPlatformDomain, host); !errors.Is(err, ErrUnexpectedRecord) || ready {
 			t.Fatalf("%s: want ErrUnexpectedRecord, got ready=%v err=%v", name, ready, err)
 		}
 		// ServingProofs is the call internal/intent actually makes. A bound that
 		// held only on the singular form would be a bound production never runs.
-		if proofs, err := ServingProofs(context.Background(), edge, []string{host}); !errors.Is(err, ErrUnexpectedRecord) || proofs != nil {
+		if proofs, err := ServingProofs(context.Background(), edge, lane.OrgPlatformDomain, []string{host}); !errors.Is(err, ErrUnexpectedRecord) || proofs != nil {
 			t.Fatalf("%s: ServingProofs must refuse it too, got %+v / %v", name, proofs, err)
 		}
 	}
@@ -763,7 +775,7 @@ func TestAWellFormedRelayedRecordSurvivesFromAnyImplementation(t *testing.T) {
 	edge := hostileEdge{record: dnsplan.Record{
 		Type: "txt", Name: "_CF-Custom-Hostname.Account.Example.com", Value: "proof-value", Proxied: true,
 	}}
-	record, ready, err := ServingProof(ctx, edge, "account.example.com")
+	record, ready, err := ServingProof(ctx, edge, lane.OrgPlatformDomain, "account.example.com")
 	if err != nil || !ready {
 		t.Fatalf("want a ready proof, got %+v / %v / %v", record, ready, err)
 	}
@@ -790,7 +802,7 @@ func TestServingProofRefusesAResponseBodyPastTheBound(t *testing.T) {
 			}
 		}
 	})
-	_, ready, err := ServingProof(context.Background(), e, "account.example.com")
+	_, ready, err := ServingProof(context.Background(), e, lane.OrgPlatformDomain, "account.example.com")
 	if err == nil || ready {
 		t.Fatalf("want a refusal, got ready=%v err=%v", ready, err)
 	}
@@ -832,6 +844,142 @@ func TestRelayedRecordsSurviveTheNormalizerAndTheAnchor(t *testing.T) {
 		}
 		if !dnsplan.Contains("example.com", record.Name) {
 			t.Fatalf("%q must sit under the anchor", record.Name)
+		}
+	}
+}
+
+// 🔴 ONE ZONE ID CANNOT SERVE THREE LANES, AND GETTING IT WRONG IS INVISIBLE.
+// MirrorStack's org zone and its app/SaaS zone are separate, so a reader pointed
+// at one of them finds no custom hostname for the other's lanes — which is
+// spelled exactly like the ordinary "Cloudflare has not minted the proof yet".
+// The only later symptom is hosts answering 526 with a healthy certificate.
+func TestEachLaneReadsItsOwnMirrorStackZone(t *testing.T) {
+	var paths []string
+	e := edgeFor(t, func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		_, _ = io.WriteString(w, `{"success":true,"result":[]}`)
+	})
+	for _, l := range []lane.Lane{lane.OrgPlatformDomain, lane.OrgAppDomain, lane.AppDomain} {
+		if _, _, err := ServingProof(context.Background(), e, l, "account.example.com"); err != nil {
+			t.Fatalf("%s: %v", l, err)
+		}
+	}
+	want := []string{
+		"/zones/" + testZones.OrgPlatform + "/custom_hostnames",
+		"/zones/" + testZones.App + "/custom_hostnames",
+		"/zones/" + testZones.App + "/custom_hostnames",
+	}
+	if strings.Join(paths, " ") != strings.Join(want, " ") {
+		t.Fatalf("want %v, got %v", want, paths)
+	}
+	// Stated separately, because the table above would still pass if someone
+	// pointed both fields at one id: this is the claim that has to hold.
+	if paths[0] == paths[1] {
+		t.Fatalf("lane 1 and lane 2 must not read the same zone, both read %q", paths[0])
+	}
+}
+
+// The lane selects, never the hostname. An unrecognised lane and a lane this
+// deployment configured no zone for are both refusals rather than a default:
+// see EdgeZones.ForLane.
+func TestForLaneRefusesRatherThanDefaulting(t *testing.T) {
+	if _, err := testZones.ForLane(lane.Lane("org_platform_domain ")); err == nil {
+		t.Fatal("an unrecognised lane must not resolve to a zone")
+	}
+	if _, err := (EdgeZones{App: "z"}).ForLane(lane.OrgPlatformDomain); err == nil {
+		t.Fatal("a lane with no configured zone must be refused, not read out of the other one")
+	}
+	if (EdgeZones{}).Configured() || !(EdgeZones{App: "z"}).Configured() {
+		t.Fatal("Configured must report whether any zone is named")
+	}
+}
+
+// 🔴 AN UNCONFIGURED EDGE IS A WAIT, NOT A FAULT. A deployment holding no
+// MirrorStack credential must publish everything it derives and report record 7
+// as not yet available; reporting a fault would put a warning on every pass of a
+// deployment nobody had finished configuring, forever.
+func TestAnUnconfiguredEdgeIsNotReadyRatherThanAnError(t *testing.T) {
+	// The reader must not reach Cloudflare at all with no credential.
+	unreachable := edgeFor(t, func(http.ResponseWriter, *http.Request) {
+		t.Error("an unconfigured edge must not make a request")
+	})
+	unreachable.Token = cfedge.Static("")
+
+	for name, edge := range map[string]EdgeHostnames{
+		// The shape cmd/dns-delegate-api wires when nothing is configured.
+		"nothing wired at all":  nil,
+		"a token nobody filled": unreachable,
+	} {
+		record, ready, err := ServingProof(context.Background(), edge, lane.AppDomain, "example.org")
+		if err != nil || ready || record != (dnsplan.Record{}) {
+			t.Fatalf("%s: want not-ready and no error, got %+v / %v / %v", name, record, ready, err)
+		}
+		proofs, err := ServingProofs(context.Background(), edge, lane.AppDomain, []string{"example.org"})
+		if err != nil || len(proofs) != 0 {
+			t.Fatalf("%s: want no proofs and no error, got %v / %v", name, proofs, err)
+		}
+	}
+}
+
+// 🔴 THE CUSTOMER'S GRANT IS NEVER SENT TO A MIRRORSTACK ZONE. Sending it would
+// widen what that grant is used for past what the consent screen described, and
+// it is the one credential in this service that a customer did not choose to
+// hand over for this.
+func TestTheEdgeSendsMirrorStacksOwnTokenAndNothingElse(t *testing.T) {
+	const customerGrant = "customer-delegated-grant-value"
+	var sent []string
+	e := edgeFor(t, func(w http.ResponseWriter, r *http.Request) {
+		for _, values := range r.Header {
+			sent = append(sent, values...)
+		}
+		sent = append(sent, r.URL.String())
+		_, _ = io.WriteString(w, `{"success":true,"result":[]}`)
+	})
+	if _, _, err := ServingProof(context.Background(), e, lane.OrgPlatformDomain, "account.example.com"); err != nil {
+		t.Fatalf("ServingProof: %v", err)
+	}
+	if !slices.Contains(sent, "Bearer ms-zone-token") {
+		t.Fatalf("the edge must authenticate as MirrorStack, sent %q", sent)
+	}
+	// The customer's grant has no parameter, field or header to arrive through;
+	// this is the assertion that no future one is added quietly.
+	for _, part := range sent {
+		if strings.Contains(part, customerGrant) {
+			t.Fatalf("a customer credential reached MirrorStack's zone in %q", part)
+		}
+	}
+}
+
+// The other half of that claim, and the half a runtime test cannot make: this
+// package must not be able to reach the customer-credential path at all. The
+// comment on edgeAPIBase says the property is checkable by reading the imports;
+// this checks them.
+func TestTheRelayNeverImportsTheCustomerCredentialPath(t *testing.T) {
+	forbidden := []string{
+		"internal/dnsprovider", // the write interface, whose every method takes the customer's token
+		"internal/provider/",   // its adapters
+		"internal/grant",       // the surface that holds sealed customer grants
+		"internal/reconcile",   // the publisher that spends one
+	}
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, imported := range parsed.Imports {
+			for _, bad := range forbidden {
+				if strings.Contains(imported.Path.Value, bad) {
+					t.Fatalf("%s imports %s: this package reads MirrorStack's zones with MirrorStack's own "+
+						"credential and must have no way to reach a customer's", file, imported.Path.Value)
+				}
+			}
 		}
 	}
 }

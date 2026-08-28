@@ -576,8 +576,11 @@ func TestConfigValidateAcceptsTheDeployedShape(t *testing.T) {
 	if err := testConfig().Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
-	if err := ConfigFromEnv().Validate(); err == nil {
-		t.Fatalf("ConfigFromEnv with no CF_ORG_DCV_DELEGATION_UUID must not validate")
+	// The delegation identifier is per ZONE, so it is ValidateLane's business
+	// rather than Validate's: a deployment may hold the app zone's and not the
+	// org zone's and still serve lane 3 perfectly.
+	if err := ConfigFromEnv().ValidateLane(lane.OrgPlatformDomain); err == nil {
+		t.Fatalf("ConfigFromEnv with no delegation identifier must not validate a lane")
 	}
 }
 
@@ -590,10 +593,6 @@ func TestConfigValidateRefusesAnIncompleteDeployment(t *testing.T) {
 		"org target is not a name": func(c *Config) { c.OrgRoutingTarget = "connect" },
 		"no app routing target":    func(c *Config) { c.AppRoutingTarget = "" },
 		"app target is not a name": func(c *Config) { c.AppRoutingTarget = "*.example.com" },
-		"no dcv uuid":              func(c *Config) { c.DCVDelegationUUID = "" },
-		"blank dcv uuid":           func(c *Config) { c.DCVDelegationUUID = "  " },
-		"dotted dcv uuid":          func(c *Config) { c.DCVDelegationUUID = "abc.def" },
-		"dcv uuid with underscore": func(c *Config) { c.DCVDelegationUUID = "abc_def" },
 		"no reserved suffixes":     func(c *Config) { c.ReservedSuffixes = nil },
 		"empty reserved suffixes":  func(c *Config) { c.ReservedSuffixes = []string{} },
 		"a reserved entry that is nothing": func(c *Config) {
@@ -626,7 +625,8 @@ func TestConfigValidateRefusesAnIncompleteDeployment(t *testing.T) {
 // changing one fails a build rather than quietly repointing every customer zone
 // derived by this deployment.
 func TestConfigFromEnvDefaultsAndOverrides(t *testing.T) {
-	for _, key := range []string{orgRoutingTargetEnv, appRoutingTargetEnv, dcvDelegationUUIDEnv, reservedSuffixesEnv} {
+	for _, key := range []string{orgRoutingTargetEnv, appRoutingTargetEnv,
+		dcvDelegationUUIDOrgEnv, dcvDelegationUUIDAppEnv, dcvDelegationUUIDLegacyEnv, reservedSuffixesEnv} {
 		t.Setenv(key, "")
 		_ = os.Unsetenv(key)
 	}
@@ -642,7 +642,8 @@ func TestConfigFromEnvDefaultsAndOverrides(t *testing.T) {
 
 	t.Setenv(orgRoutingTargetEnv, "edge.example.com")
 	t.Setenv(appRoutingTargetEnv, "edge.example.net")
-	t.Setenv(dcvDelegationUUIDEnv, "  "+testUUID+"  ")
+	t.Setenv(dcvDelegationUUIDOrgEnv, "  "+testUUID+"  ")
+	t.Setenv(dcvDelegationUUIDAppEnv, "  "+testUUID+"  ")
 	t.Setenv(reservedSuffixesEnv, "one.example.org, two.example.org;three.example.org four.example.org")
 	c = ConfigFromEnv()
 	if c.OrgRoutingTarget != "edge.example.com" || c.AppRoutingTarget != "edge.example.net" {
@@ -844,7 +845,7 @@ func TestDCVItemRefusesAnUnrepresentableTarget(t *testing.T) {
 		{"a target over the DNS wire limit", "account." + deepAnchor, testUUID, false},
 	}
 	for _, tc := range cases {
-		item, err := dcvItem(tc.host, tc.uuid)
+		item, err := dcvItem(lane.OrgPlatformDomain, tc.host, tc.uuid)
 		assertRefused(t, err, "dcvItem "+tc.name)
 		if errors.Is(err, ErrConfig) != tc.config {
 			t.Fatalf("%s: wrong audience for the refusal: %v", tc.name, err)
@@ -906,5 +907,99 @@ func TestAnAnchorThatCannotCarryTheProofIsRefusedOnEveryLane(t *testing.T) {
 		if !strings.Contains(err.Error(), proof.Prefix) {
 			t.Fatalf("%s: the refusal does not name the challenge label that does not fit: %v", l, err)
 		}
+	}
+}
+
+// 🔴 THE IDENTIFIER IS PER ZONE, AND ONE VARIABLE FOR BOTH IS A GUESS ABOUT ONE
+// OF THEM.
+//
+// Cloudflare answers GET /zones/{zone_id}/dcv_delegation/uuid per zone. Lane 1
+// lives in the org zone and lanes 2 and 3 in the app zone, so a deployment given
+// one value has it right for at most one lane — and a wrong identifier aims
+// record 6 at a namespace Cloudflare never writes to, which resolves perfectly
+// and validates never. That is the same failure the missing hostname label
+// caused, one label further along.
+func TestTheDelegationIdentifierIsSelectedPerZone(t *testing.T) {
+	c := Config{DCVDelegationUUID: "orgzone", DCVDelegationUUIDApp: "appzone"}
+	if got := c.DCVUUID(lane.OrgPlatformDomain); got != "orgzone" {
+		t.Errorf("lane 1 must use the org zone identifier, got %q", got)
+	}
+	for _, l := range []lane.Lane{lane.OrgAppDomain, lane.AppDomain} {
+		if got := c.DCVUUID(l); got != "appzone" {
+			t.Errorf("%s must use the app zone identifier, got %q", l, got)
+		}
+	}
+}
+
+// An unmigrated deployment set only the single variable that used to cover both
+// zones. It keeps working — refusing would take connect down on a config change
+// nobody made — and dcvUUIDFor warns, because the value is right for at most one
+// of the two.
+func TestTheLegacySingleVariableStillServesBothZones(t *testing.T) {
+	for _, key := range []string{dcvDelegationUUIDOrgEnv, dcvDelegationUUIDAppEnv} {
+		t.Setenv(key, "")
+		_ = os.Unsetenv(key)
+	}
+	t.Setenv(dcvDelegationUUIDLegacyEnv, testUUID)
+	c := ConfigFromEnv()
+	for _, l := range []lane.Lane{lane.OrgPlatformDomain, lane.OrgAppDomain, lane.AppDomain} {
+		if got := c.DCVUUID(l); got != testUUID {
+			t.Errorf("%s fell back to %q", l, got)
+		}
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("an unmigrated deployment must still validate: %v", err)
+	}
+}
+
+// A deployment that can derive lane 1 and not lane 2 reports success and then
+// fails on the lane it was not asked about, so Validate checks both zones and
+// names the variable an operator has to set.
+func TestValidateRefusesAZoneWithNoIdentifier(t *testing.T) {
+	c := Config{
+		OrgRoutingTarget: testOrgTarget, AppRoutingTarget: testAppTarget,
+		DCVDelegationUUID: testUUID, ReservedSuffixes: platformSuffixes,
+	}
+	// Both present via fallback: fine.
+	if err := c.ValidateLane(lane.OrgAppDomain); err != nil {
+		t.Fatalf("the org identifier must serve both until one is set: %v", err)
+	}
+	// An app identifier that is not a label must be refused BY NAME.
+	c.DCVDelegationUUIDApp = "not.a.label"
+	err := c.ValidateLane(lane.OrgAppDomain)
+	if err == nil {
+		t.Fatal("a dotted app identifier must be refused")
+	}
+	if !strings.Contains(err.Error(), dcvDelegationUUIDAppEnv) {
+		t.Fatalf("the refusal must name the variable to fix, got %v", err)
+	}
+}
+
+// The identifier cases that used to live in Validate's table. They moved with
+// the check itself: it is per zone, so it needs the lane.
+func TestValidateLaneRefusesAnUnusableIdentifier(t *testing.T) {
+	cases := map[string]string{
+		"empty":            "",
+		"blank":            "  ",
+		"dotted":           "abc.def",
+		"with underscore":  "abc_def",
+		"a wildcard":       "*",
+		"a leading hyphen": "-abc",
+	}
+	for name, uuid := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := testConfig()
+			c.DCVDelegationUUID = uuid
+			c.DCVDelegationUUIDApp = uuid
+			err := c.ValidateLane(lane.OrgPlatformDomain)
+			assertRefused(t, err, "ValidateLane")
+			if !errors.Is(err, ErrConfig) {
+				t.Fatalf("a configuration refusal must wrap ErrConfig: %v", err)
+			}
+			// And no entry point derives anything under it.
+			if _, derr := c.Registration(lane.OrgPlatformDomain, testIdentity, orgAnchor, testProof); derr == nil {
+				t.Fatal("Registration derived a plan under an unusable identifier")
+			}
+		})
 	}
 }

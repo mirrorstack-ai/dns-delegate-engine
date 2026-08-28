@@ -37,6 +37,7 @@ import (
 	"strings"
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 )
 
 // ErrUnexpectedRecord means an upstream handed back something this service will
@@ -116,16 +117,31 @@ type CertificateAuthority interface {
 // 🔴 THIS READ USES MIRRORSTACK'S OWN ZONE CREDENTIAL, NEVER THE CUSTOMER'S
 // GRANT. The custom hostname lives in OUR zone, and sending the customer's token
 // there would widen what that grant is used for beyond what the consent screen
-// described. The two are separate variables in separate packages for that reason:
-// the customer's token is a per-call argument in internal/dnsprovider, and nothing
-// in this package accepts one.
+// described. The customer's token is a plain string, a per-call argument in
+// internal/dnsprovider; this path takes a cfedge.Token, a defined type no string
+// variable is assignable to.
+//
+// 🔴 THE LANE IS A PARAMETER BECAUSE THE ZONE IS PER LANE. MirrorStack's org
+// zone and its app/SaaS zone are separate, so a reader with one zone id serves
+// at most one lane; see EdgeZones. It travels through the interface rather than
+// being fixed per instance so a caller cannot hold the wrong reader for a lane.
 //
 // Record 7 is the SECOND, SEPARATE proof, read by the edge rather than by a
 // certificate authority; see ServingProof in edge.go for what its absence looks
 // like from outside. The implementation decides what it FOUND, the free
 // ServingProof what may be published.
 type EdgeHostnames interface {
-	ServingProof(ctx context.Context, host string) (record dnsplan.Record, ready bool, err error)
+	ServingProof(ctx context.Context, l lane.Lane, host string) (record dnsplan.Record, ready bool, err error)
+}
+
+// EdgeZoneReporter is an EdgeHostnames that can name the zones it reads.
+//
+// Optional, and asserted for rather than required: it exists so
+// IntentCapabilities publishes the zone ids ACTUALLY in use instead of a second
+// read of the same environment variables, which is the copy that drifts. A fake
+// in a test implements EdgeHostnames alone and reports no zones, truthfully.
+type EdgeZoneReporter interface {
+	EdgeZones() EdgeZones
 }
 
 // ValidationRecords reads record 5 through ca for the given hosts, and bounds
@@ -205,14 +221,15 @@ func ValidationRecords(ctx context.Context, ca CertificateAuthority, hosts []str
 	return out, nil
 }
 
-// ServingProof reads record 7 through edge for one host, and bounds the record
-// it hands back. A nil edge reports not-ready, for the same reason a nil
-// CertificateAuthority reports no records.
+// ServingProof reads record 7 through edge for one host on one lane, and bounds
+// the record it hands back. A nil edge reports not-ready, for the same reason a
+// nil CertificateAuthority reports no records — and it is how an unconfigured
+// deployment answers, so a missing credential is a wait rather than a fault.
 //
 // 🔴 A NOT-READY ANSWER PUBLISHES NOTHING, WHATEVER IT CAME BACK CARRYING. The
 // zero record is returned rather than the upstream's, so "ready" is the only door
 // a relayed record comes through.
-func ServingProof(ctx context.Context, edge EdgeHostnames, host string) (dnsplan.Record, bool, error) {
+func ServingProof(ctx context.Context, edge EdgeHostnames, l lane.Lane, host string) (dnsplan.Record, bool, error) {
 	if edge == nil {
 		return dnsplan.Record{}, false, nil
 	}
@@ -220,7 +237,7 @@ func ServingProof(ctx context.Context, edge EdgeHostnames, host string) (dnsplan
 	if host == "" || len(host) > dnsplan.MaxDNSName {
 		return dnsplan.Record{}, false, fmt.Errorf("relay: %q is not a DNS name", host)
 	}
-	record, ready, err := edge.ServingProof(ctx, host)
+	record, ready, err := edge.ServingProof(ctx, l, host)
 	if err != nil || !ready {
 		return dnsplan.Record{}, false, err
 	}
@@ -241,13 +258,13 @@ func ServingProof(ctx context.Context, edge EdgeHostnames, host string) (dnsplan
 // per-host readiness map — a record that is not ready is simply not in the plan
 // yet. Host order is preserved, for the digest's sake, and it goes through the free
 // ServingProof rather than the interface so the bounds apply on the real path.
-func ServingProofs(ctx context.Context, edge EdgeHostnames, hosts []string) ([]dnsplan.Record, error) {
+func ServingProofs(ctx context.Context, edge EdgeHostnames, l lane.Lane, hosts []string) ([]dnsplan.Record, error) {
 	if edge == nil {
 		return nil, nil
 	}
 	out := make([]dnsplan.Record, 0, len(hosts))
 	for _, host := range hosts {
-		record, ready, err := ServingProof(ctx, edge, host)
+		record, ready, err := ServingProof(ctx, edge, l, host)
 		if err != nil {
 			return nil, err
 		}

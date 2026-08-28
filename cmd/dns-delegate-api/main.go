@@ -40,6 +40,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
@@ -56,6 +57,7 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/relay"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/sealed"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/auth"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfedge"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfoauth"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/config"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
@@ -416,6 +418,9 @@ func main() {
 	// Cloudflare is the first provider. A second is an adapter beside it plus a
 	// selector here; every safety rule stays in reconcile.
 	publisher := reconcile.Publisher{Provider: cloudflare.Client{}}
+	// The two reads that spend MirrorStack's own Cloudflare token, off one zone
+	// table and one loader.
+	edge, delegation := edgeReaders()
 
 	// How public DNS is read, and how much a positive reading is worth. The
 	// default is the container's single recursive resolver — this service's
@@ -459,17 +464,8 @@ func main() {
 			Reach:    reach,
 
 			Certificates: certificateAuthority(context.Background()),
-
-			// 🔴 Edge — record 7, Cloudflare's serving proof — IS NOT WIRED, AND
-			// THIS IS A KNOWN GAP RATHER THAN A DECISION. relay.Edge needs
-			// MirrorStack's OWN Cloudflare API token, for which there is no
-			// loader here, and the SaaS zone id, which differs between the org
-			// lane and the app lane while this field does not.
-			//
-			// Nil is supported, not a failure: everything derivable is still
-			// published and record 7 never appears — visibly incomplete rather
-			// than confidently wrong. docs/RECORDS.md § serving names the
-			// consequence: every lane can land in 526-with-a-healthy-certificate.
+			Edge:         edge,
+			Delegation:   delegation,
 		},
 	}
 
@@ -523,6 +519,53 @@ func certificateAuthority(ctx context.Context) relay.CertificateAuthority {
 		return nil
 	}
 	return ca
+}
+
+// The two MirrorStack zones record 7 is read from, one per lane. Named beside
+// CF_SAAS_ORG_TARGET and CF_SAAS_TARGET in internal/derive, because they are the
+// same two zones seen from the other end: a lane's routing target is a name IN
+// the zone its custom hostnames live in.
+const (
+	edgeOrgZoneEnv = "CF_SAAS_ORG_ZONE_ID"
+	edgeAppZoneEnv = "CF_SAAS_APP_ZONE_ID"
+)
+
+// edgeReaders wires the two reads that use MirrorStack's OWN Cloudflare token —
+// record 7's serving proof, and record 6's DCV delegation identifier — or
+// returns nils.
+//
+// 🔴 NIL IS THE UNCONFIGURED ANSWER, AND IT IS A WAIT RATHER THAN A FAULT. A
+// deployment that names no edge token, or no zone for any lane, publishes
+// everything it can derive: record 7 is reported as not yet available and record
+// 6 falls back to CF_ORG_DCV_DELEGATION_UUID — visibly incomplete rather than
+// confidently wrong, and never an error on a pass. A deployment that names a
+// token it cannot READ is the other case, and internal/shared/cfedge keeps the
+// two apart.
+//
+// Both readers take the same zone table and the same credential: one Cloudflare
+// account, two reads. Nils are returned as untyped nil, never as a typed nil
+// pointer, which is non-nil through an interface and would fail every pass.
+//
+// Not gated on config.IsLambda, unlike certificateAuthority: that gate exists
+// because relay.NewACM falls back to an ambient AWS account with no variable set
+// at all, and reading here takes an explicit CF_EDGE_TOKEN_SECRET_ID or
+// CF_EDGE_API_TOKEN.
+func edgeReaders() (relay.EdgeHostnames, relay.DCVDelegations) {
+	zones := relay.EdgeZones{
+		OrgPlatform: strings.TrimSpace(os.Getenv(edgeOrgZoneEnv)),
+		App:         strings.TrimSpace(os.Getenv(edgeAppZoneEnv)),
+	}
+	if !zones.Configured() || !cfedge.Configured() {
+		slog.Info("dns-delegate-api: the edge reads are not wired, so the serving proof will be "+
+			"reported as not yet available and the DCV delegation identifier will be the configured one",
+			"zones", zones.Configured(), "credential", cfedge.Configured())
+		return nil, nil
+	}
+	// The loader is its own, not shared with the OAuth and keyset loaders: it
+	// reads a different secret, and it is the one credential in this binary that
+	// is MirrorStack's rather than a customer's.
+	token := cfedge.NewDefaultLoader().Token
+	return relay.Edge{Zones: zones, Token: token}, relay.NewDCV(zones, token)
 }
 
 // lambdaHandler answers both the RPC envelope and the API-Gateway health probe
