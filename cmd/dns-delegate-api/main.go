@@ -2,37 +2,32 @@
 //
 // Two transports, one dispatcher:
 //
-//   - lambda.Invoke (production): payload is the {action, request} RPC
-//     envelope; response is the {ok, response | error} envelope.
-//   - HTTP (local dev): a small mux on DNS_DELEGATE_API_PORT (default 8093),
-//     gated by X-MS-Internal-Secret on every route except /healthz.
-//
-// Auth contract:
-//
-//   - Production: IAM gates lambda.Invoke. This service is NOT exposed through
-//     API Gateway; api-platform invokes it by alias-qualified ARN.
-//   - Local HTTP: X-MS-Internal-Secret, fail-closed (empty secret → 503).
+//   - lambda.Invoke (production): the {action, request} RPC envelope in, the
+//     {ok, response | error} envelope out. IAM gates the invoke; this service is
+//     NOT exposed through API Gateway, and api-platform reaches it by
+//     alias-qualified ARN.
+//   - HTTP (local dev): a mux on DNS_DELEGATE_API_PORT (default 8093), gated by
+//     X-MS-Internal-Secret on every route except /healthz, fail-closed (empty
+//     secret → 503).
 //
 // # Two surfaces, one binary, and the older one is on its way out
 //
-// The INTENT surface (internal/intent) is the one this repository is built
-// around: a caller names a domain and an intent, and cannot name a DNS record at
-// all. Every byte that reaches a customer's zone is derived in internal/derive
-// or relayed verbatim from AWS or Cloudflare in internal/relay, and the anchor
-// is proven by a TXT record the CUSTOMER publishes, re-checked on every pass
-// that writes.
-//
-// The GRANT surface (internal/grant) is the record-list API that preceded it:
-// Authorize / Publish / Revoke, where the caller supplies the records. It closes
-// neither of the two defects docs/DESIGN.md §1 describes — containment bounds a
-// record's NAME and nothing bounds its VALUE, and the ownership proof was a
-// record we published, gated on a public lookup of that same record.
+// The INTENT surface (internal/intent) is what this repository is built around:
+// a caller names a domain and an intent and cannot name a DNS record at all,
+// every byte reaching a customer's zone is derived in internal/derive or relayed
+// verbatim from AWS or Cloudflare in internal/relay, and the anchor is proven by
+// a TXT record the CUSTOMER publishes, re-checked on every pass that writes. The
+// GRANT surface (internal/grant) is the record-list API that preceded it —
+// Authorize / Publish / Revoke, caller-supplied records — and closes neither of
+// the two defects docs/DESIGN.md §1 describes: nothing bounds a record's VALUE,
+// and the ownership proof was a record we published, gated on a lookup of that
+// same write.
 //
 // 🔴 IT IS RETAINED ANYWAY, AND DELETING IT IS NOT A CLEANUP. api-platform calls
-// Health, Capabilities, Authorize, Publish and Revoke today. Removing or
+// Health, Capabilities, Authorize, Publish and Revoke today; removing or
 // renaming any of them takes production down, so the intent actions were added
 // BESIDE them rather than over them. Each deprecated case below names the intent
-// action that replaces it; the retirement happens when the caller has moved, and
+// action that replaces it. The retirement happens when the caller has moved, and
 // it is a change to two repositories, in that order.
 package main
 
@@ -73,14 +68,13 @@ type rpcEnvelope struct {
 	Request json.RawMessage `json:"request"`
 }
 
-// errUnknownAction is returned for an action this build does not implement. It
-// is deliberately distinct from a transport failure: api-platform's client maps
-// it to a hard error, never to a retry, so a version skew fails loudly instead
-// of hammering the engine.
+// errUnknownAction is returned for an action this build does not implement,
+// deliberately distinct from a transport failure: api-platform's client maps it
+// to a hard error, never a retry, so a version skew fails loudly.
 var errUnknownAction = errors.New("unknown action")
 
-// errInvalidInput is a malformed request payload, distinct from any refusal the
-// grant service itself makes.
+// errInvalidInput is a malformed request payload, distinct from any refusal a
+// service itself makes.
 var errInvalidInput = errors.New("invalid request payload")
 
 type dispatcher struct {
@@ -90,68 +84,54 @@ type dispatcher struct {
 	intents *intent.Service
 }
 
-// 🔴 THREE ACTION NAMES ARE LOAD-BEARING, AND EACH IS A CONSTANT SO THE REASON
-// TRAVELS WITH THE NAME RATHER THAN WITH A LINE IN A SWITCH.
+// Three action names are load-bearing, and each is a constant so the reason
+// travels with the name rather than with a line in a switch.
 
 // actionIntentAuthorize is "IntentAuthorize", and it must NEVER become an alias
-// of the legacy "Authorize".
-//
-// Legacy Authorize takes the OAuth state as a REQUEST FIELD. A caller-minted
-// state is one the caller can also mint for a registration it is not holding,
-// and the completing call then has to be handed the identity, the lane and the
-// domain as separate fields — a pair of requests that can be made to disagree.
-//
-// This one mints the state itself, as a sealed envelope carrying the lane, the
-// identity, the anchor and a nonce, so Complete needs none of them as fields. It
-// also refuses unless the ownership proof resolves RIGHT NOW, and, on the
-// wildcard lane, unless this service's own consent page was acknowledged.
-//
-// A caller reaching the wrong one would be authorized with none of those checks
-// and would get no error saying so — a silent downgrade. Two distinct names turn
-// that mistake into an `unknown_action` refusal. So neither name may be pointed
-// at the other implementation, and in particular "Authorize" must not be
-// re-routed here as a migration convenience: the caller's REQUEST SHAPE selects
-// the weaker check, not the action name it sits behind.
+// of the legacy "Authorize". Legacy Authorize takes the OAuth state as a REQUEST
+// FIELD — one the caller can mint for a registration it is not holding — and
+// Complete is then handed identity, lane and domain as separate fields that can
+// be made to disagree. This one mints the state itself, sealed over lane,
+// identity, anchor and nonce, and refuses unless the ownership proof resolves
+// RIGHT NOW and, on the wildcard lane, unless the consent page was acknowledged.
+// A caller reaching the wrong one gets none of those checks and no error saying
+// so; two names make that an `unknown_action` refusal instead. So neither name
+// may point at the other implementation, "Authorize" least of all as a migration
+// convenience: the REQUEST SHAPE selects the weaker check, not the action name.
 //
 // 🔴 LANE 2 CANNOT BE AUTHORIZED ON THIS TRANSPORT — A KNOWN GAP, NOT A DECISION.
 // The wildcard lane additionally needs a consent.Token minted under this
 // deployment's keyset, and nothing in this binary mints one: /consent renders the
-// page and stops there. A caller cannot mint one either, which is the point of a
-// MAC under a key that never leaves here. So this action refuses org_app_domain
-// with `consent_required` on every deployment of this build. Refusing is the safe
-// end of the failure; minting an acknowledgement somewhere the customer was not
-// is the claim-with-nothing-behind-it the consent page exists to replace.
+// page and stops. A caller cannot mint one either — the point of a MAC under a
+// key that never leaves here — so this action refuses org_app_domain with
+// `consent_required` on every deployment of this build. Refusing is the safe end
+// of the failure; minting an acknowledgement somewhere the customer was not is
+// the claim-with-nothing-behind-it the consent page exists to replace.
 const actionIntentAuthorize = "IntentAuthorize"
 
 // actionIntentCapabilities is named on the same rule, for a hazard of the same
-// shape. It answers a strictly LARGER response than legacy "Capabilities" — the
-// two routing targets, the DCV identifier, the declared cadence, the per-lane
-// grant lifetimes, and whether each lane needs a consent page — and a client
-// decoding one into the other's struct would not fail. It would read
-// Available:false and render no connect affordance, which looks exactly like a
-// deployment that cannot offer delegated DNS.
-//
-// It publishes the routing targets and the DCV identifier deliberately. None is
-// a secret: every one ends up in a customer's own zone as the VALUE of a record
-// we ask them to accept, and publishing them is what lets somebody check, BEFORE
-// authorizing anything, that the CNAME they are about to be asked for is the one
-// this repository derives.
+// shape: it answers a strictly LARGER response than legacy "Capabilities"
+// (docs/DESIGN.md §4 lists it), and a client decoding one into the other's
+// struct would not fail — it would read Available:false and render no connect
+// affordance, indistinguishable from a deployment that cannot offer delegated
+// DNS. Publishing the routing targets and the DCV identifier is deliberate: none
+// is a secret, every one ends up in a customer's own zone as the VALUE of a
+// record we ask them to accept, and publishing them lets somebody check BEFORE
+// authorizing that the CNAME they will be asked for is the one this repository
+// derives.
 const actionIntentCapabilities = "IntentCapabilities"
 
-// actionPublish is the deprecated record-list action, and it is where defect 1
-// lives: it bounds WHERE we write and nothing bounds WHAT.
+// actionPublish is the deprecated record-list action, and where defect 1 lives:
+// it bounds WHERE we write and nothing bounds WHAT.
 //
 // 🔴 WHILE IT IS ROUTED, THE SURFACE AS A WHOLE IS NOT BOUNDED. What MirrorStack
 // can put in a customer's zone is the UNION of what the intent surface derives
-// and whatever record list the private half hands to this one — so an audit has
-// to read both halves, and the weaker half decides. It also takes the ANCHOR as
-// a request field, so its reach is the whole zone the provider authorized rather
-// than the domain the customer connected.
-//
-// Deleting it is what turns the bound into a property of the DEPLOYMENT rather
-// than of the intent surface, and it is the next step. "Complete" is what
-// api-platform moves to; the retirement is a change to two repositories in the
-// order the package doc gives, caller first.
+// and whatever record list the private half hands to this one, so an audit has
+// to read both halves and the weaker one decides. It also takes the ANCHOR as a
+// request field, so its reach is the whole zone the provider authorized rather
+// than the domain the customer connected. Deleting it is what turns the bound
+// into a property of the DEPLOYMENT rather than of the intent surface, and it is
+// the next step; "Complete" is what api-platform moves to.
 const actionPublish = "Publish"
 
 // handler is one action, already bound to its service and its request type.
@@ -163,20 +143,19 @@ type route struct {
 
 	// writes records that this action can reach a customer's zone.
 	//
-	// 🔴 DATA RATHER THAN A COMMENT, BECAUSE "WHICH ACTIONS CAN CHANGE MY ZONE"
-	// IS THE FIRST QUESTION A READER HAS AND A COMMENT DRIFTS FROM THE TABLE IT
-	// DESCRIBES. TestTheWritingActionsAreExactlyTheDeclaredSet pins it.
+	// 🔴 DATA RATHER THAN A COMMENT: "which actions can change my zone" is the
+	// first question a reader has, and a comment drifts from the table it
+	// describes. TestTheWritingActionsAreExactlyTheDeclaredSet pins it.
 	writes bool
 
-	// deprecated marks the record-list surface. Every one of these is LIVE:
-	// api-platform calls them today and not one line of their behaviour changed.
+	// deprecated marks the record-list surface. Not one line of its behaviour
+	// changed when this table replaced the switch.
 	deprecated bool
 }
 
-// routes is the whole wire surface, in one place. A reader tracing what this
-// service can be asked to do reads this table and nothing else.
-//
-// `writes` is derived from each action's response type, not declared — see on().
+// routes is the whole wire surface. A reader tracing what this service can be
+// asked to do reads this table and nothing else; `writes` is derived from each
+// action's response type — see on().
 var routes = map[string]route{
 	// Observation. Writes nothing, needs no credential.
 	"Health": reads((*dispatcher).handleHealth),
@@ -202,7 +181,6 @@ var routes = map[string]route{
 	actionIntentCapabilities: reads((*dispatcher).handleIntentCapabilities),
 
 	// ─── the deprecated record-list surface ─────────────────────────────────
-	// Every one of these is LIVE: api-platform calls them today.
 	"Capabilities": deprecate(reads((*dispatcher).handleGrantCapabilities)),
 	"Authorize":    deprecate(on(grants, (*grant.Service).Authorize)),
 	actionPublish:  deprecate(writesToAZone(on(grants, (*grant.Service).Publish))),
@@ -211,20 +189,15 @@ var routes = map[string]route{
 
 // writesToAZone marks the one action whose writing is INVISIBLE IN ITS TYPE.
 //
-// 🔴 THAT IT NEEDS MARKING AT ALL IS THE POINT. Every intent action that reaches
-// a customer's zone says so by returning intent.PassResponse. This one returns
-// grant.PublishResponse and is the only route in the table whose blast radius a
-// reader cannot get from its signature — which is exactly the property that made
-// the record-list surface worth replacing.
+// 🔴 THAT IT NEEDS MARKING AT ALL IS THE POINT. Every intent action reaching a
+// customer's zone says so by returning intent.PassResponse. This one returns
+// grant.PublishResponse and is the only route whose blast radius a reader cannot
+// get from its signature — the property that made the record-list surface worth
+// replacing.
 func writesToAZone(r route) route { r.writes = true; return r }
 
-// surface is one of the two RPC surfaces: how to reach it off the dispatcher,
-// and the sentinel it answers when this deployment has not wired it.
-//
-// It is a struct rather than a func returning (svc, error) because the sentinel
-// is a property of the SURFACE, not the result of a lookup — a signature
-// returning a non-nil error on its success path reads as "this failed" to every
-// Go reader and every linter.
+// surface is one of the two RPC surfaces: how to reach it off the dispatcher and
+// the sentinel it answers unwired. See decodeAnd for why it is per-surface.
 type surface[Svc any] struct {
 	get         func(*dispatcher) *Svc
 	unavailable error
@@ -241,14 +214,10 @@ var (
 	}
 )
 
-// on binds one service method into a route. See decodeAnd for why the sentinel
-// travels with the surface.
-//
-// 🔴 IT DERIVES `writes` FROM THE RESPONSE TYPE RATHER THAN TAKING IT AS A FLAG.
-// intent.PassResponse is returned by exactly the actions that can reach a
-// customer's zone and by nothing else — Service.write takes one in its signature
-// — so the compiler already tracks the fact, and a hand-set boolean would only
-// be a second place to keep it. An intent action added later is classified
+// on binds one service method into a route, deriving `writes` from the response
+// type rather than taking a flag: intent.PassResponse is returned by exactly the
+// actions that can reach a customer's zone and nothing else — Service.write
+// takes one in its signature — so an intent action added later is classified
 // correctly without anyone remembering to say so.
 func on[Svc any, Req any, Res any](
 	sf surface[Svc],
@@ -292,9 +261,8 @@ func (d *dispatcher) handleIntentCapabilities(ctx context.Context, _ json.RawMes
 }
 
 // handleGrantCapabilities answers a ZERO VALUE rather than a sentinel when the
-// surface is not wired, and that is the legacy contract rather than an oversight:
-// a console reading Available:false renders no connect affordance, where an error
-// would render a failure. Unchanged from before this table existed.
+// surface is not wired — the legacy contract, not an oversight: Available:false
+// renders no connect affordance, where an error renders a failure.
 func (d *dispatcher) handleGrantCapabilities(ctx context.Context, _ json.RawMessage) (any, error) {
 	if d.grants == nil {
 		return grant.CapabilitiesResponse{}, nil
@@ -306,23 +274,20 @@ func (d *dispatcher) handleGrantCapabilities(ctx context.Context, _ json.RawMess
 // errInvalidInput, never the action's own failure vocabulary: the caller must be
 // able to tell "you sent nonsense" from "the provider refused".
 //
-// 🔴 IT PASSES THE INVOCATION'S CONTEXT, NOT context.Background().
+// 🔴 IT PASSES THE INVOCATION'S CONTEXT, NOT context.Background(). An earlier
+// version substituted Background, so the Lambda deadline never reached the
+// provider call: a write that outran it was killed with its HTTP request still
+// in flight, leaving the caller a transport failure that said nothing about
+// whether Cloudflare had applied it. With the real context the request is
+// cancelled a moment earlier and returns an error
+// cloudflare.Client.IsAmbiguous classifies — that classifier failing TOWARD
+// ambiguous for anything not a decoded API error — so reconcile re-reads rather
+// than guessing.
 //
-// An earlier version substituted Background here, which meant the Lambda
-// deadline never reached the provider call. A write that outran the deadline was
-// killed with its HTTP request still in flight, and the caller was left with a
-// transport failure carrying nothing about whether Cloudflare had applied it.
-// With the real context the request is cancelled a moment earlier and returns an
-// error cloudflare.Client.IsAmbiguous classifies — and that classifier fails
-// TOWARD ambiguous for anything which is not a decoded API error — so reconcile
-// re-reads rather than guessing. "Never retry an ambiguous write, re-read
-// instead" is only enforceable when the ambiguity is visible.
-//
-// unavailable is the calling surface's OWN not-wired sentinel rather than one
-// shared value, because errorCode derives the caller's contract from it: handing
-// back grant's sentinel from an intent action would produce a correct code by
-// luck instead of by construction, and would stop being correct the moment the
-// two vocabularies diverge.
+// unavailable is the calling surface's OWN not-wired sentinel, not one shared
+// value, because errorCode derives the caller's contract from it: grant's
+// sentinel returned from an intent action would be correct by luck, and would
+// stop being correct the moment the two vocabularies diverge.
 func decodeAnd[Svc any, Req any, Res any](
 	ctx context.Context,
 	payload json.RawMessage,
@@ -345,67 +310,54 @@ func decodeAnd[Svc any, Req any, Res any](
 
 // commit is the git SHA this binary was built from. .github/workflows/publish.yml
 // stamps it with `-X main.commit=$GITHUB_SHA` at the one build that produces a
-// deployed artifact; every other build leaves it at the default below.
-//
-// 🔴 EVERY OTHER CLAIM IN THIS REPOSITORY RESTS ON IT. Containment at the
-// anchor, a provider interface with no delete, record values derived rather
-// than accepted: each of those is a fact about SOURCE. A reader can only carry
-// one across to the service actually holding their credential if they can tell
-// that the code they read is the code answering them. Without a commit on this
-// surface there is no step from "I audited this repository" to "this is what
-// holds my credential", and every property here degrades from checkable to
-// merely stated.
+// deployed artifact; every other build leaves it at the default below. It is
+// what turns "I read this repository" into "this is the revision holding my
+// credential" (docs/DESIGN.md §4): containment at the anchor, a provider
+// interface with no delete, values derived rather than accepted are all facts
+// about SOURCE, and none carries across without it.
 //
 // 🔴 AN UNSTAMPED BUILD SAYS "unknown" AND NEVER SOMETHING PLAUSIBLE. No zero
 // sha, no "dev", no build timestamp dressed up as a version. A well-formed but
-// wrong answer is worse than none: it is a value somebody looks up, fails to
-// find, and then either writes off the whole surface over or — far worse —
-// matches against the wrong tree and audits code that is not running. "unknown"
-// is checkable and true, and it is what a local `make run` reports.
+// wrong answer is worse than none: somebody looks it up, fails to find it, and
+// either writes off the whole surface or — far worse — matches the wrong tree
+// and audits code that is not running. "unknown" is checkable and true, and it
+// is what a local `make run` reports.
 //
-// 🔴 AND IT IS PUBLISHED ON AN INTERNAL SURFACE, NOT A PUBLIC ONE. Health is
-// reached by IAM-gated lambda.Invoke in production and behind the internal
-// secret locally, so today it is MirrorStack's own operators and the private
-// half that can read this, not a customer's developer directly. That makes the
-// deployment auditable by whoever is asked; it does not yet make it
-// self-serve-auditable by the customer. Publishing it on the unauthenticated
-// gateway probe is a separate decision and this file deliberately does not take
-// it.
+// It is published on an INTERNAL surface, not a public one: Health is reached by
+// IAM-gated lambda.Invoke in production and behind the internal secret locally,
+// so today it is auditable on request rather than by a customer's developers
+// unaided. Publishing it on the unauthenticated gateway probe is a separate
+// decision this file does not take.
 var commit = "unknown"
 
 type healthResponse struct {
 	OK bool `json:"ok"`
-	// Commit is the build stamp above. It is reported on every answer, healthy
-	// or not: a deployment that is refusing traffic is exactly when somebody
-	// needs to know which code is doing the refusing.
+	// Commit is the build stamp above, reported on every answer, healthy or not:
+	// a deployment refusing traffic is when somebody most needs to know which
+	// code is doing the refusing.
 	Commit string `json:"commit"`
-	// Delegation reports whether this deployment can actually offer delegated
-	// DNS: "ready" (client and keyset), "no-keyset" (client only — grants can be
-	// published but not held), or "unconfigured".
+	// Delegation reports whether this deployment can offer delegated DNS: "ready"
+	// (client and keyset), "no-keyset" (client only — grants can be published but
+	// not held), or "unconfigured".
 	Delegation string `json:"delegation"`
 }
 
 // health is the arming check for a deploy. It resolves the credentials the same
 // way a real request does — through the runtime loaders, so a secret filled in
-// after this Lambda started counts — without contacting the provider. It also
-// publishes the deployed commit, which is what docs/DESIGN.md §4 means by every
-// other property here being verifiable rather than merely readable; see the
-// `commit` var for why an unstamped build must say so.
+// after this Lambda started counts — without contacting the provider, and
+// publishes the deployed commit (see the `commit` var).
 //
-// It reads whichever surface is wired, preferring the intent one. Both surfaces
-// resolve the same two credentials from the same two loaders, so today that
-// branch is a no-op and the answers are identical. It exists for the day the
-// deprecated service is deleted: without it, removing d.grants would
-// leave a perfectly healthy deployment answering "unconfigured", and
-// mirrorstack-infra's health check would read the service as down. A retirement
-// that presents as an outage is the kind of thing that gets rolled back and
-// blamed on the wrong change.
+// It reads whichever surface is wired, preferring the intent one. Both resolve
+// the same two credentials from the same loaders, so today that branch is a
+// no-op; it exists for the day the deprecated service is deleted, when removing
+// d.grants would otherwise leave a healthy deployment answering "unconfigured"
+// and mirrorstack-infra's health check reading the service as down.
 //
-// A derivation configuration that is incomplete is deliberately NOT reported
-// here. It is a real fault and it belongs in IntentCapabilities, which says
-// exactly what is missing; failing the health check over it would take a
-// deployment out of rotation for a capability the live caller does not yet use —
-// the same reason "no-keyset" is a healthy state rather than a failing one.
+// An incomplete derivation configuration is deliberately NOT reported here. It
+// is a real fault, but it belongs in IntentCapabilities, which says exactly what
+// is missing; failing health over it would take a deployment out of rotation for
+// a capability the live caller does not yet use — the same reason "no-keyset" is
+// healthy rather than failing.
 func (d *dispatcher) health(ctx context.Context) healthResponse {
 	var available, canHold bool
 	switch {
@@ -429,13 +381,13 @@ func (d *dispatcher) health(ctx context.Context) healthResponse {
 func main() {
 	// One OAuth loader and one keyset loader, SHARED by both surfaces. They
 	// cache on a TTL and re-read their secret when it expires, so a credential
-	// rotated after this Lambda started is picked up without a redeploy — and
-	// sharing them is what stops the two surfaces from disagreeing about which
-	// credential is current while one of them is being retired.
+	// rotated after this Lambda started is picked up without a redeploy; sharing
+	// them stops the two surfaces disagreeing about which credential is current
+	// while one is being retired.
 	oauth := cfoauth.NewDefaultLoader()
 	keys := grantcrypto.NewDefaultLoader()
-	// Cloudflare is the first provider. A second one is an adapter beside it
-	// plus a selector here; every safety rule stays in reconcile.
+	// Cloudflare is the first provider. A second is an adapter beside it plus a
+	// selector here; every safety rule stays in reconcile.
 	publisher := reconcile.Publisher{Provider: cloudflare.Client{}}
 
 	d := &dispatcher{
@@ -446,28 +398,24 @@ func main() {
 			Publisher: publisher,
 			Derive:    derive.ConfigFromEnv(),
 
-			// Wired explicitly and never defaulted inside the package.
-			// internal/intent gives the reason: a package-level default would
-			// mean a test that forgot to supply a fake silently resolved real
-			// names, and "no test needs a network" has to be enforced by
-			// something other than discipline. A binary is the one place that
-			// may say yes.
+			// Wired explicitly, never defaulted inside the package: a
+			// package-level default would mean a test that forgot a fake
+			// silently resolved real names. A binary is the one place that may
+			// say yes.
 			Resolver: observe.NetResolver{},
 
 			Certificates: certificateAuthority(context.Background()),
 
 			// 🔴 Edge — record 7, Cloudflare's serving proof — IS NOT WIRED, AND
-			// THIS IS A KNOWN GAP RATHER THAN A DECISION.
+			// THIS IS A KNOWN GAP RATHER THAN A DECISION. relay.Edge needs
+			// MirrorStack's OWN Cloudflare API token, for which there is no
+			// loader here, and the SaaS zone id, which differs between the org
+			// lane and the app lane while this field does not.
 			//
-			// relay.Edge needs MirrorStack's OWN Cloudflare API token and the
-			// zone id of the SaaS zone the custom hostname sits in. There is no
-			// loader for that token in this repository, and the zone differs
-			// between the org lane and the app lane while this field does not.
-			// Both have to be settled before it can be filled in.
-			//
-			// Nil is a supported state, not a failure: internal/intent publishes
-			// everything it can derive and record 7 simply never appears, which
-			// is visibly incomplete rather than confidently wrong.
+			// Nil is supported, not a failure: everything derivable is still
+			// published and record 7 never appears — visibly incomplete rather
+			// than confidently wrong. docs/RECORDS.md § serving names the
+			// consequence: every lane can land in 526-with-a-healthy-certificate.
 		},
 	}
 
@@ -490,36 +438,30 @@ func main() {
 }
 
 // certificateAuthority wires the ACM relay — record 5, the certificate
-// validation CNAMEs that lane 1 relays verbatim from AWS — or says why it did
-// not.
+// validation CNAMEs lane 1 relays verbatim from AWS — or says why it did not.
 //
-// 🔴 IT IS WIRED IN LAMBDA ONLY, AND THAT IS A SAFETY RULE RATHER THAN A
-// CONVENIENCE. relay.NewACM with an empty region falls back to whatever the
-// process's ambient AWS configuration resolves. Inside Lambda that is the
-// deployment's own execution role and region, which is exactly right. On a
-// developer's laptop it is whatever account their shell happens to be logged
-// into, and a local `make run` would quietly start listing certificates out of
-// it.
+// 🔴 IT IS WIRED IN LAMBDA ONLY, A SAFETY RULE RATHER THAN A CONVENIENCE.
+// relay.NewACM with an empty region falls back to the process's ambient AWS
+// configuration: inside Lambda that is the deployment's own execution role and
+// region, but on a laptop it is whatever account the shell is logged into, and a
+// local `make run` would quietly start listing certificates out of it.
 //
-// A nil return is supported rather than fatal, and the reason is the same one
-// internal/intent gives for treating a relay failure as a warning: record 6 —
-// the DCV pointer — is DERIVED here and is what gets the CLOUDFLARE EDGE
-// certificate issued, so a lane still gets TLS at the edge while ACM is
-// unreadable. Lane 1's AWS certificate does not validate until record 5 is
-// relayed, and until then that lane is served at the edge and is not complete.
-// Refusing to start over an unreadable relay would couple that slow path to the
-// fast one and leave every domain unrouted over a permission problem on our
-// side. The failure is logged at Error precisely because the alternative —
-// wiring a reader pointed at the wrong region — answers "no records, no error",
-// which is indistinguishable from an ACM that has not filled them in yet, and
-// would sit that way forever.
+// A nil return is supported rather than fatal. Record 6, the DCV pointer, is
+// DERIVED here and is what gets the Cloudflare edge certificate issued
+// (docs/RECORDS.md § certificate), so a lane still gets TLS at the edge while
+// ACM is unreadable; lane 1's AWS certificate does not validate until record 5
+// is relayed, and until then that lane is served at the edge and incomplete.
+// Refusing to start would couple that slow path to the fast one and leave every
+// domain unrouted over a permission problem on our side. The failure is logged
+// at Error because the alternative — a reader pointed at the wrong region —
+// answers "no records, no error", indistinguishable from an ACM that has not
+// filled them in yet, and would sit that way forever.
 func certificateAuthority(ctx context.Context) relay.CertificateAuthority {
 	if !config.IsLambda() {
 		return nil
 	}
-	// MS_ACM_REGION is an override for the case where the certificates do not
-	// live in the function's own region. Empty is the normal case and resolves
-	// to the execution environment's.
+	// MS_ACM_REGION overrides the case where the certificates do not live in the
+	// function's own region. Empty is normal: the execution environment's.
 	ca, err := relay.NewACM(ctx, os.Getenv("MS_ACM_REGION"))
 	if err != nil {
 		slog.Error("dns-delegate-api: certificate relay not wired, so lane 1 will publish "+
@@ -530,12 +472,10 @@ func certificateAuthority(ctx context.Context) relay.CertificateAuthority {
 }
 
 // lambdaHandler answers both the RPC envelope and the API-Gateway health probe
-// that mirrorstack-infra maps onto this same function.
-//
-// The two are told apart by "rawPath": API Gateway payload format 2.0 always
-// sets it and the RPC envelope never does. The probe returns a static 200
-// without touching the dispatcher, so a health check can never be read as an
-// authenticated RPC call.
+// mirrorstack-infra maps onto this same function. They are told apart by
+// "rawPath": API Gateway payload format 2.0 always sets it and the RPC envelope
+// never does. The probe returns a static 200 without touching the dispatcher, so
+// a health check can never be read as an authenticated RPC call.
 func (d *dispatcher) lambdaHandler(ctx context.Context, payload json.RawMessage) (any, error) {
 	var probe struct {
 		RawPath string `json:"rawPath"`
@@ -557,11 +497,11 @@ func (d *dispatcher) lambdaHandler(ctx context.Context, payload json.RawMessage)
 	response, err := d.dispatch(ctx, envelope.Action, envelope.Request)
 	if err != nil {
 		code := errorCode(err)
-		// The error is returned INSIDE the envelope, not as the Lambda
-		// function error: a function error is indistinguishable from a
-		// transport failure at the caller, and this service's client must be
-		// able to tell "the engine refused" from "the engine was unreachable".
-		// Getting that wrong destroys a working customer credential.
+		// The error is returned INSIDE the envelope, not as the Lambda function
+		// error: at the caller a function error is indistinguishable from a
+		// transport failure, and the client must be able to tell "the engine
+		// refused" from "the engine was unreachable". Getting that wrong
+		// destroys a working customer credential.
 		return httputil.Envelope{OK: false, Error: &httputil.Error{Code: code, Message: err.Error()}}, nil
 	}
 	return httputil.Envelope{OK: true, Response: response}, nil
@@ -590,28 +530,26 @@ func (d *dispatcher) httpHandler(secret string) http.Handler {
 
 // serveConsent renders the wildcard lane's consent page, for LOCAL DEVELOPMENT.
 //
-// 🔴 IT RENDERS; IT DOES NOT ACKNOWLEDGE. There is no POST here and no
-// consent.Token minted anywhere on this route. Being shown the page and agreeing
-// to it are two events, and collapsing them would mean everything holding the
-// internal secret — the private half included — held a customer's agreement to a
-// standing wildcard without a customer having read a word of it. What this route
-// is for is READING the page: the sentences a customer acts on live in
-// internal/consent, and whoever edits them should be able to look at the result.
+// 🔴 IT RENDERS; IT DOES NOT ACKNOWLEDGE. No POST, and no consent.Token minted
+// anywhere on this route. Being shown the page and agreeing to it are two
+// events; collapsing them would mean everything holding the internal secret —
+// the private half included — held a customer's agreement to a standing wildcard
+// without a customer having read a word of it. The route exists for READING the
+// page, whose sentences live in internal/consent.
 //
-// 🔴 BEING BEHIND THE INTERNAL SECRET IS WHAT MAKES IT NOT THE CUSTOMER'S PATH.
-// A customer's browser sends no such header. In production this Lambda has no
-// API Gateway route at all and the page is proxied by the private half; this
-// file deliberately adds no wiring for that.
+// Being behind the internal secret is what makes it not the customer's path: a
+// customer's browser sends no such header. In production this Lambda has no API
+// Gateway route at all and the page is proxied by the private half; this file
+// deliberately adds no wiring for that.
 //
 // 🔴 THE PAGE'S REFERENCE IS NOT A QUERY PARAMETER AND MUST NOT BECOME ONE. The
-// only input this route takes is the sealed registration; the reference an
-// acknowledgement would be MACed over comes out of that envelope. A reference
-// supplied on the URL is a value the requester chooses, which makes it a pair
-// they hold both halves of: one agreement, given once by one customer on one
-// screen, would then satisfy every later authorization on that anchor forever.
-// internal/sealed's Registration.ConsentNonce carries that reasoning in full.
-// Adding `?nonce=` back here would reintroduce the replay silently, because a
-// page rendered against a chosen reference looks exactly like a correct one.
+// only input is the sealed registration; the reference an acknowledgement would
+// be MACed over comes out of that envelope. A reference supplied on the URL is
+// one the requester chooses, so they hold both halves of the pair, and one
+// agreement given once on one screen would satisfy every later authorization on
+// that anchor forever. Adding `?nonce=` back reintroduces that replay silently.
+// docs/DESIGN.md §5 and internal/sealed's Registration.ConsentNonce carry the
+// reasoning in full.
 func (d *dispatcher) serveConsent(w http.ResponseWriter, r *http.Request) {
 	if d.intents == nil {
 		http.Error(w, "the intent surface is not wired in this build", http.StatusServiceUnavailable)
@@ -632,22 +570,21 @@ func (d *dispatcher) serveConsent(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, intent.ErrInvalidRequest), errors.Is(err, consent.ErrConsent):
 			status = http.StatusBadRequest
 		}
-		// Safe to echo, and checked rather than assumed: ConsentPage opens an
-		// envelope, computes a proof and derives a plan, and reaches no DNS
-		// provider on any path — so no refusal here can be carrying a provider
-		// response body, which httputil.Error warns can quote zone contents.
-		// http.Error writes text/plain with X-Content-Type-Options: nosniff, so a
-		// message quoting a caller-supplied domain cannot be sniffed as markup.
+		// Safe to echo, checked rather than assumed: ConsentPage opens an
+		// envelope, computes a proof and derives a plan, reaching no DNS provider
+		// on any path — so no refusal here carries a provider response body,
+		// which httputil.Error warns can quote zone contents. http.Error writes
+		// text/plain with nosniff, so a message quoting a caller-supplied domain
+		// cannot be sniffed as markup.
 		http.Error(w, err.Error(), status)
 		return
 	}
 
 	// The page loads nothing: no script, no external stylesheet, no font, no
-	// image — one inline <style> and that is all. internal/consent asserts that
-	// in a test; this header is what makes a BROWSER enforce it, so an edit that
-	// adds a remote asset breaks visibly here instead of quietly widening what a
-	// customer's consent screen depends on. Whatever proxies the page in
-	// production is responsible for sending its own.
+	// image — one inline <style>. internal/consent asserts that in a test; this
+	// header makes a BROWSER enforce it, so an edit adding a remote asset breaks
+	// visibly here instead of quietly widening what a customer's consent screen
+	// depends on. Whatever proxies the page in production sends its own.
 	w.Header().Set("Content-Security-Policy",
 		"default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; base-uri 'none'")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -665,22 +602,20 @@ func (d *dispatcher) serveConsent(w http.ResponseWriter, r *http.Request) {
 //
 // 🔴 THE CALLER ACTS ON THESE. `unavailable`, `invalid_request`, `not_proven`,
 // `consent_required` and `state_expired` all mean NOTHING WAS CONSUMED; a plan
-// refusal means the plan is wrong and retrying it cannot help. Anything
+// refusal means the plan is wrong and retrying cannot help. Anything
 // unrecognised falls through to `internal`, which the caller must treat as a
-// retry — never as a reason to release a grant. That default is the reason this
-// function stays conservative: a refusal mapped too specifically tells a caller
-// to give up on a domain that was never the problem, and the only failure worse
-// than a wasted pass is a working customer credential thrown away.
+// retry, never as a reason to release a grant. Hence the conservatism: a refusal
+// mapped too specifically tells a caller to give up on a domain that was never
+// the problem, and the only failure worse than a wasted pass is a working
+// customer credential thrown away.
 //
-// 🔴 ORDER IS LOAD-BEARING, AND NOTHING ENFORCES IT BUT THE TESTS.
-//
-// Several sentinels below are reachable while ALSO matching a broader case
-// further down — sealed.ErrExpired travels inside intent.ErrInvalidRequest,
-// dnsplan.ErrAnchorEscape wraps dnsplan.ErrPlanInvalid, and derive.ErrConfig
-// wraps derive.ErrDerive. Moving one beneath its general form breaks no build
-// and throws no error: it just quietly answers a coarser code, which is how a
-// caller ends up showing "this is a bug" to a customer whose only problem is
-// that their consent screen went stale.
+// 🔴 ORDER IS LOAD-BEARING, AND NOTHING ENFORCES IT BUT THE TESTS. Several
+// sentinels below are reachable while ALSO matching a broader case further down
+// — sealed.ErrExpired travels inside intent.ErrInvalidRequest,
+// dnsplan.ErrAnchorEscape wraps dnsplan.ErrPlanInvalid, derive.ErrConfig wraps
+// derive.ErrDerive. Moving one beneath its general form breaks no build and
+// throws no error; it quietly answers a coarser code, which is how a caller ends
+// up showing "this is a bug" to a customer whose consent screen went stale.
 func errorCode(err error) string {
 	switch {
 	case errors.Is(err, errUnknownAction):
@@ -689,41 +624,38 @@ func errorCode(err error) string {
 	// ── the specific refusals, before the general ones that carry them ──
 
 	case errors.Is(err, sealed.ErrExpired):
-		// The ten-minute authorization window closed. Nothing was consumed and
-		// nothing is broken: the customer simply took longer than ten minutes on
-		// the provider's own screen. internal/intent keeps this sentinel intact
-		// inside ErrInvalidRequest for exactly this boundary to find, because
-		// "start again" and "this is a bug" are different screens.
+		// The ten-minute authorization window closed: nothing consumed, nothing
+		// broken, the customer just took longer on the provider's own screen.
+		// internal/intent keeps this sentinel intact inside ErrInvalidRequest for
+		// this boundary to find — "start again" and "this is a bug" are
+		// different screens.
 		return "state_expired"
 
 	case errors.Is(err, intent.ErrNotProven):
 		// The ownership TXT does not resolve at the anchor right now. The request
 		// is well formed; what is missing is a record in somebody else's zone, so
-		// the caller shows the value to publish rather than an error. It is
-		// deliberately not a kind of invalid_request — a caller that could only
-		// tell the two apart by reading a message would eventually show the wrong
-		// one.
+		// the caller shows the value to publish rather than an error. Not a kind
+		// of invalid_request: a caller telling the two apart only by reading a
+		// message would eventually show the wrong one.
 		return "not_proven"
 
 	case errors.Is(err, intent.ErrConsentRequired):
-		// The wildcard lane, without an acknowledged consent page. Also not a
-		// bug: the customer has not been shown, or has not agreed to, the one
-		// grant whose scope they cannot enumerate for themselves.
+		// The wildcard lane without an acknowledged consent page. Also not a bug:
+		// the customer has not been shown, or has not agreed to, the one grant
+		// whose scope they cannot enumerate.
 		return "consent_required"
 
-	// derive.ErrConfig WRAPS derive.ErrDerive, so the narrower test comes first
-	// — the same ordering internal/intent's deriveError makes, for the same
-	// reason. An incomplete routing configuration is an OPERATOR's problem, and
-	// reporting it to the caller as a bad request would have it give up
-	// permanently on a domain that was never at fault.
+	// derive.ErrConfig WRAPS derive.ErrDerive, so the narrower test comes first —
+	// the ordering internal/intent's deriveError makes. An incomplete routing
+	// configuration is an OPERATOR's problem; reported as a bad request it would
+	// have the caller give up permanently on a blameless domain.
 	case errors.Is(err, derive.ErrConfig):
 		return "unavailable"
 	case errors.Is(err, derive.ErrDerive):
 		return "invalid_request"
 
-	// dnsplan.ErrAnchorEscape wraps dnsplan.ErrPlanInvalid; the specific code
-	// must win. A containment failure is the one refusal in this service an
-	// operator greps for by name.
+	// dnsplan.ErrAnchorEscape wraps dnsplan.ErrPlanInvalid; the specific code must
+	// win. A containment failure is the one refusal an operator greps for by name.
 	case errors.Is(err, dnsplan.ErrAnchorEscape):
 		return "anchor_escape"
 	case errors.Is(err, dnsplan.ErrPlanChanged):
@@ -738,11 +670,10 @@ func errorCode(err error) string {
 	case errors.Is(err, errInvalidInput),
 		errors.Is(err, grant.ErrInvalidRequest),
 		errors.Is(err, intent.ErrInvalidRequest),
-		// lane.ErrInvalid is what every identity, domain and slug refusal wraps.
-		// It arrives already inside intent.ErrInvalidRequest today; naming it
-		// keeps the answer right if a future path returns one bare, and it can
-		// only ever refine `internal` into a code that is unambiguously the
-		// request's fault.
+		// lane.ErrInvalid wraps every identity, domain and slug refusal, and
+		// arrives inside intent.ErrInvalidRequest today. Naming it keeps the
+		// answer right if a future path returns one bare, and can only refine
+		// `internal` into a code unambiguously the request's fault.
 		errors.Is(err, lane.ErrInvalid):
 		return "invalid_request"
 

@@ -30,9 +30,9 @@ import (
 )
 
 // oauthLoader and keyLoader are the two credential sources, as interfaces so a
-// test drives them without AWS. They are per-request rather than per-process:
-// the loaders re-read their secret on a TTL, so a credential filled in or
-// rotated after this Lambda started is picked up without a redeploy.
+// test drives them without AWS. They are per-request: the loaders re-read their
+// secret on a TTL, so a credential filled in or rotated after this Lambda started
+// is picked up without a redeploy.
 type oauthLoader interface {
 	Config(ctx context.Context) *cfoauth.Config
 }
@@ -47,8 +47,6 @@ type keyLoader interface {
 // COMMENT. dnsprovider.Provider also has CreateRecord and PatchRecord; this
 // interface does not, so no future edit to Orphans can reach a write without
 // first widening a type declaration that says, in its name, that it must not be.
-// The same trick is why reconcile takes a dnsplan.Snapshot rather than a record
-// slice: make the unsafe thing unrepresentable at the call site.
 type zoneReader interface {
 	FindZone(ctx context.Context, token, name string) (zoneID string, err error)
 	ListRecordsAt(ctx context.Context, token, zoneID, name string) ([]dnsprovider.LiveRecord, error)
@@ -58,40 +56,35 @@ type zoneReader interface {
 // Service is the intent RPC implementation.
 //
 // Everything external is behind an interface: the OAuth client, the keyset, the
-// DNS provider, the public resolver, and both upstream relays. That is what
-// lets every safety property this repository claims be tested without a network,
-// a database or a Cloudflare account — which is the same reason a customer's own
-// developers can check them.
+// DNS provider, the public resolver, and both upstream relays. That is what lets
+// every safety property this repository claims be tested — by us or by a
+// customer's own developers — without a network, a database or a Cloudflare
+// account.
 type Service struct {
 	OAuth     oauthLoader
 	Keys      keyLoader
 	Publisher reconcile.Publisher
 
-	// Derive is this deployment's routing configuration: the two CNAME targets
-	// and the DCV delegation identifier. It is data rather than an interface
-	// because there is exactly one derivation and a seam here would be a seam a
-	// caller could substitute a permissive one into.
+	// Derive is this deployment's routing configuration: the two CNAME targets and
+	// the DCV delegation identifier. Data rather than an interface, because a seam
+	// here is one a caller could substitute a permissive derivation into.
 	Derive derive.Config
 
-	// Resolver reads PUBLIC DNS, and there is deliberately no default.
-	//
-	// A nil Resolver is reported as ErrUnavailable rather than quietly replaced
-	// with observe.NetResolver{}: a default would mean a test that forgot to
-	// supply a fake would silently resolve real names, and "no test needs a
-	// network" is a rule that has to be enforced by something other than
-	// discipline. A binary wires observe.NetResolver{} explicitly.
+	// Resolver reads PUBLIC DNS, and there is deliberately no default: a nil
+	// Resolver is reported as ErrUnavailable rather than quietly replaced with
+	// observe.NetResolver{}, because a default would let a test that forgot its
+	// fake silently resolve real names. A binary wires the real one explicitly.
 	Resolver observe.Resolver
 
 	// Certificates and Edge are the two OPTIONAL upstream relays: AWS ACM for
 	// record 5 and Cloudflare for SaaS for record 7. Both are read with
 	// MIRRORSTACK's own credentials and never with the customer's grant — the
-	// custom hostname and the certificate are ours, and sending a customer's
-	// token to them would widen what that grant is used for beyond what the
-	// consent screen described.
+	// custom hostname and the certificate are ours, and sending a customer's token
+	// to them would widen that grant beyond what the consent screen described.
 	//
-	// Nil means "not wired", which is a lane that never had those records or a
-	// deployment that is not configured for them. It is never an error: a lane
-	// must still publish what it CAN derive.
+	// Nil means "not wired": a lane that never had those records, or a deployment
+	// not configured for them. Never an error — a lane must still publish what it
+	// CAN derive.
 	Certificates relay.CertificateAuthority
 	Edge         relay.EdgeHostnames
 
@@ -122,8 +115,8 @@ func (s *Service) sealer(ctx context.Context) *grantcrypto.Sealer {
 }
 
 // prover computes ownership proofs under this deployment's keyset. A deployment
-// with no keyset cannot compute one at all, and must say so rather than derive a
-// plan whose ownership row is empty.
+// with no keyset must say so rather than derive a plan whose ownership row is
+// empty.
 func (s *Service) prover(ctx context.Context) (proof.Prover, error) {
 	sealer := s.sealer(ctx)
 	if sealer == nil {
@@ -138,11 +131,9 @@ func (s *Service) prover(ctx context.Context) (proof.Prover, error) {
 // Capabilities reports what this deployment can offer and what it would put in a
 // zone. It writes nothing, takes no registration, and touches no credential.
 //
-// It publishes the routing targets and the DCV delegation identifier on purpose.
-// None of the three is a secret — every one of them ends up in a customer's own
-// zone as the VALUE of a record we ask them to accept — and publishing them here
-// is what lets somebody check, before authorizing anything, that the CNAME they
-// are about to be asked for is the one this repository derives.
+// The routing targets and the DCV delegation identifier are published on
+// purpose: none is a secret, and each ends up in a customer's own zone as the
+// VALUE of a record we ask them to accept. See CapabilitiesResponse.
 func (s *Service) Capabilities(ctx context.Context) CapabilitiesResponse {
 	out := CapabilitiesResponse{
 		Provider:          s.providerName(),
@@ -152,8 +143,7 @@ func (s *Service) Capabilities(ctx context.Context) CapabilitiesResponse {
 		Lanes:             laneCapabilities(),
 	}
 	// The declared clock, so DESIGN §8's promise — that what runs, and when, is
-	// public — is answerable from this API and not only from a source file the
-	// caller cannot import.
+	// public — is answerable from this API, not only from a source file.
 	cadence := schedule.Declared()
 	out.IntervalSeconds = int64(cadence.Interval / time.Second)
 	out.JitterSeconds = int64(cadence.Jitter / time.Second)
@@ -161,8 +151,8 @@ func (s *Service) Capabilities(ctx context.Context) CapabilitiesResponse {
 
 	if err := s.Derive.Validate(); err != nil {
 		// Reported rather than swallowed: an unconfigured deployment and a
-		// MISCONFIGURED one otherwise look identical from outside, which is the
-		// trap cfoauth.FromEnv documents at length. Here it is cheap to just say.
+		// MISCONFIGURED one otherwise look identical from outside — the trap
+		// cfoauth.FromEnv documents.
 		out.ConfigError = err.Error()
 	}
 	cfg := s.oauthConfig(ctx)
@@ -211,12 +201,11 @@ func laneCapabilities() []LaneCapability {
 //
 // 🔴 THE LANE IS CHOSEN BY THE ENTRY POINT, NEVER BY A REQUEST FIELD.
 //
-// DESIGN §5 admits a `lane` field; this implementation does not need one,
-// because each intent is its own function and the lane is a constant at the call
-// site. The lane is inside the ownership HMAC (two lanes are two different
-// proofs, and a proof for one authorizes nothing on another), so a lane a caller
-// could mistype is a proof a customer could publish and have rejected. One
-// fewer field is one fewer thing to get wrong.
+// DESIGN §5 admits a `lane` field; each intent being its own function makes it a
+// constant at the call site instead. The lane is inside the ownership HMAC — two
+// lanes are two different proofs, and a proof for one authorizes nothing on
+// another — so a lane a caller could mistype is a proof a customer could publish
+// and have rejected.
 
 // AddOrgPlatformDomain registers an org's console domain, and writes nothing.
 func (s *Service) AddOrgPlatformDomain(ctx context.Context, req AddOrgPlatformDomainRequest) (RegisteredResponse, error) {
@@ -231,7 +220,7 @@ func (s *Service) AddOrgAppDomain(ctx context.Context, req AddOrgAppDomainReques
 
 // AddAppDomain registers one arbitrary domain against one app, and writes
 // nothing. The identity is an APP: this lane has to work when there is no
-// organization anywhere in the request.
+// organization in the request.
 func (s *Service) AddAppDomain(ctx context.Context, req AddAppDomainRequest) (RegisteredResponse, error) {
 	return s.register(ctx, lane.AppDomain, req.AppID, req.Hostname)
 }
@@ -240,8 +229,8 @@ func (s *Service) AddAppDomain(ctx context.Context, req AddAppDomainRequest) (Re
 //
 // 🔴 IT TOUCHES NO CREDENTIAL AND WRITES NOTHING. It computes the proof the
 // customer must publish, derives the records, seals the registration and returns
-// the digest. Nothing has been asked of a provider, and — because the ownership
-// proof is the customer's to publish — nothing CAN be until they act.
+// the digest. Because the ownership proof is the customer's to publish, nothing
+// CAN be asked of a provider until they act.
 func (s *Service) register(ctx context.Context, l lane.Lane, identity, domain string) (RegisteredResponse, error) {
 	prover, err := s.prover(ctx)
 	if err != nil {
@@ -251,11 +240,9 @@ func (s *Service) register(ctx context.Context, l lane.Lane, identity, domain st
 	if err != nil {
 		return RegisteredResponse{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
-	// The anchor's SPELLING is settled here and its ADMISSION is settled by
-	// derive below, which holds the reserved-suffix list. Two calls to one
-	// function, never two rules: the proof is computed over the canonical anchor,
-	// so it has to be canonical before the proof exists, and derive is still the
-	// only thing that decides whether the domain may be connected at all.
+	// The anchor's SPELLING is settled here; its ADMISSION by derive below, which
+	// holds the reserved-suffix list. The proof is computed over the canonical
+	// anchor, so it must be canonical before the proof exists.
 	anchor, err := lane.ValidateDomain(domain, nil)
 	if err != nil {
 		return RegisteredResponse{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
@@ -268,27 +255,22 @@ func (s *Service) register(ctx context.Context, l lane.Lane, identity, domain st
 	if err != nil {
 		return RegisteredResponse{}, deriveError(err)
 	}
-	// A fail-closed guard, not a formality. The proof value above was computed
-	// over `anchor`; the plan hangs it at `_mirrorstack-challenge.<plan.Anchor>`.
-	// If those two ever disagreed the customer would publish a correct value at a
-	// name we never check, and the domain would sit unverifiable with a record
-	// that looks right on their screen.
+	// A fail-closed guard, not a formality. The proof value was computed over
+	// `anchor`; the plan hangs it at `_mirrorstack-challenge.<plan.Anchor>`. If
+	// those disagreed, the customer would publish a correct value at a name we
+	// never check and the domain would sit unverifiable with a record that looks
+	// right on their screen.
 	if plan.Anchor != anchor {
 		return RegisteredResponse{}, fmt.Errorf(
 			"%w: the derived anchor %q is not the validated anchor %q", ErrInvalidRequest, plan.Anchor, anchor)
 	}
 
-	// 🔴 THE CONSENT REFERENCE IS MINTED HERE, AND SEALED IN.
-	//
-	// The acknowledgement a customer gives on this service's own consent page is
-	// a MAC over (reference, anchor). If the reference travelled beside the token
-	// on the authorize request, the caller would hold both halves — a MAC over
-	// two values it chose — and one acknowledgement would authorize every future
-	// wildcard grant on the anchor, forever, with the customer shown nothing
-	// again. Minting it at registration is what makes it a value THIS service
-	// issued for THIS domain. consent.Required is the one rule for which lanes
-	// have a page at all, so an unrecognised lane gets a reference rather than
-	// silently getting none.
+	// 🔴 THE CONSENT REFERENCE IS MINTED HERE, AND SEALED IN. The acknowledgement
+	// is a MAC over (reference, anchor); minting the reference at registration is
+	// what makes it a value THIS service issued for THIS domain, rather than one
+	// half of a MAC the caller chose (AuthorizeRequest.ConsentToken). Lanes are
+	// selected by consent.Required, the single rule for which lanes have a page,
+	// so an unrecognised lane gets a reference rather than silently getting none.
 	consentNonce := ""
 	if consent.Required(l) {
 		consentNonce, err = sealed.NewNonce()
@@ -325,10 +307,10 @@ func (s *Service) register(ctx context.Context, l lane.Lane, identity, domain st
 			out.Proof = recordView(item)
 		}
 	}
-	// Fail closed rather than returning a registration with an empty proof. A
+	// Fail closed rather than returning a registration with an empty proof: a
 	// caller cannot tell an absent proof from one it failed to render, and a
-	// registration nobody can verify is one that would sit at "waiting for your
-	// DNS record" forever, with no record to wait for.
+	// registration nobody can verify sits at "waiting for your DNS record"
+	// forever, with no record to wait for.
 	if out.Proof.Name == "" || out.Proof.Value == "" {
 		return RegisteredResponse{}, fmt.Errorf(
 			"%w: the derived plan carries no ownership proof for %q", ErrUnavailable, anchor)
@@ -339,7 +321,7 @@ func (s *Service) register(ctx context.Context, l lane.Lane, identity, domain st
 // BindAppToOrgAppDomain mints what ONE app owes under an org app domain, at
 // deploy time.
 //
-// 🔴 IT HAS TWO OUTCOMES AND THE SECOND IS NOT A FAILURE.
+// It has two outcomes, and the second is not a failure:
 //
 //	grant live                   → the records are published    → "published"
 //	grant absent/expired/revoked → NOTHING is written            → "manual",
@@ -347,20 +329,18 @@ func (s *Service) register(ctx context.Context, l lane.Lane, identity, domain st
 //
 // 🔴 THE PRIVATE HALF DOES NOT CHOOSE BETWEEN THEM AND CANNOT ASK FOR THE FIRST.
 // Whether a usable credential exists is a fact THIS service establishes, by
-// opening the sealed grant and refreshing it — there is no "publish for me" flag
-// to set and no way to assert a grant one does not hold. A customer who never
-// authorized, or who revoked (which they may do at any moment), gets a working
-// answer rather than an error: here are two records, add them, and the app comes
-// up. Advance degrades identically on every lane, through the same code.
+// opening the sealed grant and refreshing it: there is no "publish for me" flag
+// and no way to assert a grant one does not hold. Advance degrades identically on
+// every lane, through the same code.
 func (s *Service) BindAppToOrgAppDomain(ctx context.Context, req BindAppRequest) (PassResponse, error) {
 	reg, err := s.openRegistration(ctx, req.Registration)
 	if err != nil {
 		return PassResponse{}, err
 	}
-	// Binding is defined only under an org app domain. On the other two lanes
-	// the anchor is either the served hostname itself or a fixed table of four,
-	// so there is no name for a slug to select and accepting one would be
-	// inventing authority the design does not grant.
+	// Binding is defined only under an org app domain. On the other two lanes the
+	// anchor is the served hostname itself or a fixed table of four, so there is
+	// no name for a slug to select and accepting one would invent authority the
+	// design does not grant.
 	if reg.Lane != lane.OrgAppDomain {
 		return PassResponse{}, fmt.Errorf(
 			"%w: an app is bound under an org app domain, not under %s", ErrInvalidRequest, reg.Lane)
@@ -369,9 +349,8 @@ func (s *Service) BindAppToOrgAppDomain(ctx context.Context, req BindAppRequest)
 	if err != nil {
 		return PassResponse{}, deriveError(err)
 	}
-	// The same body Advance runs, with the parent's grant. One implementation is
-	// what keeps "advance degrades the same way on every lane" true rather than
-	// merely intended.
+	// The same body Advance runs, with the parent's grant: one implementation is
+	// what keeps "advance degrades the same way on every lane" true.
 	return s.pass(ctx, reg, plan, req.SealedToken)
 }
 
@@ -382,10 +361,9 @@ func (s *Service) BindAppToOrgAppDomain(ctx context.Context, req BindAppRequest)
 //
 // 🔴 THE CALLER CANNOT SAY WHAT TO LOOK FOR AND CANNOT SUPPLY A VALUE THAT MAKES
 // IT PASS. The name comes from the sealed registration's anchor and the accepted
-// values are recomputed from the sealed registration under this deployment's
-// keyset. That is the whole reason this function means anything: the previous
-// design's proof was a record WE published, checked by a public lookup of that
-// same record, which is a sentence with no fact behind it.
+// values are recomputed from that registration under this deployment's keyset.
+// The previous design's proof was a record WE published, checked by a public
+// lookup of that same record — a sentence with no fact behind it.
 func (s *Service) Verify(ctx context.Context, req VerifyRequest) (VerifyResponse, error) {
 	reg, err := s.openRegistration(ctx, req.Registration)
 	if err != nil {
@@ -408,20 +386,16 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (VerifyResponse
 		},
 	}
 	// 🔴 A LOOKUP THAT DID NOT COMPLETE IS NOT A NEGATIVE — AND IT IS NOT AN RPC
-	// ERROR EITHER.
+	// ERROR EITHER. Reporting it as "not verified" would make a resolver blip
+	// indistinguishable from a customer who never published, and the two have
+	// opposite remedies. Returning it as an error throws the observation away at
+	// the transport, answering with `{"ok":false,"code":"internal"}`: the name,
+	// the value to publish and what was seen all discarded, and a fault implied
+	// when neither side was at fault.
 	//
-	// Reporting it as "not verified" would make a resolver blip indistinguishable
-	// from a customer who never published, and the two have opposite remedies. But
-	// returning it as an error throws the observation away at the transport, which
-	// answers the customer's question with `{"ok":false,"code":"internal"}` — the
-	// name, the value to publish and what was actually seen all discarded, and a
-	// fault implied on our side or theirs when neither was at fault. A failed
-	// lookup is a fact about the world; observe.Proof populates the observation
-	// precisely so it can be rendered.
-	//
-	// So the RPC succeeds, Verified stays FALSE, and Unresolved says why. The two
-	// are set together, in that order, because the one thing this path must never
-	// do is report a proof as present on an answer that never arrived.
+	// So the RPC succeeds, Verified stays FALSE, and Unresolved says why — set
+	// together, in that order, because this path must never report a proof as
+	// present on an answer that never arrived.
 	if lookupFailed(err) {
 		out.Verified, out.Unresolved = false, true
 		return out, nil
@@ -432,48 +406,39 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (VerifyResponse
 // ConsentPage renders this service's own consent page for a registration. It
 // writes nothing, touches no credential, and mints no acknowledgement.
 //
-// 🔴 IT DERIVES THE PLAN THROUGH derivedPlan — THE SAME FUNCTION Complete AND
-// Advance PUBLISH FROM — AND THAT IS THE WHOLE REASON THIS METHOD EXISTS RATHER
-// THAN THE SERVING CODE ASSEMBLING A PLAN FOR ITSELF.
+// 🔴 IT DERIVES THE PLAN THROUGH derivedPlan, THE SAME FUNCTION Complete AND
+// Advance PUBLISH FROM. The page's claim is that the customer was shown what
+// will be written; a second derivation anywhere — the serving binary, a console,
+// a proxy — could drift from the writer's by one record, and the acknowledgement
+// would then assert agreement to something nobody was shown. So the page and the
+// writer read one function, or the page is not rendered at all.
 //
-// The page's central claim is that the customer was shown what will be written.
-// A second derivation anywhere — in the binary that serves it, in a console, in
-// whatever proxies it — could drift from the writer's by one record, and the
-// acknowledgement would then assert agreement to something nobody was ever
-// shown. That is precisely the failure package consent exists to prevent, and it
-// would be no less a failure for happening inside this repository. So the page
-// and the writer read one function, or the page is not rendered at all.
+// It returns no acknowledgement token: being shown the page and agreeing to it
+// are two events, and consent.Token belongs to the second. If rendering minted
+// one, everybody who could fetch the page — the private half included — would
+// hold a customer's agreement to a standing wildcard, unread.
 //
-// 🔴 IT RETURNS NO ACKNOWLEDGEMENT TOKEN. Being shown the page and agreeing to
-// it are two events, and consent.Token belongs to the second. If rendering
-// minted one, everybody who could fetch the page — the private half included —
-// would hold a customer's agreement to a standing wildcard without a customer
-// having read a word of it.
-//
-// 🔴 IT TAKES NO REFERENCE EITHER. The reference printed on the page comes out
-// of the sealed registration, because that is the value Authorize checks the
-// acknowledgement against: a page rendered with any other reference would
-// collect an agreement that could never be verified, and a page whose reference
-// the caller chose would collect one that verifies against nothing this service
-// issued. There is one reference per registration and no way to supply another.
+// It takes no reference either: the one printed comes out of the sealed
+// registration, the value Authorize checks the acknowledgement against. Any other
+// reference collects an agreement that could never be verified; a caller-chosen
+// one collects an agreement that verifies against nothing this service issued.
 func (s *Service) ConsentPage(ctx context.Context, registration string) (string, error) {
 	reg, err := s.openRegistration(ctx, registration)
 	if err != nil {
 		return "", err
 	}
-	// consent.Page refuses the other lanes too, and says so in its own terms —
-	// that this page describes the wildcard grant and not theirs. This refusal is
-	// the one that names the REQUEST as what was wrong, so a caller asking for
-	// the wrong lane's screen is not told instead that its plan is malformed.
+	// consent.Page refuses the other lanes too, in its own terms. This refusal
+	// names the REQUEST as what was wrong, so a caller asking for the wrong lane's
+	// screen is not told instead that its plan is malformed.
 	if !consent.Required(reg.Lane) {
 		return "", fmt.Errorf("%w: %s publishes a closed, listable record set and has no consent page",
 			ErrInvalidRequest, reg.Lane)
 	}
 	// Fail closed rather than rendering a page nobody could act on. A lane-2
-	// registration with no sealed reference is one minted by a build without
-	// this control; serving it would show a customer the disclosure, take their
-	// agreement, and then refuse the acknowledgement at Authorize with no way for
-	// anyone to tell why. Re-registering the domain mints one.
+	// registration with no sealed reference was minted by a build without this
+	// control; serving it would take the customer's agreement and then refuse the
+	// acknowledgement at Authorize with no way to tell why. Re-registering mints
+	// one.
 	if reg.ConsentNonce == "" {
 		return "", fmt.Errorf(
 			"%w: this registration carries no consent reference, so no acknowledgement for it could ever be verified",
@@ -483,30 +448,28 @@ func (s *Service) ConsentPage(ctx context.Context, registration string) (string,
 	if err != nil {
 		return "", err
 	}
-	// consent.ErrConsent travels intact rather than being folded into one of this
+	// consent.ErrConsent travels intact rather than folded into one of this
 	// package's sentinels: its causes have different audiences — a reference this
 	// deployment did not mint is the caller's, a plan shape the page cannot
-	// describe is ours — and flattening them would report a derivation fault as a
-	// bad request.
+	// describe is ours — and flattening them reports a derivation fault as a bad
+	// request.
 	return consent.Page(plan, reg.ConsentNonce)
 }
 
 // Authorize returns the provider's consent URL, and mints the OAuth state itself.
 //
-// 🔴 IT REFUSES UNLESS Verify PASSES RIGHT NOW. Not "was verified once", and not
-// "a row somewhere says verified". Without a live check, the anchor's proof is a
-// fact about the past, and the customer's first stop control — delete the TXT —
-// would not bound the authority we are about to be granted. Anything short of a
-// resolution at this moment is refused, including a lookup that merely failed:
-// GRANTING authority requires a positive answer, where CONTINUING to exercise it
-// stops only on a negative one (see checkProof).
+// 🔴 IT REFUSES UNLESS Verify PASSES RIGHT NOW — not "was verified once", not "a
+// row somewhere says verified". Without a live check the proof is a fact about
+// the past, and the customer's first stop control (delete the TXT) would not
+// bound the authority about to be granted. Anything short of a resolution at this
+// moment is refused, including a lookup that merely failed; checkProof has the
+// asymmetry.
 //
-// 🔴 IT MINTS THE STATE AND DOES NOT ACCEPT ONE. That is the difference from the
-// legacy grant.Authorize, which took `state` as a request field. A caller-supplied
-// state is a string the caller can also mint for a registration it is not
-// holding; a state sealed here carries the lane, the identity, the anchor and a
-// nonce, so Complete needs none of them as fields and there is no pair of
-// requests that can be made to disagree.
+// 🔴 IT MINTS THE STATE AND DOES NOT ACCEPT ONE, unlike the legacy
+// grant.Authorize, which took `state` as a request field — a string the caller
+// can also mint for a registration it is not holding. A state sealed here carries
+// the lane, the identity, the anchor and a nonce, so Complete needs none of them
+// as fields and no pair of requests can be made to disagree.
 func (s *Service) Authorize(ctx context.Context, req AuthorizeRequest) (AuthorizeResponse, error) {
 	cfg := s.oauthConfig(ctx)
 	if cfg == nil {
@@ -534,22 +497,16 @@ func (s *Service) Authorize(ctx context.Context, req AuthorizeRequest) (Authoriz
 			ErrNotProven, check.name, check.expected)
 	}
 
-	// 🔴 THE WILDCARD LANE ALSO NEEDS THIS SERVICE'S OWN CONSENT PAGE.
-	//
-	// `*.example.net` is the one grant whose scope a customer cannot enumerate
-	// for themselves: the other two lanes publish a closed, listable set of
-	// names, and this one publishes a rule that covers every name they have not
-	// otherwise defined. So the description they act on comes from here rather
-	// than from a console this repository cannot vouch for. The token is a MAC
-	// under this deployment's keyset; a caller can echo it and cannot mint it.
+	// The wildcard lane also needs this service's own consent page, because its
+	// scope is the one a customer cannot enumerate (see ErrConsentRequired).
 	//
 	// 🔴 BOTH SIDES OF THE COMPARISON COME OUT OF THE SEAL. The reference is the
 	// registration's, minted at register() and never a request field, so the
-	// caller supplies one half of a MAC and never both. A registration carrying
-	// no reference — sealed by a build without this control — refuses here as
-	// well, because consent.Verify rejects an empty component rather than MACing
-	// over one: the fail-closed direction, and the only safe one, since the
-	// alternative is a wildcard authorized against a value nobody issued.
+	// caller supplies one half of a MAC and never both. A registration carrying no
+	// reference — sealed by a build without this control — refuses here too,
+	// because consent.Verify rejects an empty component rather than MACing over
+	// one; the alternative is a wildcard authorized against a value nobody
+	// issued.
 	acknowledged := false
 	if consent.Required(reg.Lane) {
 		if !consent.Verify(sealer, reg.ConsentNonce, reg.Anchor, req.ConsentToken) {
@@ -587,13 +544,10 @@ func (s *Service) Authorize(ctx context.Context, req AuthorizeRequest) (Authoriz
 // sealed state, which is what makes Authorize and Complete cryptographically one
 // act rather than two requests whose fields are checked against each other.
 //
-// 🔴 ExpectDigest IS REQUIRED AND AN EMPTY VALUE IS REFUSED. The legacy
-// PublishRequest treats it as optional and skips the check when it is absent, so
-// there it is a claim rather than a control. Requiring it here closes that half.
-//
-// It does NOT make the digest a bound on the private half — both sides are
-// derived here and the caller was handed the value. See the comment at the
-// comparison itself, and docs/DESIGN.md §4.
+// 🔴 ExpectDigest IS REQUIRED AND AN EMPTY VALUE IS REFUSED, where the legacy
+// PublishRequest skips the check when it is absent. It does NOT make the digest a
+// bound on the private half — both sides are derived here and the caller was
+// handed the value. See the comparison below, and docs/DESIGN.md §4.
 func (s *Service) Complete(ctx context.Context, req CompleteRequest) (PassResponse, error) {
 	cfg := s.oauthConfig(ctx)
 	if cfg == nil {
@@ -618,16 +572,16 @@ func (s *Service) Complete(ctx context.Context, req CompleteRequest) (PassRespon
 	state, err := sealed.OpenAuthState(sealer, req.State)
 	if err != nil {
 		// sealed.ErrExpired travels intact: "your consent screen went stale, start
-		// again" and "this envelope is not ours" need different screens, and the
-		// expired case is the only one that is NORMAL.
+		// again" and "this envelope is not ours" need different screens, and only
+		// the expired case is NORMAL.
 		return PassResponse{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	reg := sealed.Registration{
 		Lane: state.Lane, Identity: state.Identity, Anchor: state.Anchor, IssuedAt: state.IssuedAt,
 	}
-	// Re-checked here as well as in Authorize. A state minted by a build without
+	// Re-checked here as well as in Authorize: a state minted by a build without
 	// the consent gate would otherwise still complete, and the acknowledgement is
-	// inside the seal precisely so a later check can rely on it.
+	// inside the seal so a later check can rely on it.
 	if consent.Required(reg.Lane) && !state.ConsentAck {
 		return PassResponse{}, fmt.Errorf(
 			"%w: this authorization was minted without an acknowledged consent page", ErrConsentRequired)
@@ -641,29 +595,25 @@ func (s *Service) Complete(ctx context.Context, req CompleteRequest) (PassRespon
 	if err != nil {
 		return PassResponse{}, err
 	}
-	// 🔴 THIS RUNS BEFORE THE EXCHANGE. A plan that does not reproduce what the
+	// 🔴 THIS RUNS BEFORE THE EXCHANGE: a plan that does not reproduce what the
 	// customer reviewed is refused while the authorization code is still unspent
 	// and no credential exists.
 	//
-	// 🔴 AND IT IS NOT THE CROSS-BOUNDARY CONTROL IT LOOKS LIKE. Both sides of
-	// the comparison are derived here, from the sealed registration, and the
-	// caller was HANDED the digest it sends back — so this is derive(reg) against
-	// derive(reg). It catches a plan that drifted between registration and
-	// completion, and it catches a bug in the private half. It does not bound the
-	// private half, because nothing the customer signed enters it. docs/DESIGN.md
-	// §4 says the same thing at more length; if you are about to describe this as
-	// the thing that stops a hostile caller, read that section first.
+	// 🔴 AND IT IS NOT THE CROSS-BOUNDARY CONTROL IT LOOKS LIKE. Both sides are
+	// derived here from the sealed registration, and the caller was HANDED the
+	// digest it sends back — this is derive(reg) against derive(reg). It catches a
+	// plan that drifted between registration and completion, and a bug in the
+	// private half; it does not bound the private half, because nothing the
+	// customer signed enters it. docs/DESIGN.md §4 says the same at more length.
 	//
-	// 🔴 IT IS TWO CHECKS AND THEY ARE TWO DIFFERENT SCREENS. Validate is asked
-	// against the snapshot's OWN digest, so the only thing it can still refuse is
-	// the snapshot itself — a record outside the anchor, an unnormalized row, a
-	// broken envelope. That is plan_invalid: this is a bug and retrying cannot
-	// help. A well-formed plan whose digest no longer matches the one the
-	// customer reviewed is the opposite answer — a routing target or a DCV
-	// identifier changed under a consent screen that was rendered minutes ago —
-	// and the remedy is to re-render and ask again. Reporting that as
-	// plan_invalid tells a caller a stale screen is a defect, and a caller that
-	// believes it may give up on the domain permanently.
+	// It is two checks and two different screens. Validate is asked against the
+	// snapshot's OWN digest, so all it can refuse is the snapshot itself — a
+	// record outside the anchor, an unnormalized row, a broken envelope — which is
+	// plan_invalid: a bug, where retrying cannot help. A well-formed plan whose
+	// digest no longer matches the reviewed one is the opposite answer, and the
+	// remedy is to re-render and ask again. Reporting that as plan_invalid tells a
+	// caller a stale screen is a defect, and a caller that believes it may give up
+	// on the domain permanently.
 	digest := review.Digest()
 	if err := review.Validate(digest); err != nil {
 		slog.Error("intent: refusing a plan that does not describe a publishable set",
@@ -684,10 +634,10 @@ func (s *Service) Complete(ctx context.Context, req CompleteRequest) (PassRespon
 		Digest:       hex.EncodeToString(digest),
 		GrantSeconds: grantSeconds(reg.Lane),
 	}
-	// The ownership proof is re-checked here too, not only at Authorize. The
-	// state is a ten-minute receipt of that check (see sealed.OpenAuthState), and
-	// DESIGN §8 promises there is no window in which we are still writing and the
-	// customer has already said no. Ten minutes is such a window; this closes it.
+	// The ownership proof is re-checked here too, not only at Authorize: the state
+	// is a ten-minute receipt of that check (see sealed.OpenAuthState), and
+	// DESIGN §8 promises no window in which we are still writing and the customer
+	// has already said no. Ten minutes is such a window; this closes it.
 	check, warning, err := s.proofBeforeWriting(ctx, reg)
 	if err != nil {
 		return PassResponse{}, err
@@ -714,9 +664,8 @@ func (s *Service) Complete(ctx context.Context, req CompleteRequest) (PassRespon
 	token, err := s.exchange(ctx, cfg, req.Code, req.CodeVerifier)
 	if err != nil {
 		// The code is single-use and now spent, but no token was ever issued, so
-		// there is nothing for the caller to persist and nothing to revoke. This
-		// is the one post-boundary case that stays an RPC error, exactly as it is
-		// in internal/grant.
+		// there is nothing to persist and nothing to revoke. This is the one
+		// post-boundary case that stays an RPC error, as in internal/grant.
 		return PassResponse{}, fmt.Errorf("%w: exchange authorization code: %w", ErrUnavailable, err)
 	}
 	s.write(ctx, cfg, reg, token, false, write, &out)
@@ -724,17 +673,14 @@ func (s *Service) Complete(ctx context.Context, req CompleteRequest) (PassRespon
 }
 
 // Advance is one pass of the loop, and the only function that writes after the
-// first publish.
-//
-// It re-derives the record set, re-checks that the ownership proof still
-// resolves, asks AWS and Cloudflare whether the records they owe have appeared,
-// and publishes whatever is missing.
+// first publish: it re-derives the record set, re-checks the ownership proof,
+// asks AWS and Cloudflare whether the records they owe have appeared, and
+// publishes whatever is missing.
 //
 // 🔴 IF THE PROOF IS GONE IT WRITES NOTHING AND SAYS SO. That is the customer's
-// stop control (DESIGN §8): it takes effect within ONE pass, and nothing has to
-// reach MirrorStack for it to work — no API call, no support ticket, no console
-// visit. The grant is not even opened, so the pass does not so much as touch
-// their provider.
+// stop control (DESIGN §8): effective within ONE pass, with nothing needing to
+// reach MirrorStack — no API call, no support ticket, no console visit. The grant
+// is not even opened, so the pass does not touch their provider at all.
 func (s *Service) Advance(ctx context.Context, req AdvanceRequest) (PassResponse, error) {
 	reg, err := s.openRegistration(ctx, req.Registration)
 	if err != nil {
@@ -747,10 +693,9 @@ func (s *Service) Advance(ctx context.Context, req AdvanceRequest) (PassResponse
 	return s.pass(ctx, reg, plan, req.SealedToken)
 }
 
-// pass is the whole of Advance and of BindApp's published/manual split.
-//
-// The order is deliberate and every step before the credential is a refusal that
-// consumes nothing:
+// pass is the whole of Advance and of BindApp's published/manual split. The order
+// is deliberate: every step before the credential is a refusal that consumes
+// nothing.
 //
 //	proof → relay → containment and digest → credential → seal → publish
 func (s *Service) pass(
@@ -795,15 +740,14 @@ func (s *Service) pass(
 
 	token, rotated, grantFailure := s.resolveGrant(ctx, cfg, reg, sealedToken)
 	if token == nil {
-		// 🔴 THE MANUAL PATH. Nothing was written and nothing is wrong. The
-		// records are already in out.Records — the same bytes we would have
-		// published — because there is one derivation for both paths.
+		// The manual path. Nothing was written and nothing is wrong: the records
+		// are already in out.Records, the same bytes we would have published,
+		// because there is one derivation for both paths.
 		out.Failure = grantFailure
 		out.Result = ResultManual
 		if grantFailure != nil && grantFailure.Retry {
-			// A provider we could not reach is not a customer without a grant.
-			// Telling them to type seven records into a DNS panel over a
-			// five-second blip is the wrong answer to the right question.
+			// A provider we could not reach is not a customer without a grant
+			// (see ResultDeferred).
 			out.Result = ResultDeferred
 		}
 		return out, nil
@@ -816,12 +760,12 @@ func (s *Service) pass(
 // console shows — so the screen and the writer cannot drift apart.
 //
 // 🔴 THE OWNERSHIP ROW IS JUDGED SEPARATELY, AND SKIPPING THAT IS A BUG WITH NO
-// ERROR IN IT. observe.Plan deliberately refuses to decide the proof: the derived
-// item carries the value under TODAY's active key, while verification accepts one
-// value per key in the keyset, so a proof published months ago under a key that
-// has since rotated is perfectly valid and would be reported absent. That report
-// would contradict Verify on the one record everything else hangs from, and tell
-// a customer whose domain is working to go and fix a record that is fine.
+// ERROR IN IT. observe.Plan refuses to decide the proof: the derived item carries
+// the value under TODAY's active key, while verification accepts one value per
+// key in the keyset, so a proof published months ago under a since-rotated key is
+// valid and would be reported absent — contradicting Verify on the one record
+// everything hangs from, and telling a customer whose domain works to fix a
+// record that is fine.
 func (s *Service) Describe(ctx context.Context, req DescribeRequest) (DescribeResponse, error) {
 	reg, err := s.openRegistration(ctx, req.Registration)
 	if err != nil {
@@ -849,19 +793,19 @@ func (s *Service) Describe(ctx context.Context, req DescribeRequest) (DescribeRe
 	}
 	observations, err := observe.Plan(ctx, s.Resolver, merged)
 	if err != nil {
-		// A plan this service will not observe is a plan it should not have
-		// derived — a record outside the anchor, or a type it does not publish.
-		// Reporting around it would put a line in front of a customer that we
-		// have no business managing.
+		// A plan this service will not observe is one it should not have derived —
+		// a record outside the anchor, or a type it does not publish. Reporting
+		// around it would put a line in front of a customer that we have no
+		// business managing.
 		return DescribeResponse{}, err
 	}
 
 	check, proofErr := s.checkProof(ctx, reg)
 	if proofErr != nil {
 		// Describe is the tool somebody reaches for BECAUSE something is not
-		// working, so a resolver failure degrades it rather than failing it. The
-		// proof row stays `unknown`, which is visibly incomplete rather than
-		// confidently wrong.
+		// working, so a resolver failure degrades it rather than failing it: the
+		// proof row stays `unknown`, visibly incomplete rather than confidently
+		// wrong.
 		out.Warnings = append(out.Warnings, fmt.Sprintf("the ownership proof could not be read: %v", proofErr))
 	}
 	out.Verified = check.published
@@ -882,15 +826,14 @@ func (s *Service) Describe(ctx context.Context, req DescribeRequest) (DescribeRe
 
 // Orphans reports what this service left behind when a domain is removed.
 //
-// 🔴 A REPORT, NEVER A MUTATION — AND THE TYPE SYSTEM SAYS SO. The provider is
-// reached through zoneReader, which has no create and no patch. There is no
+// A report, never a mutation, and the type system says so: the provider is
+// reached through zoneReader, which has no create and no patch, and there is no
 // delete anywhere in this service to reach in the first place.
 //
-// It prefers the customer's own zone, read with their grant, because that is
-// authoritative; it falls back to public DNS whenever no usable grant exists, so
-// the report still works for a customer who never authorized or has already
-// revoked. Using the grant necessarily ROTATES it, so the rotated envelope comes
-// back in the response and must be persisted like any other.
+// It prefers the customer's own zone, read with their grant, and falls back to
+// public DNS whenever no usable grant exists, so the report still works for a
+// customer who never authorized or has revoked. Using the grant ROTATES it, so
+// the rotated envelope comes back in the response and must be persisted.
 func (s *Service) Orphans(ctx context.Context, req OrphansRequest) (OrphansResponse, error) {
 	reg, err := s.openRegistration(ctx, req.Registration)
 	if err != nil {
@@ -903,7 +846,7 @@ func (s *Service) Orphans(ctx context.Context, req OrphansRequest) (OrphansRespo
 	merged, warnings := s.relayInto(ctx, plan)
 	out := OrphansResponse{
 		Anchor: reg.Anchor,
-		// Always true, and it is not a defect being confessed to. See the field.
+		// Always true; see the field.
 		Incomplete: true,
 		Warnings:   warnings,
 	}
@@ -917,22 +860,22 @@ func (s *Service) Orphans(ctx context.Context, req OrphansRequest) (OrphansRespo
 		out.Rotated, out.Failure = rotated, failure
 		if token != nil {
 			// Seal before reading, for the same reason write() seals before
-			// publishing: the refresh already rotated the caller's copy, and a
-			// read that fails afterwards must not take the replacement with it.
+			// publishing: the refresh already rotated the caller's copy, and a read
+			// that fails afterwards must not take the replacement with it.
 			envelope, keyID, sealErr := s.sealGrant(ctx, token, reg)
 			if sealErr == nil {
 				out.SealedToken, out.KeyID = envelope, keyID
 			} else {
 				// 🔴 A SEALING FAILURE HERE IS THE 2026-08-24 FAILURE, IN A
 				// FUNCTION THAT ONLY READS. The refresh above rotated the grant,
-				// so the caller's stored token is already dead; if the
-				// replacement cannot be sealed there is nothing to hand back,
-				// and a report that said rotated:true with an empty sealedToken
-				// and no failure would leave a LIVE grant at the provider that
-				// nothing in MirrorStack can ever release. Dropping sealErr is
-				// how that happens silently, so it is logged, the grant is ended
-				// where it lives, and the response says so — the same three
-				// steps write() takes, for the same reason.
+				// so the caller's stored token is already dead; if the replacement
+				// cannot be sealed there is nothing to hand back, and a report
+				// saying rotated:true with an empty sealedToken and no failure
+				// would leave a LIVE grant at the provider that nothing in
+				// MirrorStack can ever release. Dropping sealErr is how that
+				// happens silently — so it is logged, the grant is ended where it
+				// lives, and the response says so, the same three steps write()
+				// takes.
 				slog.Warn("intent: could not seal the delegated grant while reporting orphans; revoking instead of holding",
 					"lane", reg.Lane, "anchor", reg.Anchor, "error", sealErr)
 				s.revokeToken(ctx, cfg, token, reg, "the grant could not be held")
@@ -941,10 +884,10 @@ func (s *Service) Orphans(ctx context.Context, req OrphansRequest) (OrphansRespo
 					Code: FailureResealFailed, Retry: false,
 					Message: "the rotated grant could not be held, so it has been revoked; this report is from public DNS",
 				}
-				// And it is not used to read afterwards. A credential we have
-				// just ended is not one to spend a request on, and the public-DNS
-				// path below is a complete answer rather than a degraded one —
-				// it is what every customer who never authorized already gets.
+				// And it is not used to read afterwards: a credential just ended
+				// is not one to spend a request on, and the public-DNS path below
+				// is a complete answer — what every customer who never authorized
+				// already gets.
 				token = nil
 			}
 		}
@@ -977,16 +920,15 @@ func (s *Service) Orphans(ctx context.Context, req OrphansRequest) (OrphansRespo
 	return out, nil
 }
 
-// Release revokes a held grant at the provider, refresh token first.
-//
-// Refresh first because revoking it kills the whole grant, where revoking only
-// the access token leaves a credential that can mint another.
+// Release revokes a held grant at the provider, refresh token first: revoking
+// that kills the whole grant, where revoking only the access token leaves a
+// credential that can mint another.
 //
 // 🔴 AN ENVELOPE THAT CANNOT BE OPENED IS REPORTED AS SUCH AND NEVER GUESSED AT.
-// There is no fallback that tries other keys, other anchors or other identities:
-// a "helpful" guess here is a request to revoke a credential we cannot prove is
-// the one this row holds. The response says unreadable, the log says REVOKE BY
-// HAND, and a person decides.
+// There is no fallback trying other keys, anchors or identities: a "helpful"
+// guess is a request to revoke a credential we cannot prove is the one this row
+// holds. The response says unreadable, the log says REVOKE BY HAND, and a person
+// decides.
 func (s *Service) Release(ctx context.Context, req ReleaseRequest) (ReleaseResponse, error) {
 	cfg := s.oauthConfig(ctx)
 	if cfg == nil {
@@ -1024,34 +966,27 @@ type proofCheck struct {
 	published bool
 
 	// withdrawn means public DNS gave a DEFINITE answer and the proof was not in
-	// it. It is not the negation of published: a lookup that did not complete is
+	// it. Not the negation of published: a lookup that did not complete is
 	// neither.
 	withdrawn bool
 }
 
 // checkProof resolves the ownership proof for a registration.
 //
-// 🔴 THE ASYMMETRY BETWEEN published AND withdrawn IS THE WHOLE DESIGN OF THIS
-// FUNCTION, AND IT IS DELIBERATE IN BOTH DIRECTIONS.
-//
-// GRANTING authority requires a positive answer. Authorize refuses unless the
-// proof resolved and matched right now, so a SERVFAIL, a timeout or an empty
-// answer all mean "not yet" — the customer retries thirty seconds later and
-// nothing was lost.
-//
-// CONTINUING to exercise authority stops only on a NEGATIVE answer. A pass that
-// is already publishing a set derived from an anchor proven at authorize time
-// does not stop because a resolver hiccupped: observe.Proof puts it exactly
-// right — a registration is stopped on an answer, never on a failure to get one.
-// Folding "unknown" into "withdrawn" would make a nameserver blip
+// 🔴 THE ASYMMETRY BETWEEN published AND withdrawn IS DELIBERATE IN BOTH
+// DIRECTIONS. GRANTING authority requires a positive answer: Authorize refuses
+// unless the proof resolved and matched right now, so a SERVFAIL, a timeout or an
+// empty answer all mean "not yet". CONTINUING to exercise authority stops only on
+// a NEGATIVE answer: a registration is stopped on an answer, never on a failure
+// to get one. Folding "unknown" into "withdrawn" would make a nameserver blip
 // indistinguishable from a customer saying no, and the loop would eventually
 // release a live credential over a fault that was ours.
 func (s *Service) checkProof(ctx context.Context, reg sealed.Registration) (proofCheck, error) {
 	out := proofCheck{name: proof.Name(reg.Anchor)}
 	if out.name == "" {
-		// The anchor is over 230 bytes, so the challenge name would not be a
-		// legal DNS name. derive refuses such a registration outright; this is
-		// the guard on the path that opens a stored one.
+		// The anchor is over 230 bytes, so the challenge name would not be a legal
+		// DNS name. derive refuses such a registration outright; this is the guard
+		// on the path that opens a stored one.
 		return out, fmt.Errorf("%w: %q is too deep to carry an ownership proof", ErrInvalidRequest, reg.Anchor)
 	}
 	prover, err := s.prover(ctx)
@@ -1062,9 +997,9 @@ func (s *Service) checkProof(ctx context.Context, reg sealed.Registration) (proo
 	if err != nil {
 		return out, fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
-	// Computed for the response, not for the comparison. The comparison is
-	// against the whole accept set, so a rotation does not invalidate a value a
-	// customer published months ago and has no reason to revisit.
+	// Computed for the response, not for the comparison: that is against the whole
+	// accept set, so a rotation does not invalidate a value a customer published
+	// months ago and has no reason to revisit.
 	out.expected, err = prover.Expected(reg.Lane, reg.Identity, reg.Anchor)
 	if err != nil {
 		return out, fmt.Errorf("%w: %w", ErrUnavailable, err)
@@ -1080,7 +1015,7 @@ func (s *Service) checkProof(ctx context.Context, reg sealed.Registration) (proo
 }
 
 // stopped is the response for a registration whose proof has been withdrawn.
-// Nothing was written, no credential was opened, and the remedy is entirely the
+// Nothing was written, no credential was opened, and the remedy is the
 // customer's: republish the TXT and the next pass continues.
 func stopped(out PassResponse, check proofCheck) PassResponse {
 	out.Result = ResultStopped
@@ -1099,21 +1034,19 @@ func stopped(out PassResponse, check proofCheck) PassResponse {
 //
 // 🔴 A PASS THAT COULD NOT LOOK MUST NOT WRITE.
 //
-// checkProof fails for four reasons and only ONE of them is an answer about the
-// world. A resolver that timed out or SERVFAILed is a fault of ours or of the
-// network, and stopping on it would make a nameserver blip indistinguishable
-// from a customer saying no — so that one degrades to a warning and the pass
-// proceeds on the anchor proven at authorize time.
+// checkProof fails for four reasons and only ONE is an answer about the world: a
+// resolver that timed out or SERVFAILed degrades to a warning and the pass
+// proceeds on the anchor proven at authorize time — the one place DESIGN §8
+// admits a failure does not fail closed.
 //
 // The other three — no keyset, no resolver wired, an accept set we could not
-// compute — mean this service was never in a position to ask. Publishing on
-// those makes the customer's stop control silently inoperative: they delete the
-// ownership proof, we never read it, and the records come back on every pass
-// with nothing but a warning string inside a `published` response to say so.
-// DESIGN §8 promises deletion stops every write; that promise is this function.
+// compute — mean this service was never in a position to ask. Publishing on those
+// makes the customer's stop control silently inoperative: they delete the
+// ownership proof, we never read it, and the records come back on every pass with
+// nothing but a warning string inside a `published` response to say so.
 //
-// Describe takes the opposite branch deliberately (see its call to checkProof):
-// it writes nothing, so a report with an `unknown` proof row beats no report.
+// Describe takes the opposite branch: it writes nothing, so a report with an
+// `unknown` proof row beats no report.
 func (s *Service) proofBeforeWriting(ctx context.Context, reg sealed.Registration) (proofCheck, string, error) {
 	check, err := s.checkProof(ctx, reg)
 	switch {
@@ -1122,8 +1055,8 @@ func (s *Service) proofBeforeWriting(ctx context.Context, reg sealed.Registratio
 	case lookupFailed(err):
 		return check, fmt.Sprintf("the ownership proof could not be read: %v", err), nil
 	default:
-		// 🔴 Returning the zero proofCheck matters: withdrawn is false on it, and
-		// a caller that ignored this error would fall through to the publish.
+		// Returning the zero proofCheck matters: withdrawn is false on it, and a
+		// caller that ignored this error would fall through to the publish.
 		return proofCheck{}, "", err
 	}
 }
@@ -1132,11 +1065,11 @@ func (s *Service) proofBeforeWriting(ctx context.Context, reg sealed.Registratio
 //
 // Everything this service could have got wrong is one of three sentinels: no
 // keyset or no resolver wired (ErrUnavailable), an anchor too deep to carry a
-// proof (ErrInvalidRequest), or a malformed observation request — including a
+// proof (ErrInvalidRequest), or a malformed observation request, including a
 // keyset that produced no accepted value at all (observe.ErrObserve). Those stay
-// RPC errors, because a report about the customer's zone produced by a service
-// that was not in a position to look is not a report. What is left is a
-// well-formed lookup that did not come back, which is an answer about the world.
+// RPC errors: a report about the customer's zone from a service that was not in a
+// position to look is not a report. What is left is a well-formed lookup that did
+// not come back.
 func lookupFailed(err error) bool {
 	return err != nil &&
 		!errors.Is(err, ErrUnavailable) &&
@@ -1159,10 +1092,10 @@ func (s *Service) openRegistration(ctx context.Context, envelope string) (sealed
 	return reg, nil
 }
 
-// derivedPlan re-derives a registration's records from the three sealed facts
-// and this deployment's configuration. Nothing is read back from storage,
-// because there is no storage: the certificate id, the custom-hostname id and
-// the published-record cursor were deleted from the model (DESIGN §7).
+// derivedPlan re-derives a registration's records from the three sealed facts and
+// this deployment's configuration. Nothing is read back from storage, because
+// there is none: the certificate id, the custom-hostname id and the
+// published-record cursor were deleted from the model (DESIGN §7).
 func (s *Service) derivedPlan(ctx context.Context, reg sealed.Registration) (derive.Plan, error) {
 	prover, err := s.prover(ctx)
 	if err != nil {
@@ -1179,11 +1112,10 @@ func (s *Service) derivedPlan(ctx context.Context, reg sealed.Registration) (der
 	return plan, nil
 }
 
-// deriveError splits a derivation refusal by AUDIENCE. A deployment whose
-// routing configuration is incomplete is an operator's problem and reports as
-// unavailable; a domain that cannot be connected is the caller's and reports as
-// an invalid request. derive.ErrConfig wraps derive.ErrDerive, so the narrower
-// test comes first.
+// deriveError splits a derivation refusal by AUDIENCE: an incomplete routing
+// configuration is an operator's problem and reports as unavailable, a domain
+// that cannot be connected is the caller's and reports as an invalid request.
+// derive.ErrConfig wraps derive.ErrDerive, so the narrower test comes first.
 func deriveError(err error) error {
 	if errors.Is(err, derive.ErrConfig) {
 		return fmt.Errorf("%w: %w", ErrUnavailable, err)
@@ -1197,16 +1129,15 @@ func deriveError(err error) error {
 // relayInto merges the records AWS and Cloudflare owe into a derived plan.
 //
 // 🔴 A RELAY FAILURE IS A WARNING, NOT A REFUSAL. Record 6 — the DCV pointer — is
-// derived here and is what gets the CLOUDFLARE EDGE certificate issued, so a
-// lane still gets TLS at the edge while ACM is unreadable. Lane 1's AWS
-// certificate is a SECOND certificate and does not validate until record 5 is
-// relayed; until then that lane is served at the edge and is not complete.
-// Blocking record 6 on an ACM read failure would couple the fast path to the
-// slow one and leave a domain unrouted over a permission problem on our side. So the pass publishes what it
-// can and says what it could not read. Swallowing the error instead would make a
-// relay that has been broken for a week indistinguishable from an upstream that
-// is merely slow, which is exactly the class of silence this repository exists to
-// remove.
+// derived here and is what gets the CLOUDFLARE EDGE certificate issued, so a lane
+// still gets TLS at the edge while ACM is unreadable. Lane 1's AWS certificate is
+// a SECOND certificate and does not validate until record 5 is relayed; until
+// then that lane is served at the edge and is not complete. Blocking record 6 on
+// an ACM read failure would couple the fast path to the slow one and leave a
+// domain unrouted over a permission problem on our side. So the pass publishes
+// what it can and says what it could not read; swallowing the error would make a
+// relay broken for a week indistinguishable from an upstream that is merely
+// slow.
 func (s *Service) relayInto(ctx context.Context, plan derive.Plan) (derive.Plan, []string) {
 	var warnings []string
 	items := append(make([]derive.Item, 0, len(plan.Items)+len(plan.Hosts)*2), plan.Items...)
@@ -1251,11 +1182,9 @@ func (s *Service) relayInto(ctx context.Context, plan derive.Plan) (derive.Plan,
 //
 // Lane 1 only — DESIGN §6 row 5 — and 🔴 NOT `cdn`. The CDN worker terminates TLS
 // for that hostname before anything reaches API Gateway, so no AWS certificate
-// ever covers it and no validation record is ever owed for it. The exclusion
-// lives here, in public, with the reason, because it is the kind of fact that
-// otherwise survives only as the shape of a bug: a list that quietly included
-// `cdn` would leave one host in `describe` permanently reported as waiting on an
-// upstream that was never going to answer.
+// ever covers it and no validation record is owed for it. A list that quietly
+// included `cdn` would leave one host in `describe` permanently reported as
+// waiting on an upstream that was never going to answer.
 func certificateHosts(plan derive.Plan) []string {
 	if plan.Lane != lane.OrgPlatformDomain {
 		return nil
@@ -1274,10 +1203,9 @@ func certificateHosts(plan derive.Plan) []string {
 // servingHosts are the hostnames Cloudflare mints a serving proof for.
 //
 // Every lane owes record 7, but a WILDCARD is not a custom hostname on this
-// account (a wildcard custom hostname is an Enterprise feature), so `*.<anchor>`
-// is skipped: the org app domain's proofs are minted per app, at deploy time, by
-// BindAppToOrgAppDomain, whose plan names a concrete host and reaches this same
-// function.
+// account (an Enterprise feature), so `*.<anchor>` is skipped: that lane's proofs
+// are minted per app at deploy time by BindAppToOrgAppDomain, whose plan names a
+// concrete host and reaches this same function.
 func servingHosts(plan derive.Plan) []string {
 	out := make([]string, 0, len(plan.Hosts))
 	for _, host := range plan.Hosts {
@@ -1290,8 +1218,8 @@ func servingHosts(plan derive.Plan) []string {
 }
 
 // hostFor picks the hostname a relayed record serves: the most specific one it
-// sits at or under. `_acme-challenge.api.example.com` serves `api.example.com`
-// and not `example.com`, and a console groups by that.
+// sits at or under. `_acme-challenge.api.example.com` serves `api.example.com`,
+// not `example.com`, and a console groups by that.
 func hostFor(hosts []string, name string) string {
 	best := ""
 	for _, host := range hosts {
@@ -1304,11 +1232,9 @@ func hostFor(hosts []string, name string) string {
 
 // publishable is the record set this service may WRITE.
 //
-// 🔴 THE OWNERSHIP RECORD IS NEVER IN IT, AND A REGRESSION HERE SILENTLY
-// RESTORES THE EXACT DEFECT THIS REBUILD EXISTS TO FIX. A proof we publish
-// ourselves proves nothing: the old design's gate was a public lookup of a record
-// the old design had just written, so "the customer proved they own this anchor"
-// was a sentence with no fact behind it.
+// 🔴 THE OWNERSHIP RECORD IS NEVER IN IT, AND A REGRESSION HERE SILENTLY RESTORES
+// THE EXACT DEFECT THIS REBUILD EXISTS TO FIX: a proof we publish ourselves
+// proves nothing.
 //
 // derive.Plan.Publishable is an allow-list on SourceDerived/SourceRelayed and
 // already excludes it. This function does not repeat that filter — two copies of
@@ -1334,11 +1260,10 @@ func publishable(plan derive.Plan) ([]dnsplan.Record, error) {
 
 // snapshotKind maps a lane onto dnsplan's coarse binding.
 //
-// dnsplan predates the lanes and knows two kinds. The mapping is deliberate
-// rather than incidental: lane 1 is the org's own platform, and the other two
-// both serve an application. Nothing is lost by the merge, because the lane
-// itself lives in the sealed registration and inside the ownership HMAC, and the
-// digest covers the anchor and the records — which differ per lane anyway. An
+// dnsplan predates the lanes and knows two kinds: lane 1 is the org's own
+// platform, the other two both serve an application. Nothing is lost by the
+// merge, because the lane lives in the sealed registration and inside the
+// ownership HMAC, and the digest covers the anchor and the records. An
 // unrecognised lane maps to the empty string, which dnsplan.NewSnapshot refuses.
 func snapshotKind(l lane.Lane) string {
 	switch l {
@@ -1353,15 +1278,13 @@ func snapshotKind(l lane.Lane) string {
 // reviewSnapshot is the plan the CUSTOMER reviews, and the digest they consent
 // to.
 //
-// It covers the DERIVED publishable records only. A relayed record's bytes do not
-// exist at review time — AWS populates a validation record minutes after it
-// returns an ARN, and Cloudflare mints a serving proof when a custom hostname is
-// created — so including them would make the digest move between authorize and
-// complete and tell every customer mid-connect that the plan had changed.
+// It covers the DERIVED publishable records only: a relayed record's bytes do not
+// exist at review time, so including them would move the digest between authorize
+// and complete and tell every customer mid-connect that the plan had changed.
 //
-// The snapshot's TargetID is the registration's IDENTITY. This service holds no
+// The snapshot's TargetID is the registration's IDENTITY: this service holds no
 // row id and §5 gives it no field to receive one, so the identity is the only
-// canonical UUID in scope — and it is the right one: it binds the digest to WHOSE
+// canonical UUID in scope, and the right one — it binds the digest to WHOSE
 // domain this is.
 func reviewSnapshot(l lane.Lane, identity string, plan derive.Plan) (dnsplan.Snapshot, error) {
 	records, err := publishable(plan)
@@ -1375,27 +1298,25 @@ func reviewSnapshot(l lane.Lane, identity string, plan derive.Plan) (dnsplan.Sna
 // whatever the upstreams have produced since.
 //
 // 🔴 EVERY RECORD THIS SERVICE PUBLISHES GOES THROUGH dnsplan.NewSnapshot AND
-// THEN reconcile.Publisher, WITH NO PATH AROUND EITHER. NewSnapshot is where
-// anchor containment is enforced and the digest is computed; the Publisher is
-// where never-delete, read-before-write, never-take-a-name-in-use and the bounded
-// window live. A caller that skipped either would be the one that mattered.
+// THEN reconcile.Publisher, WITH NO PATH AROUND EITHER. NewSnapshot enforces
+// anchor containment and computes the digest; the Publisher is where
+// never-delete, read-before-write, never-take-a-name-in-use and the bounded
+// window live.
 //
-// It also asserts that the reviewed plan is still COVERED by what is about to be
-// written. The write set may legitimately have GROWN — that is what a later pass
-// is for — but it may never shrink or mutate, because that is a plan the customer
-// did not see.
+// It also asserts the reviewed plan is still COVERED by the write set, which may
+// have GROWN — that is what a later pass is for — but never shrink or mutate,
+// which would be a plan the customer did not see.
 //
 // 🔴 BE HONEST ABOUT WHAT THAT ASSERTION CURRENTLY CATCHES: NOTHING. On every
 // path today, review and the write set are derived in the same call from the same
-// plan, and relayInto only ever APPENDS — so the containment holds by
-// construction and the check cannot fire. It is here for the edit that has not
-// been made yet: the day something filters the merged set, or derives the two
-// halves from different plans, this is what refuses. Defence in depth is worth
-// keeping and worth labelling as such; a reader must not come away thinking it
-// is catching a live drift between the consent screen and the write.
+// plan and relayInto only APPENDS, so the containment holds by construction and
+// the check cannot fire. It is here for the edit not yet made: the day something
+// filters the merged set, or derives the two halves from different plans, this is
+// what refuses. A reader must not come away thinking it catches a live drift
+// between the consent screen and the write.
 //
 // A plan that is not publishable yet comes back as a Failure rather than an
-// error: it is a wait, not a fault.
+// error: a wait, not a fault.
 func writeSnapshot(
 	reg sealed.Registration, review dnsplan.Snapshot, merged derive.Plan,
 ) (dnsplan.Snapshot, *Failure, error) {
@@ -1431,26 +1352,24 @@ func writeSnapshot(
 // write alone, in a store this service does not own.
 //
 // 🔴 THE LANE IS IN IT, WHICH internal/grant's VERSION HAD NO WAY TO DO. One org
-// can connect the same domain on two lanes; those are two separate consents, two
-// separate ownership proofs, and two separate grants. Without the lane, a grant
-// obtained for the wildcard lane would open in the platform lane's row.
+// can connect the same domain on two lanes: two consents, two ownership proofs,
+// two grants. Without the lane, a grant obtained for the wildcard lane would open
+// in the platform lane's row.
 //
-// It takes the opened Registration rather than three strings, deliberately: the
-// only way to hold one is to have opened an envelope this service sealed, so a
-// caller cannot choose the binding, and a caller that could choose it could
-// choose to unbind it.
+// It takes the opened Registration rather than three strings: the only way to
+// hold one is to have opened an envelope this service sealed, so a caller cannot
+// choose the binding — and one that could choose it could unbind it.
 func GrantAAD(reg sealed.Registration) string {
 	return "ms-dns-grant/v1\x00" + string(reg.Lane) + "\x00" + reg.Identity + "\x00" + reg.Anchor
 }
 
 // resolveGrant opens the held grant and refreshes it.
 //
-// A nil token is the MANUAL path and the Failure says which kind: no grant was
-// supplied at all (the ordinary state of a customer who never authorized), the
-// envelope could not be opened, the provider rejected it, or the provider could
-// not be reached. Only the last is retryable, and that distinction is the whole
-// contract: confusing "dead" with "unreachable" either strands a customer or
-// destroys a working grant.
+// A nil token is the MANUAL path and the Failure says which kind: no grant
+// supplied (the ordinary state of a customer who never authorized), an envelope
+// that could not be opened, a provider that rejected it, or one that could not be
+// reached. Only the last is retryable: confusing "dead" with "unreachable" either
+// strands a customer or destroys a working grant.
 func (s *Service) resolveGrant(
 	ctx context.Context, cfg *cfoauth.Config, reg sealed.Registration, sealedToken string,
 ) (*oauth2.Token, bool, *Failure) {
@@ -1493,15 +1412,14 @@ func (s *Service) resolveGrant(
 // write seals the credential and publishes. It is the ONLY place in this package
 // that reaches reconcile.Publisher.
 //
-// 🔴 SEAL BEFORE PUBLISHING, NOT AFTER.
-//
-// The provider rotates the refresh token on every use, so once the refresh above
-// returned, the caller's stored token is ALREADY DEAD. If the publish below fails
-// and this response carries no replacement, the grant kills itself on the next
-// pass — measured 2026-08-24: the first pass returned early on a preparing plan
-// without storing the rotated token, and the second pass found a token the
-// provider had already replaced. That is why every failure from here on is
-// reported in the response and never as an RPC error.
+// 🔴 SEAL BEFORE PUBLISHING, NOT AFTER. The provider rotates the refresh token on
+// every use, so once the refresh above returned, the caller's stored token is
+// ALREADY DEAD. If the publish below fails and this response carries no
+// replacement, the grant kills itself on the next pass — measured 2026-08-24: the
+// first pass returned early on a preparing plan without storing the rotated
+// token, and the second pass found a token the provider had already replaced.
+// That is why every failure from here on is reported in the response and never as
+// an RPC error.
 func (s *Service) write(
 	ctx context.Context, cfg *cfoauth.Config, reg sealed.Registration,
 	token *oauth2.Token, rotated bool, snapshot dnsplan.Snapshot, out *PassResponse,
@@ -1518,8 +1436,8 @@ func (s *Service) write(
 		out.Result = ResultDeferred
 		out.Failure = publishFailure(err)
 		if out.SealedToken == "" {
-			// A grant nobody recorded must not be left alive at the provider: it
-			// is one nothing will ever release.
+			// A grant nobody recorded must not be left alive at the provider:
+			// nothing would ever release it.
 			s.revokeToken(ctx, cfg, token, reg, "the grant could not be held")
 			out.Revoked = true
 		}
@@ -1560,9 +1478,8 @@ func (s *Service) refresh(ctx context.Context, cfg *cfoauth.Config, refreshToken
 	return cfg.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken}).Token()
 }
 
-// isInvalidGrant reports the provider saying the refresh token is dead. It is the
-// one refresh failure that must NOT be retried: retrying spends nothing and the
-// grant will never come back.
+// isInvalidGrant reports the provider saying the refresh token is dead — the one
+// refresh failure that must NOT be retried: the grant will never come back.
 func isInvalidGrant(err error) bool {
 	var retrieveErr *oauth2.RetrieveError
 	if errors.As(err, &retrieveErr) {
@@ -1586,28 +1503,28 @@ func publishFailure(err error) *Failure {
 		// A plan defect. Retrying the same plan cannot help.
 		return &Failure{Code: FailureProvider, Retry: false, Message: err.Error()}
 	case errors.Is(err, reconcile.ErrNameInUse):
-		// The customer is serving something else from a name in the plan. Only
-		// they can decide it should go, so a retry changes nothing until they do
-		// — but it is not a dead grant either.
+		// The customer is serving something else from a name in the plan. Only they
+		// can decide it should go, so a retry changes nothing until they do — but
+		// it is not a dead grant either.
 		return &Failure{Code: FailureProvider, Retry: false, Message: err.Error()}
 	case errors.Is(err, dnsplan.ErrPlanPreparing):
 		return &Failure{Code: FailurePlanPreparing, Retry: true, Message: err.Error()}
 	default:
-		// 🔴 EVERYTHING UNKNOWN IS RETRYABLE. The alternative — defaulting to
-		// "dead" — releases a working customer credential over a transient
-		// provider blip, and a released grant cannot be recovered without sending
-		// the customer back through consent.
+		// 🔴 EVERYTHING UNKNOWN IS RETRYABLE. Defaulting to "dead" would release a
+		// working customer credential over a transient provider blip, and a
+		// released grant cannot be recovered without sending the customer back
+		// through consent.
 		return &Failure{Code: FailureProvider, Retry: true, Message: err.Error()}
 	}
 }
 
-// revokeToken ends a grant at the provider, refresh token first: revoking it
-// kills the whole grant, whereas revoking only the access token leaves a
-// credential that can mint another.
+// revokeToken ends a grant at the provider, refresh token first: that kills the
+// whole grant, where revoking only the access token leaves a credential that can
+// mint another.
 //
-// Every failure is a precise log line and nothing else. The caller has already
+// Every failure is a precise log line and nothing else: the caller has already
 // succeeded or failed on its own terms, and a failed revocation is an operator
-// task rather than a caller outcome.
+// task.
 func (s *Service) revokeToken(
 	ctx context.Context, cfg *cfoauth.Config, token *oauth2.Token, reg sealed.Registration, reason string,
 ) {
@@ -1654,8 +1571,8 @@ func (s *Service) revokeToken(
 // ─── the read-only zone report ──────────────────────────────────────────────
 
 // readZone reads every planned name through the customer's own provider and
-// reports what is there. It calls FindZone and ListRecordsAt and nothing else —
-// see zoneReader.
+// reports what is there. It calls FindZone and ListRecordsAt and nothing else
+// (see zoneReader).
 func (s *Service) readZone(ctx context.Context, token string, plan derive.Plan) ([]RecordView, error) {
 	var reader zoneReader = s.Publisher.Provider
 	if reader == nil {
@@ -1664,9 +1581,9 @@ func (s *Service) readZone(ctx context.Context, token string, plan derive.Plan) 
 	if len(plan.Items) == 0 {
 		return nil, nil
 	}
-	// Located by the ANCHOR, which is the name the customer proved and the only
-	// one in the plan that is guaranteed to be in their zone rather than under a
-	// delegation somebody could have created beneath it.
+	// Located by the ANCHOR: the name the customer proved, and the only one in the
+	// plan guaranteed to be in their zone rather than under a delegation somebody
+	// could have created beneath it.
 	zoneID, err := reader.FindZone(ctx, token, plan.Anchor)
 	if err != nil {
 		return nil, err
@@ -1701,9 +1618,9 @@ func (s *Service) readZone(ctx context.Context, token string, plan derive.Plan) 
 			}
 		}
 		// Only a CNAME can conflict, because only a CNAME is exclusive at its
-		// owner. A TXT that is not ours sits beside ours, so "something else is
-		// here" is still absent for our purposes — the same vocabulary
-		// internal/observe uses, so one report can be read against the other.
+		// owner: a TXT that is not ours sits beside ours, so "something else is
+		// here" is still absent for our purposes. Same vocabulary as
+		// internal/observe, so one report can be read against the other.
 		if state == observe.StateAbsent && sameType > 0 && strings.EqualFold(item.Record.Type, "CNAME") {
 			state = observe.StateConflicting
 		}
@@ -1719,9 +1636,8 @@ func (s *Service) readZone(ctx context.Context, token string, plan derive.Plan) 
 // meaning STANDING.
 //
 // A negative value means this build does not recognise the lane. It is returned
-// rather than clamped, because a caller that adds it to `now` then computes an
-// expiry in the PAST — which is lane.GrantLifetime's deliberate fail-closed
-// answer, and clamping it here would throw that away.
+// rather than clamped: a caller that adds it to `now` computes an expiry in the
+// PAST, which is lane.GrantLifetime's deliberate fail-closed answer.
 func grantSeconds(l lane.Lane) int64 {
 	return int64(l.GrantLifetime() / time.Second)
 }

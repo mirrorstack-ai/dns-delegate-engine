@@ -1,17 +1,13 @@
 // Package lane names the three ways a customer domain can reach MirrorStack, and
 // holds the rules every other package in this service validates against.
 //
-// A lane is not a label. It decides which kind of identity a request carries,
-// which hostnames are derived under the anchor, how long a credential may be
-// held — and it is an input to the ownership proof the customer publishes, so two
-// lanes are two different proofs and a proof for one authorizes nothing on
-// another. Making that one small package is what keeps the answer to "which of
-// these three am I doing" from being re-decided, differently, in five places.
-//
-// Nothing here talks to a DNS provider, a database or the network. It is pure
-// data and pure rules, so the bounds this service claims can be read, and tested,
-// without a Cloudflare account. See docs/DESIGN.md §2 for the lane table and
-// docs/RECORDS.md for the records each lane produces.
+// A lane is not a label: it decides which identity kind a request carries, which
+// hostnames are derived under the anchor and how long a credential may be held,
+// and it is an input to the ownership proof, so a proof for one lane authorizes
+// nothing on another. Nothing here talks to a DNS provider, a database or the
+// network — pure data and pure rules, so the bounds this service claims are
+// testable without a Cloudflare account. docs/DESIGN.md §2 is the lane table;
+// docs/RECORDS.md the records each produces.
 package lane
 
 import (
@@ -24,15 +20,11 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
 )
 
-// ErrInvalid is the single refusal this package returns.
-//
-// Deliberately ONE error at the boundary, for the same reason dnsplan has one:
-// every caller's check is then identical — errors.Is(err, ErrInvalid) — and a
-// refusal added here later cannot slip past a caller that switched on the set of
-// sentinels it happened to know about. The specific cause travels in the wrapped
-// message, where logs and tests can read it, and never as a sibling sentinel a
-// caller could branch on. There is nothing for a caller to branch on anyway: the
-// answer to every refusal below is that the request is malformed.
+// ErrInvalid is the single refusal this package returns. ONE error at the
+// boundary, as in dnsplan: every check is errors.Is(err, ErrInvalid), so a
+// refusal added later cannot slip past a caller that switched on the sentinels
+// it knew. Every refusal below means the request is malformed, so there is
+// nothing to branch on; the cause travels in the wrapped message.
 var ErrInvalid = errors.New("lane: invalid")
 
 // maxLabel is the DNS wire limit for one label. A hostname may be 253 bytes
@@ -41,11 +33,9 @@ const maxLabel = 63
 
 // Lane is one of exactly three ways a domain reaches MirrorStack.
 //
-// There is no fourth and there is no default. An unrecognised value is refused
-// rather than resolved, because a defaulted lane would pick a record set, an
-// identity kind and a grant lifetime that the customer never consented to — and
-// it would do it silently, since every one of those three looks reasonable on
-// its own.
+// There is no fourth and no default. An unrecognised value is refused, never
+// resolved: a defaulted lane silently picks a record set, an identity kind and a
+// grant lifetime the customer never consented to.
 type Lane string
 
 const (
@@ -55,31 +45,27 @@ const (
 	OrgPlatformDomain Lane = "org_platform_domain"
 
 	// OrgAppDomain is the parent under which every one of an org's apps is
-	// auto-routed at <slug>.<anchor>, behind one wildcard. It is the only lane
-	// whose grant is standing, because the records it exists to write belong to
-	// apps that do not exist yet.
+	// auto-routed at <slug>.<anchor>, behind one wildcard. The only lane whose
+	// grant is standing: the records it exists to write belong to apps that do
+	// not exist yet.
 	OrgAppDomain Lane = "org_app_domain"
 
 	// AppDomain is one arbitrary domain bound to one app.
 	//
-	// 🔴 THERE IS NO ORGANIZATION ON THIS LANE, AND THAT IS NOT AN OVERSIGHT.
-	//
-	// The owner may be a person. Any check that reaches for an org id here finds
-	// nothing, and a check that reads "no org" as "no restriction" is an
-	// authorization hole rather than a nil pointer. Identity() answers the
-	// question once, here, so no caller has to assume it.
+	// 🔴 THERE IS NO ORGANIZATION ON THIS LANE, AND THAT IS NOT AN OVERSIGHT. The
+	// owner may be a person, so any check reaching for an org id finds nothing,
+	// and one reading "no org" as "no restriction" is an authorization hole rather
+	// than a nil pointer. Identity() answers it once, here.
 	AppDomain Lane = "app_domain"
 )
 
 // Parse accepts exactly the three lane strings and nothing else: no case
 // folding, no trimming, no aliases.
 //
-// The lane is a byte string inside the ownership proof the customer publishes —
-// HMAC(K, lane‖id‖anchor) — so it is a cryptographic input rather than a display
-// value. It arrives from MirrorStack's own private half, where a second accepted
-// spelling of one lane is a defect in the caller; being told so is more useful
-// than having it guessed at, and cheaper than discovering later that one domain
-// carries two valid proofs.
+// The lane is a byte string inside the ownership proof — HMAC(K, lane‖id‖anchor)
+// — so it is a cryptographic input, not a display value. It arrives from
+// MirrorStack's own private half, where a second accepted spelling is a defect
+// in the caller; guessing would mean one domain carrying two valid proofs.
 func Parse(s string) (Lane, error) {
 	switch Lane(s) {
 	case OrgPlatformDomain, OrgAppDomain, AppDomain:
@@ -100,11 +86,9 @@ const (
 	IdentityApp IdentityKind = "app"
 )
 
-// Identity reports what kind of id this lane's identity field carries.
-//
-// An unrecognised lane returns the empty kind, which equals neither constant, so
-// a caller that skipped Parse cannot fall through into "org" by default. Lane 3
-// is an APP id and may have no organization anywhere — see AppDomain.
+// Identity reports what kind of id this lane's identity field carries. An
+// unrecognised lane returns the empty kind, so a caller that skipped Parse
+// cannot fall through into "org".
 func (l Lane) Identity() IdentityKind {
 	switch l {
 	case OrgPlatformDomain, OrgAppDomain:
@@ -117,52 +101,38 @@ func (l Lane) Identity() IdentityKind {
 
 // PlatformLabels is the fixed sibling table for the org platform lane.
 //
-// 🔴 THE CALLER CANNOT ADD A FIFTH LABEL OR RENAME ONE. THAT IS THE POINT OF IT
-// BEING A TABLE HERE.
+// 🔴 THE CALLER CANNOT ADD A FIFTH LABEL OR RENAME ONE. Each label becomes a
+// hostname inside the customer's own domain and a subject on a publicly-trusted
+// certificate; a label supplied on a request would be a caller-chosen name, and
+// this design has exactly one of those (see ValidateSlug). `cdn` owns no AWS
+// certificate record, being terminated before the request reaches AWS.
 //
-// Each label becomes a hostname inside the customer's own domain and a subject on
-// a publicly-trusted certificate. A label supplied on a request would be a
-// caller-chosen name, and this design has exactly one of those — the app slug,
-// which selects a name under a parent already proven and is validated on its own
-// (see ValidateSlug).
-//
-// `cdn` deliberately owns no AWS certificate record: a content host is terminated
-// before the request ever reaches AWS, so it is owed no validation record there.
-// That asymmetry lives with the record derivation; this is only the table.
-//
-// The honest limit: this is a package-level slice, so it is writable — by code in
-// this repository and nowhere else, since the package is internal. Tests pin the
-// four strings, so changing them fails a build rather than a customer's zone.
+// The honest limit: this is a package-level slice, so it is writable — by code
+// in this repository and nowhere else, since the package is internal. Tests pin
+// the four strings, so changing them fails a build, not a customer's zone.
 var PlatformLabels = []string{"account", "api", "apps", "cdn"}
 
-// Hosts returns the hostnames this lane serves under anchor, in a fresh slice the
-// caller may keep and mutate.
+// Hosts returns the hostnames this lane serves under anchor, in a fresh slice
+// the caller may keep and mutate. docs/DESIGN.md §2 has the table.
 //
 // 🔴 EVERY NAME RETURNED IS AT OR UNDER THE ANCHOR, BY CONSTRUCTION.
+// dnsplan.Contains enforces it again before anything is published; deriving a
+// name anywhere else would only move the refusal downstream, past a credential
+// exchange.
 //
-// dnsplan.Contains enforces that again before anything is published; deriving a
-// name anywhere else would only move the refusal further downstream, into a code
-// path that runs after a credential has been exchanged.
+// Lane 1 derives the four siblings and NOT the anchor, so an org connecting
+// example.com keeps serving its own website at the apex. Lane 2 derives the
+// single wildcard, which answers only names the zone holds no record of its own
+// for, so what the customer already publishes keeps resolving; per-app hostnames
+// are never listed, because the slug picks one and the wildcard routes it, and
+// only the certificate records are minted per app, at deploy time. Lane 3
+// derives the anchor itself.
 //
-//   - OrgPlatformDomain — the four siblings from PlatformLabels, and NOT the
-//     anchor itself. An org connecting example.com keeps serving its own website
-//     at the apex; those four names are the entire footprint.
-//   - OrgAppDomain — the single wildcard `*.<anchor>`. A wildcard answers only
-//     names for which the zone holds no record of its own, so every host the
-//     customer already publishes keeps resolving exactly as it did. The per-app
-//     hostnames are not listed here and never need to be: the slug picks one and
-//     the wildcard routes it, and only the app's certificate records are minted
-//     per app, at deploy time.
-//   - AppDomain — the anchor itself, and nothing beneath it. The tightest of the
-//     three.
-//
-// The anchor is re-validated here rather than trusted, and an anchor that fails
-// returns nil. A total function that answers nothing for a bad input is the
-// legible behaviour: "account." + "" is a name under no anchor at all, and the
-// caller that skipped validation would otherwise get four of them. The reserved
-// suffix list is deliberately not consulted — Hosts derives, it does not admit,
-// and a reserved check run here with an empty list would be the guard that
-// silently protects nothing (see ValidateDomain).
+// The anchor is re-validated rather than trusted, and one that fails returns nil
+// rather than four names under no anchor at all. The reserved suffix list is
+// deliberately not consulted: Hosts derives, it does not admit, and a reserved
+// check run here with an empty list would be the guard that silently protects
+// nothing (see ValidateDomain).
 func (l Lane) Hosts(anchor string) []string {
 	anchor, err := ValidateDomain(anchor, nil)
 	if err != nil {
@@ -183,9 +153,8 @@ func (l Lane) Hosts(anchor string) []string {
 	return nil
 }
 
-// Standing is the grant lifetime of a lane whose credential is held with no fixed
-// expiry. It is the zero duration, which is why GrantLifetime never returns zero
-// for anything else.
+// Standing is the grant lifetime of a lane held with no fixed expiry. It is the
+// zero duration, which is why GrantLifetime never returns zero for anything else.
 const Standing = time.Duration(0)
 
 // closedLaneLifetime is how long a credential is held on a lane whose record set
@@ -197,23 +166,17 @@ const alreadyExpired = -1 * time.Second
 
 // GrantLifetime is how long a grant on this lane is held.
 //
-// Lanes 1 and 3 are CLOSED: their record sets are finite and known at the moment
-// the customer authorizes, so the credential is held 24 hours and then gone. That
-// is only possible because record 6 — `_acme-challenge.<host>` pointing at
-// Cloudflare's delegated DCV location — carries no token and never changes, so
-// nothing has to be republished on a certificate-renewal clock. Lane 2 is
-// STANDING, because the records it exists to write belong to apps that do not
-// exist yet; its expiry slides forward each time it publishes. docs/RECORDS.md
-// says that is the trade to argue with hardest on this repository, and it is.
+// Lanes 1 and 3 are CLOSED: their record sets are finite and known when the
+// customer authorizes, so the credential is held 24 hours and then gone — only
+// possible because record 6 carries no token and never changes, so nothing needs
+// republishing on a certificate-renewal clock. Lane 2 is STANDING, its expiry
+// sliding forward each time it publishes; docs/RECORDS.md calls that the trade
+// to argue with hardest on this repository, and it is.
 //
-// 🔴 ZERO MEANS STANDING, SO AN UNRECOGNISED LANE MUST NEVER RETURN ZERO.
-//
-// It returns a negative duration instead. A caller that branches on Standing does
-// not take the standing branch, and a caller that forgets to branch adds the
-// duration to now and computes an expiry in the past — holding a grant that is
-// already dead. There is no value this function can return that fails open, which
-// is the property being bought: the dangerous answer here is also the default
-// answer of a switch that forgot a case.
+// 🔴 ZERO MEANS STANDING, SO AN UNRECOGNISED LANE MUST NEVER RETURN ZERO. It
+// returns a negative duration: a caller that branches on Standing does not take
+// the standing branch, and one that forgets to branch computes an expiry in the
+// past, holding a grant already dead. No return value here fails open.
 func (l Lane) GrantLifetime() time.Duration {
 	switch l {
 	case OrgPlatformDomain, AppDomain:
@@ -227,21 +190,18 @@ func (l Lane) GrantLifetime() time.Duration {
 // ValidateIdentity accepts ONLY the canonical 36-character hyphenated UUID, in
 // any case, and returns it lowercased.
 //
-// Deliberately stricter than a general UUID parser, for dnsplan's reason: pgtype
-// accepts braced and unhyphenated spellings, so "the same" id can arrive in
-// several encodings. The id is inside the plan digest AND inside the ownership
-// HMAC the customer publishes, so two encodings of one id are two digests and two
-// proofs — a registration would quietly stop matching itself, and the customer
-// would be told the plan changed.
+// Stricter than a general UUID parser, for dnsplan's reason: pgtype accepts
+// braced and unhyphenated spellings, so "the same" id can arrive in several
+// encodings. The id is inside the plan digest AND the ownership HMAC, so two
+// encodings are two digests and two proofs — a registration would quietly stop
+// matching itself and the customer would be told the plan changed. Whether the
+// org or app EXISTS is api-platform's question; only the spelling is settled
+// here, which is why the nil UUID is accepted: canonical, and it names nothing.
 //
-// This function does not ask whether the org or app exists; that is api-platform's
-// question and it holds the rows. All that is settled here is the spelling, which
-// is why the nil UUID is accepted: it is canonical, and it names nothing.
-//
-// The rule is duplicated rather than shared because dnsplan's copy is unexported.
-// Two copies of one rule drift, and the looser copy is the one that matters — so
-// TestValidateIdentityMatchesDnsplanStrictness runs both over one table through
-// dnsplan's exported surface and fails if they ever disagree.
+// The rule is duplicated because dnsplan's copy is unexported, and the looser of
+// two copies is the one that matters — so
+// TestValidateIdentityMatchesDnsplanStrictness runs both over one table and
+// fails if they ever disagree.
 func ValidateIdentity(s string) (string, error) {
 	if len(s) != 36 {
 		return "", fmt.Errorf("%w: identity is not a canonical uuid", ErrInvalid)
@@ -265,56 +225,40 @@ func ValidateIdentity(s string) (string, error) {
 	return strings.ToLower(s), nil
 }
 
-// ValidateDomain accepts one DNS name and returns it normalized: lowercased, with
-// surrounding space and the root dot removed.
+// ValidateDomain accepts one DNS name and returns it normalized: lowercased,
+// with surrounding space and the root dot removed.
 //
 // At most 253 bytes, at least two labels, every label LDH — letters, digits and
-// hyphen, not starting or ending with a hyphen — no empty label, no wildcard, no
-// underscore label, and no all-numeric rightmost label. An internationalized
-// domain must arrive as its A-label (`xn--…`), which is already LDH: this service
-// will not convert one for you, because silently rewriting a customer's domain
-// produces a name they did not type and cannot recognise on a consent screen.
+// hyphen, not starting or ending with one — no empty label, no wildcard, no
+// underscore label, no all-numeric rightmost label. An internationalized domain
+// must arrive as its A-label (`xn--…`): converting one here would produce a name
+// the customer did not type and cannot recognise on a consent screen.
 //
-// The name validated here becomes the ANCHOR — the single bound on everything a
-// delegated credential can ever reach — so the rules are about what can be
-// proven and derived, not about what a resolver would tolerate. A single label
-// is a TLD nobody can own, and an anchor there would make containment meaningless.
-// An all-numeric rightmost label is an address wearing a domain's shape, and this
-// service publishes no A or AAAA record and has nothing to say about an address.
+// The name becomes the ANCHOR — the single bound on everything a delegated
+// credential can ever reach — so the rules are about what can be proven and
+// derived, not what a resolver would tolerate. A single label is a TLD nobody
+// can own; an all-numeric rightmost label is an address wearing a domain's
+// shape, and this service publishes no A or AAAA record.
 //
-// 🔴 A NAME AT OR UNDER A RESERVED SUFFIX IS REFUSED OUTRIGHT.
+// 🔴 A NAME AT OR UNDER A RESERVED SUFFIX IS REFUSED OUTRIGHT: it has no
+// customer at the other end, so the ownership proof would be published by us
+// (docs/DESIGN.md §1) and this write path would be reusable as a platform-zone
+// editor. Matching is on a leading dot (dnsplan.Contains) and one-directional —
+// neither a domain merely ending in the same letters nor a name ABOVE a reserved
+// suffix, which somebody could genuinely own, is refused.
 //
-// A name under a MirrorStack suffix has no customer on the other end of it: the
-// ownership proof would be published by us, which is exactly the defect
-// docs/DESIGN.md §1 exists to remove. Refusing it here keeps the proof meaningful
-// and keeps the customer-grant write path from being reused as a platform-zone
-// editor. The suffix is matched with a leading dot (dnsplan.Contains), so a
-// reserved "example.com" refuses "example.com" and "account.example.com" and does
-// NOT refuse "evilexample.com" — a different domain that merely ends in the same
-// letters. The match is one-directional: a name ABOVE a reserved suffix is not
-// refused, because that is a domain somebody could genuinely own, and the
-// ownership proof is what settles whether they do.
-//
-// An empty reserved list reserves nothing, and that is a decision the call site
-// makes visibly. An entry that is PRESENT but normalizes to nothing is a
-// different thing — someone intended protection and it evaporated — so it refuses
-// every domain instead of quietly protecting none. A guard that protects nothing
-// while reading like protection is worse than no guard at all.
+// An empty reserved list reserves nothing, visibly, at the call site. An entry
+// PRESENT but normalizing to nothing is different — someone intended protection
+// and it evaporated — so it refuses every domain instead: a guard that protects
+// nothing while reading like protection is worse than no guard at all.
 func ValidateDomain(name string, reserved []string) (string, error) {
 	// 🔴 STRUCTURAL ILLEGALITY IS CHECKED ON THE RAW NAME, BEFORE NORMALIZING.
 	//
-	// This used to lean on NormalizeName preserving the defect: "example.com.."
-	// normalized to "example.com.", whose empty last label labelReason then
-	// caught. That made a REFUSAL depend on a normalizer being incomplete, and
-	// when NormalizeName was made idempotent — which it had to be, because
-	// Validate re-normalizes what NewSnapshot stored and a disagreement strands a
-	// customer mid-connect — the doubled dot folded away and the refusal
-	// evaporated with it.
-	//
-	// Normalizing is total and validating is strict; a rule that needs the first
-	// one to be lossy is a rule in the wrong place. An empty label is illegal in
-	// a DNS name however it is spelled, so it is refused here on what the caller
-	// actually sent.
+	// This used to lean on NormalizeName preserving the defect; when NormalizeName
+	// was made idempotent — as it had to be, because Validate re-normalizes what
+	// NewSnapshot stored and a disagreement strands a customer mid-connect —
+	// "example.com.." folded away and the refusal evaporated with it. An empty
+	// label is illegal however it is spelled, so it is refused on what arrived.
 	if strings.Contains(strings.TrimSpace(name), "..") {
 		return "", fmt.Errorf("%w: %q has an empty label", ErrInvalid, echo(strings.TrimSpace(name)))
 	}
@@ -338,10 +282,9 @@ func ValidateDomain(name string, reserved []string) (string, error) {
 	if allDigits(labels[len(labels)-1]) {
 		return "", fmt.Errorf("%w: %q has an all-numeric rightmost label", ErrInvalid, echo(normalized))
 	}
-	// The list is checked before it is used, so a malformed entry is reported
-	// whichever domain happens to be under inspection. Checking it inline would
-	// surface the config defect only for the names that matched nothing else —
-	// which is to say, mostly not at all.
+	// Checked before use, so a malformed entry is reported whichever domain is
+	// under inspection; inline, it would surface only for names that matched
+	// nothing else.
 	suffixes := make([]string, 0, len(reserved))
 	for _, entry := range reserved {
 		suffix := dnsplan.NormalizeName(entry)
@@ -349,20 +292,12 @@ func ValidateDomain(name string, reserved []string) (string, error) {
 			slog.Error("lane: refusing every domain because the reserved-suffix list carries an entry that normalizes to nothing")
 			return "", fmt.Errorf("%w: the reserved suffix list is malformed", ErrInvalid)
 		}
-		// 🔴 A LEADING DOT IS THE SAME FAILURE ONE SPELLING FURTHER OUT.
-		//
-		// Suffixes are often WRITTEN with a leading dot, and an operator setting
-		// MS_RESERVED_DOMAIN_SUFFIXES=".staging.example" is writing what looks
-		// like a suffix. NormalizeName trims a trailing root dot and not a
-		// leading one, so the entry survives non-empty, the guard above does not
-		// fire, and Contains then tests for the suffix "..staging.example" —
-		// which no DNS name can end in. The entry protects nothing while reading
-		// like protection, which is exactly what the paragraph above says must
-		// never happen; it was found by fuzzing internal/derive.
-		//
-		// Refused rather than repaired: stripping the dot would guess at intent,
-		// and the entry is a NAME by contract. An operator who sees this error
-		// fixes their configuration in one edit.
+		// A leading dot is the same failure one spelling further out, and suffixes
+		// are often WRITTEN with one. NormalizeName trims a trailing root dot and
+		// not a leading one, so the entry survives non-empty, the guard above does
+		// not fire, and Contains then tests for "..staging.example" — which no DNS
+		// name can end in. Found by fuzzing internal/derive. Refused rather than
+		// repaired: stripping it would guess at intent; the entry is a NAME.
 		if strings.HasPrefix(suffix, ".") {
 			slog.Error("lane: refusing every domain because a reserved-suffix entry is written with a leading dot",
 				"entry", suffix)
@@ -383,33 +318,25 @@ func ValidateDomain(name string, reserved []string) (string, error) {
 // ValidateSlug accepts a single LDH label of at most 63 bytes and returns it
 // lowercased.
 //
-// 🔴 THIS IS THE ONE CALLER-CHOSEN STRING ANYWHERE IN THIS DESIGN.
-//
-// Every other byte that reaches a customer's zone is derived here or relayed from
-// AWS or Cloudflare. A slug selects WHICH name under a parent the customer has
-// already proven — never WHAT is written there — so the only question this
-// function has to answer is whether the caller picked a name or picked a shape.
+// 🔴 THIS IS THE ONE CALLER-CHOSEN STRING ANYWHERE IN THIS DESIGN. Every other
+// byte reaching a customer's zone is derived here or relayed from AWS or
+// Cloudflare. A slug selects WHICH name under a parent the customer has already
+// proven, never WHAT is written there.
 //
 // 🔴 A DOTTED SLUG DOES NOT ESCAPE THE ANCHOR, WHICH IS PRECISELY WHY IT HAS TO
-// BE REFUSED HERE.
-//
-// "a.b" under example.net is a.b.example.net, which is still at or under the
-// anchor: dnsplan.Contains passes it and no later check objects. Two things go
-// wrong quietly instead. The caller has chosen the shape of a name rather than
-// one label, which is authority this design does not give it. And `*.example.net`
-// matches exactly one label, so the app would be handed a hostname the wildcard
-// does not route and would simply never serve — a bug with no error in it.
+// BE REFUSED HERE. "a.b" under example.net is still at or under the anchor, so
+// dnsplan.Contains passes it and no later check objects. Two things go wrong
+// quietly instead: the caller has chosen the SHAPE of a name rather than one
+// label, authority this design does not give it, and `*.example.net` matches
+// exactly one label, so the app would be handed a hostname the wildcard does not
+// route and would simply never serve — a bug with no error in it.
 //
 // It must equally be unable to spell `_acme-challenge`, `_cf-custom-hostname`,
-// `_mirrorstack-challenge` or `_dmarc`. Those owners already mean something to a
-// certificate authority, to Cloudflare, or to a mail receiver, and a slug that
-// could name one would let the caller aim a derived record at a name whose
-// meaning it did not choose.
+// `_mirrorstack-challenge` or `_dmarc`: those owners already mean something to a
+// certificate authority, to Cloudflare, or to a mail receiver.
 //
-// Case is folded, because DNS is case-insensitive and folding is not a change of
-// identity. Nothing else is repaired: no trimming, no substitution, no stripping
-// of a stray dot. This is the one string a caller chooses, and a repaired slug is
-// a hostname nobody typed.
+// Case is folded; DNS is case-insensitive. Nothing else is repaired, because a
+// repaired slug is a hostname nobody typed.
 func ValidateSlug(s string) (string, error) {
 	folded := strings.ToLower(s)
 	if strings.Contains(folded, ".") {
@@ -422,22 +349,20 @@ func ValidateSlug(s string) (string, error) {
 }
 
 // labelReason reports why one DNS label is unacceptable, or "" when it is fine.
-//
-// It expects a label that has already been lowercased — both callers fold first —
-// because an uppercase byte would otherwise be reported as a character outside
-// LDH, which is true and unhelpful.
+// It expects a lowercased label — both callers fold first — since an uppercase
+// byte would otherwise be reported as a character outside LDH.
 func labelReason(label string) string {
 	switch {
 	case label == "":
 		// A leading dot, a trailing dot and a doubled dot all arrive here, as an
-		// empty label between two separators. No such name exists in DNS.
+		// empty label between separators. No such name exists in DNS.
 		return "an empty label"
 	case len(label) > maxLabel:
 		return fmt.Sprintf("a label over %d bytes", maxLabel)
 	case strings.Contains(label, "*"):
-		// A wildcard is a name this service DERIVES — lane 2's `*.<anchor>`, once,
-		// after a proof at that anchor. A caller able to spell one could ask for a
-		// record covering every name in the zone.
+		// A wildcard is a name this service DERIVES — lane 2's `*.<anchor>`, after
+		// a proof at that anchor. A caller able to spell one could ask for a record
+		// covering every name in the zone.
 		return "a wildcard label"
 	case strings.Contains(label, "_"):
 		// Underscore labels are where the protocols live: _acme-challenge,
@@ -476,12 +401,9 @@ func allDigits(label string) bool {
 	return true
 }
 
-// echo bounds what a refusal quotes back at the caller.
-//
-// Caller input is untrusted in size as well as in content, and an error string is
-// somewhere a value gets copied, logged, and copied again. Truncating may split a
-// UTF-8 rune; %q renders the stray byte as an escape, which is honest about what
-// arrived.
+// echo bounds what a refusal quotes back: input is untrusted in size as well as
+// content, and an error string gets copied, logged, and copied again. Truncating
+// may split a UTF-8 rune; %q renders the stray byte honestly, as an escape.
 func echo(s string) string {
 	const max = 64
 	if len(s) > max {

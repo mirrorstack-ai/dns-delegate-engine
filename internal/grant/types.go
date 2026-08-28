@@ -1,6 +1,7 @@
 // Package grant is the RPC surface api-platform calls.
 //
-// 🔴 THE SERVICE IS STATELESS. IT OWNS NO TABLE AND OPENS NO DATABASE.
+// 🔴 THE SERVICE IS STATELESS. IT OWNS NO TABLE AND OPENS NO DATABASE
+// (CLAUDE.md, "No database, ever").
 //
 // api-platform derives the plan and owns every row; this service owns the two
 // things a plan cannot be published without — the OAuth client that talks to the
@@ -8,10 +9,6 @@
 // stores ciphertext it holds no key for, and this service holds a credential it
 // has no place to persist. Neither half can act alone, and the public half is
 // small enough to read.
-//
-// That is a stronger arrangement than giving this service its own database
-// grant, which was the earlier design: there is no schema to drift, no
-// migration to sequence, and no second writer to the customer's rows.
 package grant
 
 import "github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
@@ -24,7 +21,7 @@ const (
 
 // CapabilitiesResponse tells api-platform what this deployment can offer, so the
 // console renders no connect affordance rather than a button that fails on the
-// provider's own consent screen.
+// provider's consent screen.
 type CapabilitiesResponse struct {
 	Available bool     `json:"available"`
 	CanHold   bool     `json:"canHold"`

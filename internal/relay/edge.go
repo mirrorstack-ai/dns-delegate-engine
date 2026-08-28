@@ -13,34 +13,24 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
 )
 
-// edgeAPIBase is Cloudflare's v4 API root.
-//
-// Deliberately a second copy of the constant in internal/provider/cloudflare
-// rather than an import of it. That package is the CUSTOMER-credential path: its
-// every call takes the customer's delegated token as an argument. This file is
-// the MIRRORSTACK-credential path. Keeping them from importing each other is
-// what makes "the customer's token is never sent to our zone" a property you can
-// check by reading the imports, and one shared URL string is a cheap price.
+// edgeAPIBase is Cloudflare's v4 API root. Deliberately a second copy of the
+// constant in internal/provider/cloudflare rather than an import: that package is
+// the CUSTOMER-credential path and this file is the MIRRORSTACK-credential path,
+// so keeping them from importing each other makes "the customer's token is never
+// sent to our zone" a property you can check by reading the imports.
 const edgeAPIBase = "https://api.cloudflare.com/client/v4"
 
-// maxEdgeResponse bounds the upstream body this reader will hold in memory.
-//
-// Base is overridable and the response is untrusted input in the same sense
-// internal/sealed's stored envelope is: it is read BEFORE anything about it has
-// been established, so an endpoint that answers with an endless body must not be
-// able to turn one pass of the loop into an allocation. A custom hostname
-// listing filtered to ONE hostname is a few kilobytes; this is generous by
-// orders of magnitude and still finite. Exceeding it is a refusal, not a silent
-// truncation — a truncated JSON body that happened to parse would be an answer
-// nobody sent.
+// maxEdgeResponse bounds the upstream body this reader will hold in memory. Base
+// is overridable and the response is untrusted input read BEFORE anything about it
+// has been established, so an endpoint that answers with an endless body must not
+// turn one pass of the loop into an allocation. Exceeding it is a refusal, not a
+// silent truncation — a truncated JSON body that happened to parse would be an
+// answer nobody sent.
 const maxEdgeResponse = 1 << 20 // 1 MiB
 
-// TokenSource yields MirrorStack's own Cloudflare zone credential for one call.
-//
-// A function rather than a string so the token can be re-read from Secrets
-// Manager on a TTL and rotate underneath a running process — the same reason
-// internal/shared/grantcrypto and internal/shared/cfoauth resolve their secrets
-// at request time instead of at deploy time.
+// TokenSource yields MirrorStack's own Cloudflare zone credential for one call. A
+// function rather than a string so the token can be re-read from Secrets Manager on
+// a TTL and rotate underneath a running process.
 type TokenSource func(ctx context.Context) (string, error)
 
 // StaticToken adapts a token already in hand. Intended for local runs and tests;
@@ -51,13 +41,11 @@ func StaticToken(token string) TokenSource {
 
 // Edge reads record 7 — the serving proof — from Cloudflare for SaaS.
 //
-// 🔴 ZoneID IS MIRRORSTACK'S ZONE, AND Token IS MIRRORSTACK'S TOKEN.
-//
-// A custom hostname is an object in OUR zone, and reading it needs the SSL and
-// Certificates permission on that zone. A customer's delegated grant carries
-// zone.read and dns.write on the ONE zone they picked — their own — so it could
-// not perform this read even if it were offered it. There is no field on this
-// struct that a customer credential belongs in.
+// 🔴 ZoneID IS MIRRORSTACK'S ZONE, AND Token IS MIRRORSTACK'S TOKEN. Reading a
+// custom hostname in OUR zone needs the SSL and Certificates permission there,
+// which a customer's delegated grant — zone.read and dns.write on the one zone
+// they picked — could not perform even if it were offered it. There is no field on
+// this struct that a customer credential belongs in.
 type Edge struct {
 	// ZoneID is the MirrorStack SaaS zone holding the custom hostname. The org
 	// lane and the app lane use different zones; the caller supplies the right
@@ -78,10 +66,9 @@ type Edge struct {
 var _ EdgeHostnames = Edge{}
 
 // customHostname is Cloudflare's read shape, reduced to the two fields this
-// service reads. Everything else in the object — the certificate's status, its
-// pending validation records, the hostname id — is deliberately absent: this
-// service is stateless and re-reads, so an id it does not decode is an id it
-// cannot accidentally start storing.
+// service reads. The certificate's status, its pending validation records and the
+// hostname id are deliberately absent: this service is stateless and re-reads, so
+// an id it does not decode is an id it cannot accidentally start storing.
 type customHostname struct {
 	Hostname              string `json:"hostname"`
 	OwnershipVerification struct {
@@ -96,27 +83,19 @@ type customHostname struct {
 // 🔴 RECORD 7 IS A SECOND, SEPARATE PROOF, READ BY THE EDGE AND NOT BY A
 // CERTIFICATE AUTHORITY. MISSING IT PRODUCES A 526 WHILE THE CERTIFICATE STATUS
 // READS ACTIVE — the hardest shape of this failure to diagnose, because DNS, the
-// certificate and the console all read healthy.
+// certificate and the console all read healthy. _acme-challenge is read by a
+// certificate authority instead and fails the other way: missing, a renewal fails
+// months later, silently (docs/RECORDS.md, "serving"). The waits differ too —
+// Cloudflare mints this proof when the custom hostname is CREATED, and mints the
+// certificate challenge only after that host's routing record resolves, so on an
+// early pass this is ready and the certificate record is not.
 //
-// The two underscore records answer to different readers and fail at different
-// times, and describing them with one word names the wrong blocker:
-//
-//	_acme-challenge       a certificate authority reads it, via the delegation.
-//	                      Missing → a renewal fails months later, silently.
-//	_cf-custom-hostname   the edge reads it, before it will route at all.
-//	                      Missing → 526 now, with the certificate healthy.
-//
-// Their waits differ too. Cloudflare mints this proof when the custom hostname
-// is CREATED, and mints the certificate challenge only after that host's routing
-// record resolves. So on an early pass this is ready and the certificate record
-// is not; on a later one both are.
-//
-// ready=false with a nil error is the normal early state: the custom hostname
-// does not exist yet, or exists and Cloudflare has not asked for a proof. The
-// only errors this method returns are a failed call and a missing credential. A
-// record Cloudflare's own contract says it cannot return is refused one level
-// up, by the free ServingProof in relay.go, so the refusal holds for every
-// implementation of EdgeHostnames rather than for this one.
+// ready=false with a nil error is the normal early state: the custom hostname does
+// not exist yet, or exists and Cloudflare has not asked for a proof. The only
+// errors this method returns are a failed call and a missing credential. A record
+// Cloudflare's own contract says it cannot return is refused one level up, by the
+// free ServingProof in relay.go, so that refusal holds for every implementation of
+// EdgeHostnames rather than for this one.
 func (e Edge) ServingProof(ctx context.Context, host string) (dnsplan.Record, bool, error) {
 	host = dnsplan.NormalizeName(host)
 	if host == "" || len(host) > dnsplan.MaxDNSName {
@@ -127,8 +106,7 @@ func (e Edge) ServingProof(ctx context.Context, host string) (dnsplan.Record, bo
 	}
 	// A missing token is a configuration fault reported as a fault. Reporting it
 	// as not-ready would be indistinguishable from Cloudflare being slow — and
-	// would stay indistinguishable forever, which is the shape of green signal
-	// that costs the most to diagnose.
+	// would stay indistinguishable forever.
 	if e.Token == nil {
 		return dnsplan.Record{}, false, fmt.Errorf("relay: no MirrorStack zone credential configured for the serving proof")
 	}
@@ -188,19 +166,15 @@ func (e Edge) ServingProof(ctx context.Context, host string) (dnsplan.Record, bo
 // nothing; only a non-empty name AND a non-empty value do. That is Cloudflare's
 // wire shape, which is why the WAIT is decided here.
 //
-// Note also that ownership_verification is a TOP-LEVEL field, a sibling of ssl
-// rather than a member of it. api-platform read the ssl object alone and went
-// months without ever parsing this proof, which is the same shape of bug read
-// from the other side.
+// ownership_verification is also a TOP-LEVEL field, a sibling of ssl rather than a
+// member of it: api-platform read the ssl object alone and went months without
+// ever parsing this proof, the same shape of bug from the other side.
 //
-// 🔴 WHETHER THE RECORD MAY BE PUBLISHED IS NOT DECIDED HERE. The type, the
-// _cf-custom-hostname name beneath the host that was asked for, and the bound on
-// the value are checked by the free ServingProof in relay.go, above this
-// interface, so they hold for any edge implementation and not only for this one.
-// Cloudflare's HTTP alternative, for instance, arrives in its own field
-// (ownership_verification_http) and never as a type here — but it is relay.go
-// that refuses a non-TXT, because an adapter cannot opt out of a rule it never
-// sees.
+// Whether the record may be PUBLISHED is not decided here: the type, the
+// _cf-custom-hostname name beneath the host asked for, and the bound on the value
+// are checked by the free ServingProof in relay.go. Cloudflare's HTTP alternative
+// arrives in its own field (ownership_verification_http) and never as a type here,
+// but it is still relay.go that refuses a non-TXT.
 func servingProofRecord(found customHostname) (dnsplan.Record, bool) {
 	proof := found.OwnershipVerification
 	if strings.TrimSpace(proof.Name) == "" || strings.TrimSpace(proof.Value) == "" {
@@ -223,12 +197,10 @@ func (e Edge) client() *http.Client {
 	return &http.Client{Timeout: 15 * time.Second}
 }
 
-// get performs the one read this file makes.
-//
-// There is no post, patch or delete here, and that is not an accident of what
-// was needed: a custom hostname belongs to api-platform's lifecycle, and this
-// service is the half that holds credentials. Giving it a write method against
-// MirrorStack's own zone would put the two halves back together.
+// get performs the one read this file makes. There is no post, patch or delete
+// here, and that is not an accident of what was needed: a custom hostname belongs
+// to api-platform's lifecycle, and giving the half that holds credentials a write
+// method against MirrorStack's own zone would put the two halves back together.
 func (e Edge) get(ctx context.Context, token, path string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.base()+path, nil)
 	if err != nil {

@@ -10,89 +10,74 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 )
 
-// Page renders the consent page for a registration: the anchor, the wildcard
-// that will be published, that the grant is STANDING rather than 24 hours, what
-// it can and cannot reach, and the two controls the customer keeps — delete the
-// ownership proof, or revoke at the provider.
+// Page renders the consent page for a registration: the anchor, the wildcard that
+// will be published, that the grant is STANDING rather than 24 hours, what it can
+// and cannot reach, and the two controls the customer keeps — delete the ownership
+// proof, or revoke at the provider.
 //
 // 🔴 IT IS A LEGAL-WEIGHT DISCLOSURE, NOT A SCREEN. What comes back is the
 // entire text a customer is asked to agree to before a standing credential over
 // their zone exists, and the acknowledgement Token mints refers to it. Every
-// sentence in it has to be true of the code in this repository, which is the
-// reason the page is built here rather than anywhere a product decision could
-// reach it. Two consequences worth stating plainly, because they look like
-// omissions:
+// sentence has to be true of the code in this repository, which is why the page is
+// built here rather than anywhere a product decision could reach it. Two
+// consequences that look like omissions:
 //
-//   - It has no call to action, no button and no form. This function renders a
-//     description; collecting the agreement belongs to whatever serves the page,
-//     and keeping the two apart is what keeps a render from becoming an
-//     acknowledgement (see Token).
-//   - It fetches nothing. No script, no image, no font, no external stylesheet,
-//     no link — the source contains no `src` and no `href` at all, so "this page
-//     made no request and reported nothing about you" is checkable by reading it
-//     rather than by trusting us. A consent screen that phoned home while asking
-//     for consent would be answering the customer's question the wrong way. The
-//     one <style> block is inline, and TestPageLoadsNothingAndPostsNowhere is
-//     what keeps that the only one.
+//   - No call to action, no button and no form. Collecting the agreement belongs
+//     to whatever serves the page, and keeping the two apart is what keeps a
+//     render from becoming an acknowledgement (see Token).
+//   - It fetches nothing: no script, image, font, external stylesheet or link —
+//     the source contains no `src` and no `href` at all, so "this page made no
+//     request and reported nothing about you" is checkable by reading it. The one
+//     <style> block is inline, and TestPageLoadsNothingAndPostsNowhere keeps it
+//     the only one.
 //
-// The nonce is the page's reference: it is printed on the page and it is inside
-// the acknowledgement, which is what ties a token to the exact text that was
-// shown. Page and Token agree on what a usable (nonce, anchor) pair is because
-// Page asks Token's own validator — a page that cannot be acknowledged is not
-// worth serving.
+// The nonce is the page's reference, printed on the page and inside the
+// acknowledgement, which ties a token to the exact text shown. Page asks Token's
+// own validator what a usable (nonce, anchor) pair is.
 //
-// 🔴 THE ONLY DEFENCE AGAINST A HOSTILE VALUE HERE IS CONTEXTUAL ESCAPING, AND
-// THAT IS DELIBERATE.
-//
-// Every string this page renders — the anchor, a record's name, a routing
-// target, an explanation — goes through html/template, which escapes for the
-// context it lands in. What this function does NOT do is re-check that the
-// anchor is a syntactically valid DNS name. lane.ValidateDomain does that where
-// domains enter the service, and internal/derive runs it before a plan exists;
-// repeating it here would be a second copy of a rule to drift, and, worse, it
-// would tempt a later reader into believing the escaping is a formality that
-// something upstream has already made unnecessary. It has not. The escaping is
-// unconditional so that it keeps holding the day the checks upstream are
-// reordered, and TestPageEscapesEveryValueItRenders drives a plan through here
-// that no validator would ever have passed, precisely to prove the escaping does
-// not depend on one.
+// 🔴 THE ONLY DEFENCE AGAINST A HOSTILE VALUE HERE IS CONTEXTUAL ESCAPING.
+// Every string rendered goes through html/template. This function does NOT
+// re-check that the anchor is a syntactically valid DNS name — lane.ValidateDomain
+// does that where domains enter the service, and internal/derive before a plan
+// exists — because a second copy would drift, and would tempt a later reader into
+// treating the escaping as a formality something upstream has made unnecessary.
+// It is unconditional so that it keeps holding the day those checks are reordered,
+// and TestPageEscapesEveryValueItRenders drives a plan through here that no
+// validator would ever have passed, to prove it depends on none.
 //
 // What it does check is SEMANTIC rather than syntactic: that the plan describes
 // the grant this page's sentences are about. See the refusals below.
 func Page(p derive.Plan, nonce string) (string, error) {
-	// 🔴 THE PAGE'S CENTRAL CLAIM IS A LANE-2 CLAIM. Rendering it for another
-	// lane would tell a customer their closed, 24-hour, four-record grant is a
-	// standing wildcard — and would mint an acknowledgement saying they had been
-	// told so. Note the asymmetry with Required, which fails closed in the other
-	// direction: an unrecognised lane is REQUIRED to have a page and CANNOT be
-	// given one, so it is blocked rather than described wrongly.
+	// The page's central claim is a lane-2 claim: rendering it for another lane
+	// would tell a customer their closed, 24-hour, four-record grant is a standing
+	// wildcard, and mint an acknowledgement saying they had been told so. Required
+	// fails closed the other way, so an unrecognised lane is REQUIRED to have a page
+	// and CANNOT be given one — blocked rather than described wrongly.
 	if p.Lane != lane.OrgAppDomain {
 		return "", fmt.Errorf("%w: this page describes the %s grant, not %q",
 			ErrConsent, lane.OrgAppDomain, echo(string(p.Lane)))
 	}
-	// Unreachable today, and retained. The page says, in its own words, that this
-	// grant has no expiry; package lane is where that is actually decided. If the
-	// lane table ever gives lane 2 a bounded lifetime, this refusal is what
-	// forces whoever changed it to come and rewrite the page, instead of leaving
-	// a disclosure that is confidently wrong about the one property it exists to
-	// disclose.
+	// Unreachable today, and retained. The page says this grant has no expiry;
+	// package lane is where that is actually decided. If the lane table ever gives
+	// lane 2 a bounded lifetime, this refusal forces whoever changed it to rewrite
+	// the page instead of leaving a disclosure that is confidently wrong about the
+	// one property it exists to disclose.
 	if p.Lane.GrantLifetime() != lane.Standing {
 		return "", fmt.Errorf("%w: %s no longer holds a standing grant, and this page says it does",
 			ErrConsent, lane.OrgAppDomain)
 	}
 
 	anchor := dnsplan.NormalizeName(p.Anchor)
-	// message is Token's validator, called here for its refusals. It bounds the
-	// anchor and the reference and rejects a separator in either, so every page
-	// this function returns is one an acknowledgement can be minted for.
+	// message is Token's validator, called for its refusals: it bounds the anchor
+	// and the reference and rejects a separator in either, so every page returned
+	// is one an acknowledgement can be minted for.
 	if _, err := message(nonce, anchor); err != nil {
 		return "", err
 	}
-	// dnsplan.MaxRecords is the publish boundary's bound, reused rather than
-	// chosen again: the page and the writer disagreeing about how many records a
-	// plan may hold would mean a customer consenting to a set that is then
-	// refused, or — the direction that matters — a set larger than the one they
-	// were shown.
+	// dnsplan.MaxRecords is the publish boundary's bound, reused rather than chosen
+	// again: page and writer disagreeing about how many records a plan may hold
+	// would mean a customer consenting to a set that is then refused, or — the
+	// direction that matters — a set larger than the one they were shown.
 	if len(p.Items) == 0 || len(p.Items) > dnsplan.MaxRecords {
 		return "", fmt.Errorf("%w: a plan of %d records describes no grant a customer can agree to",
 			ErrConsent, len(p.Items))
@@ -126,12 +111,10 @@ func Page(p derive.Plan, nonce string) (string, error) {
 		})
 	}
 
-	// The ownership row is required because the page's first stop control names
-	// it: "delete this record and every write stops". A page that gave that
-	// instruction without naming the record would be handing a customer a
-	// control they cannot find, and its source must be the customer — a proof we
-	// write ourselves proves nothing, and the sentence would be false of a row we
-	// publish.
+	// The ownership row is required because the page's first stop control names it:
+	// "delete this record and every write stops". Without it the customer is handed
+	// a control they cannot find, and its source must be the customer — the
+	// sentence would be false of a row we publish.
 	if ownership == nil {
 		return "", fmt.Errorf("%w: the plan carries no ownership proof, so the page cannot name what to delete", ErrConsent)
 	}
@@ -139,12 +122,11 @@ func Page(p derive.Plan, nonce string) (string, error) {
 		return "", fmt.Errorf("%w: the ownership proof is marked %q rather than %q, and a proof we publish is not a stop control",
 			ErrConsent, echo(string(ownership.Source)), derive.SourceCustomer)
 	}
-	// The wildcard is the grant. It has to be present, it has to be ours to
-	// write, and it has to be the wildcard AT THIS ANCHOR — the page names it in
-	// its heading, so a plan whose routing record is some other name would be
+	// The wildcard is the grant: present, ours to write, and AT THIS ANCHOR — the
+	// page names it in its heading, so a plan with some other routing name would be
 	// consented to under a description of a name it does not contain. A per-app
-	// bind plan (derive.BindApp) lands here: it has no routing record at all,
-	// which is correct, and it is not a plan anybody authorizes.
+	// bind plan (derive.BindApp) lands here with no routing record at all, which is
+	// correct: it is not a plan anybody authorizes.
 	if routing == nil {
 		return "", fmt.Errorf("%w: the plan publishes no wildcard, so there is no standing grant to describe", ErrConsent)
 	}
@@ -164,8 +146,7 @@ func Page(p derive.Plan, nonce string) (string, error) {
 		ProofName:     ownership.Record.Name,
 		ProofValue:    ownership.Record.Value,
 		// Built from the anchor rather than from a record, because these are the
-		// names that do NOT exist yet — the whole reason this page exists. The
-		// placeholder is where the app's own slug goes.
+		// names that do NOT exist yet. The placeholder is where the app's slug goes.
 		PerAppCert:    dcvPrefix + slugPlaceholder + "." + anchor,
 		PerAppServing: servingPrefix + slugPlaceholder + "." + anchor,
 		PerAppHost:    slugPlaceholder + "." + anchor,
@@ -174,25 +155,19 @@ func Page(p derive.Plan, nonce string) (string, error) {
 	}
 	var out strings.Builder
 	if err := pageTemplate.Execute(&out, data); err != nil {
-		// Retained rather than assumed away. Every field is a string and the
-		// template has no function calls, so there is nothing here that fails at
-		// runtime today; a half-written page is the one outcome that must never
-		// be returned as a page, because a disclosure truncated mid-sentence is
-		// a disclosure that omits whichever paragraph came last.
+		// Retained rather than assumed away: nothing here fails at runtime today, but
+		// a disclosure truncated mid-sentence omits whichever paragraph came last.
 		return "", fmt.Errorf("%w: the consent page did not render: %w", ErrConsent, err)
 	}
 	return out.String(), nil
 }
 
-// checkItem refuses a row this page cannot honestly display.
-//
-// It is deliberately the same shape as derive.checkItem — and deliberately not
-// the same code, because this package must not be the reason a plan is
-// considered safe. derive refuses to BUILD these; this refuses to SHOW them, and
-// the two agreeing is a property worth having twice: a row that reached here
-// unlabelled, proxied, of an unknown type or outside the anchor came from
-// somewhere other than derive, and a consent page is the last place to find that
-// out quietly.
+// checkItem refuses a row this page cannot honestly display. Deliberately the
+// same shape as derive.checkItem and deliberately not the same code, because this
+// package must not be the reason a plan is considered safe: derive refuses to
+// BUILD these, this refuses to SHOW them. A row that reached here unlabelled,
+// proxied, of an unknown type or outside the anchor came from somewhere other than
+// derive, and a consent page is the last place to find that out quietly.
 func checkItem(anchor string, item derive.Item) error {
 	record := item.Record
 	if record.Type != "CNAME" && record.Type != "TXT" {
@@ -200,9 +175,9 @@ func checkItem(anchor string, item derive.Item) error {
 			ErrConsent, echo(record.Type))
 	}
 	if record.Name == "" || record.Value == "" {
-		// Empty is the dangerous half-formed case: a blank owner name is a write
-		// at the zone apex, and a blank cell in a disclosure is a customer
-		// agreeing to something nobody wrote down.
+		// Empty is the dangerous half-formed case: a blank owner name is a write at
+		// the zone apex, and a blank cell in a disclosure is a customer agreeing to
+		// something nobody wrote down.
 		return fmt.Errorf("%w: the plan holds an incomplete %s record", ErrConsent, record.Type)
 	}
 	if item.Explain == "" || item.Source == "" || item.Purpose == "" {
@@ -211,17 +186,17 @@ func checkItem(anchor string, item derive.Item) error {
 	}
 	if record.Proxied {
 		// There is no column for this, and adding one would document a capability
-		// this service does not have: a customer-zone record is never proxied
-		// (see derive.routingItem). Refusing is how the page stays true.
+		// this service does not have: a customer-zone record is never proxied (see
+		// derive.routingItem).
 		return fmt.Errorf("%w: %q is marked proxied, and a customer-zone record never is",
 			ErrConsent, echo(record.Name))
 	}
 	if !dnsplan.Contains(anchor, record.Name) {
 		// Both sentinels: a caller checking this package keeps one answer, and an
-		// operator grepping the service for every containment failure finds this
-		// one too. A page listing a record outside the anchor would be asking for
-		// consent to a write the publisher would refuse — and the acknowledgement
-		// it produced would be evidence of an agreement that never applied.
+		// operator grepping for every containment failure finds this one too. A page
+		// listing a record outside the anchor asks consent for a write the publisher
+		// would refuse, and its acknowledgement would evidence an agreement that
+		// never applied.
 		return fmt.Errorf("%w: %w: %q is not at or under %q",
 			ErrConsent, dnsplan.ErrAnchorEscape, echo(record.Name), echo(anchor))
 	}
@@ -229,27 +204,24 @@ func checkItem(anchor string, item derive.Item) error {
 }
 
 const (
-	// dcvPrefix and servingPrefix are the owners of records 6 and 7
-	// (docs/DESIGN.md §6). They are the same literals as internal/derive's
-	// dcvPrefix and internal/relay's ownershipRecordPrefix, which are unexported
-	// in packages that have no business exporting them for a renderer's benefit.
-	// TestPerAppNamesMatchWhatBindAppDerives pins this copy of the first against
-	// a plan derive actually produces; the second has no equivalent, because
-	// building one would need a Cloudflare answer, and that is stated here rather
-	// than left to be discovered.
+	// dcvPrefix and servingPrefix own records 6 and 7 (docs/DESIGN.md §6): the same
+	// literals as internal/derive's dcvPrefix and internal/relay's
+	// ownershipRecordPrefix, unexported in packages that have no business exporting
+	// them for a renderer's benefit. TestPerAppNamesMatchWhatBindAppDerives pins
+	// this copy of the first against a plan derive produces; the second has no
+	// equivalent, because building one would need a Cloudflare answer.
 	dcvPrefix     = "_acme-challenge."
 	servingPrefix = "_cf-custom-hostname."
 
-	// slugPlaceholder stands where an app's own slug goes in a name that does
-	// not exist yet. The angle brackets are what a developer expects in a
-	// placeholder, and they are also HTML metacharacters — they reach the page
-	// as data and are escaped like every other value, which is the behaviour
-	// under test rather than an exception to it.
+	// slugPlaceholder stands where an app's own slug goes in a name that does not
+	// exist yet. The angle brackets are what a developer expects in a placeholder
+	// and are also HTML metacharacters: they reach the page as data and are escaped
+	// like every other value, which is the behaviour under test.
 	slugPlaceholder = "<your-app>"
 )
 
-// pageData is everything the template renders. Strings only, and no method on
-// it: a template that can call code can call code that fails halfway through a
+// pageData is everything the template renders. Strings only, and no method on it:
+// a template that can call code can call code that fails halfway through a
 // disclosure.
 type pageData struct {
 	Anchor        string
@@ -264,9 +236,9 @@ type pageData struct {
 	Rows          []pageRow
 }
 
-// pageRow is one record as the page displays it. Purpose is not a column: the
-// Explain sentence says what the row is for in words a person can act on, and a
-// one-word category beside it would be the part a reader skims to instead.
+// pageRow is one record as the page displays it. Purpose is not a column: Explain
+// says what the row is for in words a person can act on, and a one-word category
+// beside it is what a reader would skim to instead.
 type pageRow struct {
 	Name    string
 	Type    string
@@ -275,13 +247,11 @@ type pageRow struct {
 	Explain string
 }
 
-// writerWord is the answer to the only question anybody asks about an
-// unfamiliar row in their own zone: who put it there.
-//
-// An unrecognised source renders as itself rather than as a blank or a guess. A
-// blank cell in this column would read as "nobody", which is the one answer that
-// is never true, and it is exactly what a derive.Source constant added later
-// would produce if this map fell back to the empty string.
+// writerWord answers the only question anybody asks about an unfamiliar row in
+// their own zone: who put it there. An unrecognised source renders as itself
+// rather than as a blank or a guess — a blank cell would read as "nobody", the one
+// answer that is never true, and is what a derive.Source constant added later
+// would produce if this fell back to the empty string.
 func writerWord(source derive.Source) string {
 	switch source {
 	case derive.SourceCustomer:
@@ -304,19 +274,16 @@ func echo(s string) string {
 	return s
 }
 
-// pageTemplate is parsed once, at init, with Must.
+// pageTemplate is parsed once, at init, with Must: a parse failure is a defect in
+// the constant below rather than a condition any request can produce, so it
+// belongs at process start where CI and a deploy both see it, not as an error
+// returned to the one customer mid-consent when it ships.
 //
-// A parse failure is a defect in the constant below rather than a condition any
-// request can produce, so it belongs at process start where CI and a deploy both
-// see it — not as an error returned to the one customer unlucky enough to be
-// mid-consent when it ships.
-//
-// 🔴 EVERY ACTION IN IT IS A PLAIN {{.Field}} ON A STRING. html/template escapes
-// for the context each one lands in, and that guarantee is only worth having
-// while nothing here is a template.HTML, a template.JS or a template.URL. There
-// are none, there is no <script>, and there is no attribute whose value comes
-// from data — so no value on this page is ever one escaping decision away from
-// being executable.
+// 🔴 EVERY ACTION IN IT IS A PLAIN {{.Field}} ON A STRING. html/template's
+// contextual escaping is only worth having while nothing here is a template.HTML,
+// a template.JS or a template.URL. There are none, there is no <script>, and no
+// attribute takes its value from data — so no value on this page is ever one
+// escaping decision away from being executable.
 var pageTemplate = template.Must(template.New("consent").Parse(pageMarkup))
 
 const pageMarkup = `<!doctype html>

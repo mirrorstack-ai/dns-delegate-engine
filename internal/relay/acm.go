@@ -15,12 +15,10 @@ import (
 )
 
 // DefaultMaxCertificates bounds how many certificates one pass will describe.
-//
-// This reader holds no certificate id (see §7 of docs/DESIGN.md), so it finds
-// certificates by listing the account and matching on domain — and ACM has no
-// server-side domain filter, so the match is client-side. The cap keeps a pass
-// over an account with thousands of certificates bounded; exceeding it is
-// logged, never silent.
+// This reader holds no certificate id (docs/DESIGN.md §7), so it finds them by
+// listing the account and matching on domain client-side. The cap keeps a pass
+// over an account with thousands of certificates bounded; exceeding it is logged,
+// never silent.
 const DefaultMaxCertificates = 50
 
 // maxListPages bounds the account-wide listing itself. Termination already comes
@@ -28,26 +26,22 @@ const DefaultMaxCertificates = 50
 // cannot turn one pass of the loop into an unbounded one.
 const maxListPages = 50
 
-// ACMAPI is the slice of AWS Certificate Manager this service reads.
-//
-// The signatures copy the SDK's exactly, variadic option functions included, so
+// ACMAPI is the slice of AWS Certificate Manager this service reads. The
+// signatures copy the SDK's exactly, variadic option functions included, so
 // *acm.Client satisfies it with no adapter and a test satisfies it with a struct
-// literal. That is the whole reason the seam exists: NO TEST IN THIS REPOSITORY
-// MAY NEED AN AWS ACCOUNT.
-//
-// There is no RequestCertificate and no DeleteCertificate here. This service
-// reads; api-platform owns the certificate's lifecycle.
+// literal: NO TEST IN THIS REPOSITORY MAY NEED AN AWS ACCOUNT. There is no
+// RequestCertificate and no DeleteCertificate — this service reads, and
+// api-platform owns the certificate's lifecycle.
 type ACMAPI interface {
 	ListCertificates(ctx context.Context, params *acm.ListCertificatesInput, optFns ...func(*acm.Options)) (*acm.ListCertificatesOutput, error)
 	DescribeCertificate(ctx context.Context, params *acm.DescribeCertificateInput, optFns ...func(*acm.Options)) (*acm.DescribeCertificateOutput, error)
 }
 
-// ACM reads record 5 — the AWS DNS validation CNAME — out of ACM.
-//
-// It is a value type so its zero value is inert and a caller is never tempted to
-// park a typed nil pointer in the CertificateAuthority interface. A deployment
-// with no certificate authority passes a nil interface instead; see
-// ValidationRecords in relay.go for why that is a wait rather than an error.
+// ACM reads record 5 — the AWS DNS validation CNAME — out of ACM. A value type so
+// its zero value is inert and no caller is tempted to park a typed nil pointer in
+// the CertificateAuthority interface; a deployment with no certificate authority
+// passes a nil interface instead, which ValidationRecords in relay.go treats as a
+// wait rather than an error.
 type ACM struct {
 	// API is the ACM client. Nil means the reader is not configured, which is
 	// reported as "no records yet", exactly like a nil adapter.
@@ -59,13 +53,11 @@ type ACM struct {
 
 var _ CertificateAuthority = ACM{}
 
-// NewACM builds a reader from the ambient AWS configuration.
-//
-// region names where the certificates live. ACM is regional and a certificate
-// can only be attached by a service in its own region, so the caller has to say;
-// an empty region falls back to whatever the process's AWS configuration
-// resolves, which is the right answer inside Lambda and the wrong one almost
-// everywhere else.
+// NewACM builds a reader from the ambient AWS configuration. region names where
+// the certificates live: ACM is regional and a certificate can only be attached by
+// a service in its own region, so the caller has to say. An empty region falls back
+// to whatever the process's AWS configuration resolves, which is the right answer
+// inside Lambda and the wrong one almost everywhere else.
 func NewACM(ctx context.Context, region string) (ACM, error) {
 	var opts []func(*config.LoadOptions) error
 	if region = strings.TrimSpace(region); region != "" {
@@ -81,27 +73,19 @@ func NewACM(ctx context.Context, region string) (ACM, error) {
 // ValidationRecords returns the DNS validation CNAME for every certificate that
 // covers one of these hosts.
 //
-// 🔴 AN EMPTY ANSWER WITH A NIL ERROR IS THE NORMAL EARLY STATE.
+// 🔴 AN EMPTY ANSWER WITH A NIL ERROR IS THE NORMAL EARLY STATE — a certificate is
+// routinely present and recordless for the first minutes of its life; see
+// CertificateAuthority in relay.go. The only thing that produces an error here is a
+// failed AWS call; a record AWS should not have been able to hand back at all is
+// refused a level up.
 //
-// RequestCertificate returns an ARN immediately and ACM fills the validation
-// record in seconds to minutes later, so a certificate is routinely present and
-// recordless for the first minutes of its life. Absent is not-yet. The only
-// thing that produces an error in this method is a failed AWS call; a record AWS
-// should not have been able to hand back at all is refused a level up.
+// Which hosts get a certificate is a derivation decision made elsewhere: lane 1
+// covers account, api and apps but NOT cdn, which the CDN Worker terminates before
+// it ever reaches API Gateway, and lanes 2 and 3 have no ACM record of any kind.
 //
-// Which hosts get a certificate at all is a derivation decision made elsewhere —
-// lane 1 covers account, api and apps but NOT cdn, which the CDN Worker
-// terminates before it ever reaches API Gateway, and lanes 2 and 3 have no ACM
-// record of any kind. This reader takes the list it is given.
-//
-// 🔴 WHAT COMES BACK HERE IS A FINDING, NOT A PLAN. Whether a record may be
-// published — CNAME, an underscore name beneath a host that was asked for, a
-// target inside the AWS validation zone — is decided by relay.ValidationRecords,
-// above the CertificateAuthority interface. Duplicates and order are settled
-// there too, for the same reason: two SANs can carry one ResourceRecord, the
-// plan digest is order-sensitive, and neither fact is about ACM. Every rule that
-// lived in this file would be a rule the next certificate authority does not
-// have.
+// What comes back here is a FINDING, not a plan: publishability, duplicates and
+// order are settled by relay.ValidationRecords above the interface — two SANs can
+// carry one ResourceRecord, and the plan digest is order-sensitive.
 func (a ACM) ValidationRecords(ctx context.Context, hosts []string) ([]dnsplan.Record, error) {
 	wanted := normalizeHosts(hosts)
 	if a.API == nil || len(wanted) == 0 {
@@ -123,31 +107,28 @@ func (a ACM) ValidationRecords(ctx context.Context, hosts []string) ([]dnsplan.R
 }
 
 // candidates lists the account and returns the ARNs of certificates that might
-// cover one of these hosts.
-//
-// ACM offers no server-side domain filter — types.Filters selects on key type,
-// key usage and who manages the certificate, and on nothing else — so selecting
-// by hostname is unavoidably client-side over the summaries.
+// cover one of these hosts. ACM offers no server-side domain filter —
+// types.Filters selects on key type, key usage and who manages the certificate,
+// and on nothing else — so selecting by hostname is unavoidably client-side over
+// the summaries.
 func (a ACM) candidates(ctx context.Context, hosts []string) ([]*string, error) {
 	input := &acm.ListCertificatesInput{
-		// Only these two statuses can still produce a record worth publishing.
-		// A PENDING_VALIDATION certificate is waiting on exactly the record this
-		// function exists to fetch, and an ISSUED one still needs its record to
-		// STAY in the zone — ACM revalidates through the same CNAME at renewal,
-		// which is why docs/RECORDS.md marks it retained rather than temporary.
-		// FAILED, REVOKED, EXPIRED and VALIDATION_TIMED_OUT are dead ends whose
-		// records can never help; api-platform mints a replacement instead.
+		// Only these two statuses can still produce a record worth publishing. A
+		// PENDING_VALIDATION certificate is waiting on exactly the record this
+		// function fetches, and an ISSUED one still needs its record to STAY in the
+		// zone — ACM revalidates through the same CNAME at renewal, which is why
+		// docs/RECORDS.md marks it retained. FAILED, REVOKED, EXPIRED and
+		// VALIDATION_TIMED_OUT are dead ends; api-platform mints a replacement.
 		CertificateStatuses: []acmtypes.CertificateStatus{
 			acmtypes.CertificateStatusPendingValidation,
 			acmtypes.CertificateStatusIssued,
 		},
-		// 🔴 BOTH OF THESE FILTERS EXIST TO DEFEAT A DEFAULT THAT HIDES ROWS.
-		// ACM's documented default returns only RSA_1024 and RSA_2048, and
-		// excludes certificates whose key pair origin is ACME. Neither omission
-		// is an error — the certificate simply is not in the list — so a future
-		// change of key algorithm would make a certificate vanish from this
-		// reader with every call succeeding. Naming every value keeps that from
-		// being a silent outcome.
+		// 🔴 BOTH OF THESE FILTERS EXIST TO DEFEAT A DEFAULT THAT HIDES ROWS. ACM's
+		// documented default returns only RSA_1024 and RSA_2048, and excludes
+		// certificates whose key pair origin is ACME. Neither omission is an error —
+		// the certificate simply is not in the list — so a future change of key
+		// algorithm would make a certificate vanish from this reader with every call
+		// succeeding.
 		Includes: &acmtypes.Filters{KeyTypes: []acmtypes.KeyAlgorithm{
 			acmtypes.KeyAlgorithmRsa1024,
 			acmtypes.KeyAlgorithmRsa2048,
@@ -197,13 +178,10 @@ func (a ACM) candidates(ctx context.Context, hosts []string) ([]*string, error) 
 }
 
 // coversAnyHost reports whether a listed certificate might cover one of these
-// hosts.
-//
-// It errs toward describing one certificate too many rather than one too few: a
-// list response caps SubjectAlternativeNameSummaries at the first hundred names
-// and flags the truncation, and a truncated list cannot prove absence. Describing
-// a certificate that turns out not to cover the host costs one read; skipping one
-// that does costs a certificate that never validates.
+// hosts. It errs toward describing one certificate too many rather than one too
+// few: a list response caps SubjectAlternativeNameSummaries at the first hundred
+// names and flags the truncation, and a truncated list cannot prove absence.
+// Skipping one that does cover the host costs a certificate that never validates.
 func coversAnyHost(summary acmtypes.CertificateSummary, hosts []string) bool {
 	names := make([]string, 0, len(summary.SubjectAlternativeNameSummaries)+1)
 	if summary.DomainName != nil {
@@ -226,9 +204,8 @@ func (a ACM) describe(ctx context.Context, arn *string, hosts []string) ([]dnspl
 	out, err := a.API.DescribeCertificate(ctx, &acm.DescribeCertificateInput{CertificateArn: arn})
 	if err != nil {
 		// A certificate deleted between the list and this read is a race, not a
-		// fault. This reader holds no certificate id precisely because the truth
-		// lives in AWS; the cost of that is that AWS may change its mind
-		// mid-pass, and the next pass simply will not list it.
+		// fault. This reader holds no certificate id because the truth lives in AWS;
+		// the cost of that is that AWS may change its mind mid-pass.
 		var missing *acmtypes.ResourceNotFoundException
 		if errors.As(err, &missing) {
 			return nil, nil
@@ -239,27 +216,24 @@ func (a ACM) describe(ctx context.Context, arn *string, hosts []string) ([]dnspl
 		return nil, nil
 	}
 	// DomainValidationOptions exists only for AMAZON_ISSUED certificates and is
-	// empty until ACM has filled it in. Both are ordinary, and both mean "come
-	// back next pass".
+	// empty until ACM has filled it in. Both mean "come back next pass".
 	records := make([]dnsplan.Record, 0, len(out.Certificate.DomainValidationOptions))
 	for _, option := range out.Certificate.DomainValidationOptions {
 		// EMPTY IS NORMAL on the first read, and on every read of a certificate
-		// validated by email or by HTTP redirect. Not an error, not a partial
-		// failure, nothing to report.
+		// validated by email or by HTTP redirect. Nothing to report.
 		if option.ResourceRecord == nil {
 			continue
 		}
-		// The TYPE is passed through rather than asserted to be CNAME. AWS
-		// declares CNAME the only type this field takes, so a record that is
-		// anything else is a contract violation — and relay.ValidationRecords
-		// refuses it by name. Hard-coding "CNAME" here would instead RELABEL
-		// whatever came back and publish its value as a CNAME target.
+		// The TYPE is passed through rather than asserted to be CNAME. AWS declares
+		// CNAME the only type this field takes, so anything else is a contract
+		// violation that relay.ValidationRecords refuses by name; hard-coding
+		// "CNAME" here would instead RELABEL whatever came back.
 		record := relayedRecord(string(option.ResourceRecord.Type),
 			deref(option.ResourceRecord.Name), deref(option.ResourceRecord.Value))
-		// The one drop this reader is entitled to make: a certificate legitimately
-		// carries names this pass did not ask about, and their records belong to
-		// another host's plan. Everything else — including a record with no name
-		// at all — is handed up to be refused loudly. See forAnotherHost.
+		// The one drop this reader may make: a certificate legitimately carries names
+		// this pass did not ask about, and their records belong to another host's
+		// plan. Everything else, a record with no name at all included, is handed up
+		// to be refused loudly. See forAnotherHost.
 		if forAnotherHost(hosts, record) {
 			continue
 		}
@@ -268,9 +242,9 @@ func (a ACM) describe(ctx context.Context, arn *string, hosts []string) ([]dnspl
 	return records, nil
 }
 
-// deref reads an SDK string pointer without pulling the aws helper package in.
-// One three-line function is cheaper than moving the core AWS module into this
-// repository's direct dependencies for aws.ToString.
+// deref reads an SDK string pointer without pulling the aws helper package in —
+// cheaper than moving the core AWS module into this repository's direct
+// dependencies for aws.ToString.
 func deref(s *string) string {
 	if s == nil {
 		return ""
