@@ -112,15 +112,54 @@ An honest threat model is mostly a list of assumptions. These are ours.
 
 ### We assume public DNS tells us the truth
 
-`verify()` resolves the ownership proof through a recursive resolver. **Anyone
-who can lie to that resolver can forge a proof** for a domain they do not own,
-and unlock a grant.
+`verify()` resolves the ownership proof through whatever resolvers this
+deployment was wired with. **Anyone who can lie to all of them can forge a
+proof** for a domain they do not own, and unlock a grant.
 
-This is the same problem a certificate authority has, and they answer it with
-multi-perspective validation, DNSSEC checking, and querying authoritative
-nameservers directly. **We do none of that yet.** It is the largest unclosed
-assumption in this repository and it is tracked in
-[`SECURITY.md`](../SECURITY.md).
+This is the same problem a certificate authority has, and they answer it three
+ways. Two of the three are in this repository now:
+
+- **Multi-perspective validation.** `observe.Quorum` asks N independent
+  resolvers and reports a value only when a declared threshold of them serve it.
+  One liar out of three produces nothing.
+- **Asking the authoritative nameservers directly.** `observe.Authoritative`
+  reads the NS records for the zone and queries those servers, which takes the
+  recursive cache out of the answer.
+- **DNSSEC — not done, and not claimed.** Go's `net.Resolver` does not validate,
+  nothing here adds it, and **no signature is checked anywhere in this
+  repository**. `capabilities.resolution.dnssec` is a constant `false` so that is
+  answerable from the API rather than only from a source file.
+
+🔴 **Read the policy before you authorize, because it is a deployment setting
+and not a property of this code.** `IntentCapabilities` returns
+`resolution: {vantages, threshold, authoritative, dnssec}`, taken from the
+resolver the binary actually wired, and every record in a `verify` or `describe`
+answer carries the count its state rests on: `agreement: {asked, agreed,
+threshold}`.
+
+**The default is one vantage point — the container's own recursive resolver,
+believed on its own**, which is what this service did before the quorum existed.
+A quorum is opt-in (`DNS_DELEGATE_RESOLVERS`, `DNS_DELEGATE_AUTHORITATIVE`,
+`DNS_DELEGATE_QUORUM`) because a vantage point a deployment cannot reach answers
+`unknown`, and `unknown` refuses every authorization.
+
+What a quorum closes: a single lying recursive resolver, and an off-path cache
+poisoner, who has to win the race at every vantage point rather than at one.
+
+What it does not close, at any threshold:
+
+- **An attacker holding your registrar or your authoritative nameservers.**
+  Every vantage point then agrees on the same forged answer, and no
+  DNS-based validation anywhere survives that.
+- **The delegation itself.** `Authoritative` learns *which* servers are
+  authoritative through an ordinary resolver, so a forged NS answer redirects
+  it. It removes the cache from the proof, not from the delegation.
+- **An on-path attacker at our own egress**, who rewrites every vantage point's
+  traffic alike.
+
+One direction is deliberately not hardened: agreement that the proof is **gone**
+is still absence, and still stops every write. Your stop control must not need a
+quorum to work.
 
 There is a second, milder version of the same thing: we see what public DNS
 *serves*, which can lag your deletion by the record's TTL. So "deleting the proof

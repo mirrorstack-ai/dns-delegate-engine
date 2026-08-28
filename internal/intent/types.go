@@ -258,6 +258,21 @@ type RecordView struct {
 	// Orphans). An empty State means nothing was looked up, never "absent".
 	State string   `json:"state,omitempty"`
 	Found []string `json:"found,omitempty"`
+
+	// Agreement says how many independent vantage points State rests on. Absent
+	// means no lookup was issued for this row.
+	Agreement *AgreementView `json:"agreement,omitempty"`
+}
+
+// AgreementView is one reading's vantage-point count, so "the proof is
+// published" can be read for what it is worth rather than taken on trust.
+type AgreementView struct {
+	// Asked is how many vantage points were queried, Agreed how many served this
+	// reading, and Threshold how many had to. `1 / 1 / 1` is a single recursive
+	// resolver, believed on its own.
+	Asked     int `json:"asked"`
+	Agreed    int `json:"agreed"`
+	Threshold int `json:"threshold"`
 }
 
 func recordView(item derive.Item) RecordView {
@@ -289,10 +304,24 @@ func observedView(item derive.Item, obs observe.Observation) RecordView {
 	view := recordView(item)
 	view.State = string(obs.State)
 	view.Found = obs.Found
+	view.Agreement = agreementView(obs)
 	if obs.Explain != "" {
 		view.Explain = obs.Explain
 	}
 	return view
+}
+
+// agreementView projects a reading's vantage-point count. Nil when no lookup was
+// issued, which is not the same as a lookup nobody agreed on.
+func agreementView(obs observe.Observation) *AgreementView {
+	if obs.Agreement.Asked == 0 {
+		return nil
+	}
+	return &AgreementView{
+		Asked:     obs.Agreement.Asked,
+		Agreed:    obs.Agreement.Agreed,
+		Threshold: obs.Agreement.Threshold,
+	}
 }
 
 // RegisteredResponse is what all three registration intents return. None of them
@@ -561,6 +590,30 @@ type CapabilitiesResponse struct {
 	IntervalSeconds    int64 `json:"intervalSeconds"`
 	JitterSeconds      int64 `json:"jitterSeconds"`
 	MinIntervalSeconds int64 `json:"minIntervalSeconds"`
+
+	// Resolution is how this deployment reads the ownership proof, published
+	// BEFORE anything is authorized because it is what a positive verification is
+	// worth (docs/THREAT-MODEL.md, "We assume public DNS tells us the truth").
+	Resolution ResolutionCapability `json:"resolution"`
+}
+
+// ResolutionCapability is the deployment's vantage-point rule, from
+// observe.PolicyOf on the resolver the binary actually wired.
+type ResolutionCapability struct {
+	// Vantages is how many independent resolvers are asked and Threshold how many
+	// must agree before a proof counts as published. `1` and `1` is a single
+	// recursive resolver.
+	Vantages  int `json:"vantages"`
+	Threshold int `json:"threshold"`
+
+	// Authoritative reports that one vantage point asks the zone's own
+	// nameservers rather than a recursive resolver.
+	Authoritative bool `json:"authoritative"`
+
+	// DNSSEC is always false. Nothing in this repository validates a signature,
+	// and the field exists so that is answerable from the API rather than only
+	// from a source file.
+	DNSSEC bool `json:"dnssec"`
 }
 
 // LaneCapability is one lane, described in the terms a customer decides on.

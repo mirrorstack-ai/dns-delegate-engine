@@ -65,7 +65,7 @@ These are open **right now**, stated at the top of the README and in
 | | |
 |---|---|
 | The legacy `publish(records)` action is still routed | It takes both the record list **and the anchor** as request fields. It is not bounded by the connected domain — its reach is the whole zone the provider authorized. Retiring it is the next change, caller first. |
-| `verify()` trusts a recursive resolver | Whoever can spoof a DNS answer to us can forge an ownership proof. Certificate authorities solve this with multi-perspective validation and DNSSEC; we do not yet. |
+| `verify()` validates no DNSSEC, and its quorum is opt-in | Multi-perspective validation and direct authoritative lookups both exist now (`internal/observe`), but the default is a single recursive resolver and **no signature is checked anywhere**. `capabilities.resolution` reports which of these a given deployment is running; [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) states what each closes. |
 | The rate floor is declared, not enforced | Nothing here slows a caller that advances a registration in a loop. |
 | Lane 2 cannot be authorized | Nothing in the deployed binary mints a consent acknowledgement, so it refuses. Fail-closed. |
 

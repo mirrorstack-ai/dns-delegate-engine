@@ -149,6 +149,17 @@ func (s *Service) Capabilities(ctx context.Context) CapabilitiesResponse {
 	out.JitterSeconds = int64(cadence.Jitter / time.Second)
 	out.MinIntervalSeconds = int64(cadence.MinInterval / time.Second)
 
+	// Read off the wired resolver, never a constant: a claim about vantage points
+	// that the binary's wiring cannot contradict.
+	if s.Resolver != nil {
+		policy := observe.PolicyOf(s.Resolver)
+		out.Resolution = ResolutionCapability{
+			Vantages:      policy.Vantages,
+			Threshold:     policy.Threshold,
+			Authoritative: policy.Authoritative,
+		}
+	}
+
 	if err := s.Derive.Validate(); err != nil {
 		// Reported rather than swallowed: an unconfigured deployment and a
 		// MISCONFIGURED one otherwise look identical from outside — the trap
@@ -383,6 +394,11 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (VerifyResponse
 			State:   string(check.observation.State),
 			Found:   check.observation.Found,
 			Explain: check.observation.Explain,
+
+			// What the reading is worth. Verify is the one call whose whole answer
+			// is a boolean, so the number of vantage points behind it has to travel
+			// with it.
+			Agreement: agreementView(check.observation),
 		},
 	}
 	// 🔴 A LOOKUP THAT DID NOT COMPLETE IS NOT A NEGATIVE — AND IT IS NOT AN RPC

@@ -467,3 +467,118 @@ func FuzzObservationStatesArePartitioned(f *testing.F) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// The quorum rule.
+// ---------------------------------------------------------------------------
+
+// vantageBehaviours is what one vantage point can do: serve values, serve
+// nothing, or fail to answer. The fuzz target picks three of them.
+var vantageBehaviours = []struct {
+	values   []string
+	answered bool
+}{
+	{values: []string{"wanted"}, answered: true},
+	{values: []string{"other"}, answered: true},
+	{values: []string{"wanted", "other"}, answered: true},
+	{values: []string{"wanted", "wanted"}, answered: true},
+	{answered: true}, // resolves, holds nothing
+	{},               // did not answer at all
+}
+
+func vantageFor(n uint8) (Resolver, int) {
+	i := int(n) % len(vantageBehaviours)
+	b := vantageBehaviours[i]
+	switch {
+	case !b.answered:
+		return failing(servfail(proofName)), i
+	case len(b.values) == 0:
+		return &fakeResolver{txt: map[string]txtAnswer{proofName: {values: nil}}}, i
+	}
+	return serving(b.values...), i
+}
+
+// FuzzQuorumNeverReportsMoreThanItWasTold asserts the two directions that
+// matter over every combination of three vantage points and any threshold:
+// a value is returned only when the threshold agreed on it, and absence is
+// returned only when the threshold saw nothing.
+//
+// 🔴 The second is the one a decorative test would miss. Absence stops a
+// customer's registration, so reporting it on fewer agreeing vantage points than
+// were declared would make the stop control fire on a resolver blip.
+func FuzzQuorumNeverReportsMoreThanItWasTold(f *testing.F) {
+	f.Add(uint8(0), uint8(0), uint8(4), uint8(2))
+	f.Add(uint8(0), uint8(4), uint8(4), uint8(2))
+	f.Add(uint8(1), uint8(0), uint8(5), uint8(3))
+	f.Add(uint8(2), uint8(3), uint8(0), uint8(1))
+
+	f.Fuzz(func(t *testing.T, a, b, c, rawThreshold uint8) {
+		resolvers := make([]Resolver, 0, 3)
+		chosen := make([]int, 0, 3)
+		for _, n := range []uint8{a, b, c} {
+			r, i := vantageFor(n)
+			resolvers = append(resolvers, r)
+			chosen = append(chosen, i)
+		}
+		// Deliberately allowed to fall outside [1, 3]: a misconfigured quorum
+		// must verify nothing rather than everything.
+		threshold := int(rawThreshold) % 6
+		q := Quorum{Resolvers: resolvers, Threshold: threshold}
+
+		values, agreement, err := q.AttestedTXT(context.Background(), proofName)
+
+		if threshold < 1 || threshold > 3 {
+			if !errors.Is(err, ErrNoQuorum) {
+				t.Fatalf("threshold %d over 3 vantage points returned %v", threshold, err)
+			}
+			return
+		}
+
+		// Recounted from the behaviour table rather than from the quorum's own
+		// bookkeeping, which is the thing under test.
+		served := map[string]int{}
+		empty := 0
+		for _, i := range chosen {
+			bh := vantageBehaviours[i]
+			if !bh.answered {
+				continue
+			}
+			seen := map[string]bool{}
+			for _, v := range bh.values {
+				seen[v] = true
+			}
+			if len(seen) == 0 {
+				empty++
+			}
+			for v := range seen {
+				served[v]++
+			}
+		}
+
+		switch {
+		case err == nil:
+			if len(values) == 0 {
+				t.Fatal("a nil error with no values says nothing at all")
+			}
+			for _, v := range values {
+				if served[v] < threshold {
+					t.Fatalf("returned %q, which only %d of 3 vantage points served, at a threshold of %d", v, served[v], threshold)
+				}
+			}
+			if agreement.Agreed < threshold {
+				t.Fatalf("agreement %+v claims fewer agreeing vantage points than the threshold it met", agreement)
+			}
+		case isNotFound(err):
+			if empty < threshold {
+				t.Fatalf("reported absence on %d of 3 vantage points seeing nothing, at a threshold of %d", empty, threshold)
+			}
+		default:
+			if !errors.Is(err, ErrNoQuorum) {
+				t.Fatalf("unexpected error %v", err)
+			}
+		}
+		if agreement.Asked != 3 || agreement.Threshold != threshold {
+			t.Fatalf("agreement %+v does not describe the quorum it came from", agreement)
+		}
+	})
+}

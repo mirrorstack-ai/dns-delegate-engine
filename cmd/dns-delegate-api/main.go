@@ -390,6 +390,19 @@ func main() {
 	// selector here; every safety rule stays in reconcile.
 	publisher := reconcile.Publisher{Provider: cloudflare.Client{}}
 
+	// How public DNS is read, and how much a positive reading is worth. The
+	// default is the container's single recursive resolver — this service's
+	// behaviour before the quorum existed — and DNS_DELEGATE_RESOLVERS /
+	// DNS_DELEGATE_AUTHORITATIVE widen it; observe.ResolverFromEnv documents why
+	// hardening is opt-in. The policy is logged and republished through
+	// IntentCapabilities, so a deployment cannot claim more vantage points than
+	// it wired.
+	resolver := observe.ResolverFromEnv()
+	policy := observe.PolicyOf(resolver)
+	slog.Info("dns-delegate-api: public DNS vantage points",
+		"vantages", policy.Vantages, "threshold", policy.Threshold,
+		"authoritative", policy.Authoritative, "dnssec", false)
+
 	d := &dispatcher{
 		grants: &grant.Service{OAuth: oauth, Keys: keys, Publisher: publisher},
 		intents: &intent.Service{
@@ -402,7 +415,7 @@ func main() {
 			// package-level default would mean a test that forgot a fake
 			// silently resolved real names. A binary is the one place that may
 			// say yes.
-			Resolver: observe.NetResolver{},
+			Resolver: resolver,
 
 			Certificates: certificateAuthority(context.Background()),
 
