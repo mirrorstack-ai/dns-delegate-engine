@@ -616,52 +616,39 @@ const (
 //
 //	_acme-challenge.<host>  CNAME  <host>.<uuid>.dcv.cloudflare.com
 //
-// This is the most consequential derivation in the package, because of what the
-// form buys. The record carries NO token, and both halves of it — the hostname
-// the customer just connected, and a per-zone identifier that is fixed
-// configuration — are known before anything has been asked of anyone. So it is
-// publishable on the FIRST pass, before a certificate has been requested or a
-// custom hostname created, and it never changes again: Cloudflare mints and
-// rotates the real tokens behind the pointer, in its own zone, for every future
-// renewal. That is what lets lanes 1 and 3 hold a credential for 24 hours
-// instead of forever. Cloudflare's DCV tokens live 7 days on Let's Encrypt and
-// 14 on Google Trust Services, and a form that put the token in the customer's
-// zone would need republishing on that clock, indefinitely, by a grant we
-// deliberately do not keep.
+// The most consequential derivation in the package, because of what the form
+// buys. The record carries NO token, and both halves — the hostname just
+// connected and a per-zone identifier that is fixed configuration — are known
+// before anything is asked of anyone. So it is publishable on the FIRST pass and
+// never changes again: Cloudflare mints and rotates the real tokens behind the
+// pointer, in its own zone. That is what lets lanes 1 and 3 hold a credential for
+// 24 hours instead of forever — DCV tokens live 7 days on Let's Encrypt and 14 on
+// Google Trust Services, so a form putting the token in the customer's zone would
+// need republishing on that clock by a grant we deliberately do not keep.
 //
-// 🔴 THE HOSTNAME PREFIX IS LOAD-BEARING, AND api-platform DISAGREES WITH THIS
-// FILE ABOUT IT.
+// 🔴 THE HOSTNAME PREFIX IS LOAD-BEARING, AND api-platform DISAGREES.
 //
-// Cloudflare documents the target as `<host>.<uuid>.dcv.cloudflare.com`: the
-// hostname is the per-host namespace Cloudflare writes its rotating TXT records
-// into, and a wildcard hostname gets two of them at that one name. Without the
-// prefix every host delegated to one of our zones would collide on a single
-// name, and a certificate authority following the pointer would read a token for
-// somebody else's hostname, or nothing at all.
+// Cloudflare documents the target as `<host>.<uuid>.dcv.cloudflare.com`, the
+// hostname being the per-host namespace it writes its rotating TXT records into.
+// Without the prefix every host delegated to one of our zones collides on a
+// single name, and a CA following the pointer reads somebody else's token or
+// nothing. api-platform's dcvDelegationTarget omits it. This file follows
+// docs/DESIGN.md §6 — the merged public spec, which matches Cloudflare's docs —
+// and the disagreement is recorded rather than resolved because the other half is
+// a change in another repository.
 //
-// api-platform's `dcvDelegationTarget` builds `<uuid>.dcv.cloudflare.com`, with
-// no prefix. THIS FILE FOLLOWS docs/DESIGN.md §6, which is the merged public
-// specification and matches Cloudflare's own documentation. The disagreement is
-// recorded rather than resolved here because the other half of it is a change in
-// another repository.
-//
-// 🔴 AND THE FORM IS UNVERIFIED AGAINST A LIVE CLOUDFLARE DASHBOARD as of
-// 2026-08-28. Nobody has yet read `GET /zones/{our_zone}/dcv_delegation/uuid`
-// with our own token or copied the value out of the dashboard; the uuid in use
+// 🔴 UNVERIFIED AGAINST A LIVE DASHBOARD as of 2026-08-28. Nobody has read
+// `GET /zones/{our_zone}/dcv_delegation/uuid` with our own token; the uuid in use
 // is a hand-set environment variable. The one live probe on record — four custom
-// hostnames that sat at `pending_validation` indefinitely "with the delegation
-// CNAME in place and resolving" — published the PREFIX-LESS target, and
-// concluded that delegation was not in effect on that zone. It cannot
-// distinguish that from a pointer aimed at a name Cloudflare never writes to. So
-// "delegation does not work here" is an open question until it is re-measured
-// with the form above, and a reader of this repository is owed that uncertainty
-// rather than a confident constant.
+// hostnames stuck at `pending_validation` "with the delegation CNAME in place and
+// resolving" — published the PREFIX-LESS target and concluded delegation was not
+// in effect. It cannot distinguish that from a pointer aimed at a name Cloudflare
+// never writes to, so "delegation does not work here" is open until re-measured
+// with the form above. A reader of this repository is owed that uncertainty.
 //
-// It returns "" rather than a target that cannot be right, for the reason
-// proof.Name does: a half-formed value is worse than an empty one, because only
-// the empty one fails loudly. Callers below turn that into a refusal. The uuid's
-// SHAPE is Config.Validate's business, not this function's — this is the form,
-// that is the deployment.
+// Returns "" rather than a target that cannot be right, for proof.Name's reason:
+// only the empty value fails loudly. The uuid's SHAPE is Config.Validate's
+// business — this is the form, that is the deployment.
 func DCVTarget(host, uuid string) string {
 	host = dnsplan.NormalizeName(host)
 	uuid = dnsplan.NormalizeName(uuid)

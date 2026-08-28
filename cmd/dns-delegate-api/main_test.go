@@ -317,6 +317,60 @@ func TestTheTwoAuthorizeActionsCannotBeConfused(t *testing.T) {
 	}
 }
 
+// `route.writes` is DERIVED from each action's response type rather than
+// declared, so this test is not cross-checking one hand-written list against
+// another — it pins the fact the derivation rests on: intent.PassResponse is
+// returned by exactly the actions that can reach a customer's zone.
+//
+// It fails if an action starts or stops returning PassResponse, which is the
+// change that would silently reclassify it.
+func TestTheWritingActionsAreExactlyTheDeclaredSet(t *testing.T) {
+	want := map[string]bool{
+		"Complete": true, "Advance": true, "BindAppToOrgAppDomain": true,
+		// The one action whose writing is invisible in its type, and the reason
+		// the record-list surface is worth replacing.
+		actionPublish: true,
+	}
+	for name, r := range routes {
+		if r.writes != want[name] {
+			t.Errorf("%q: writes=%v, want %v", name, r.writes, want[name])
+		}
+	}
+}
+
+func TestTheDeprecatedActionsAreExactlyTheLegacyFour(t *testing.T) {
+	want := map[string]bool{"Capabilities": true, "Authorize": true, actionPublish: true, "Revoke": true}
+	for name, r := range routes {
+		if r.deprecated != want[name] {
+			t.Errorf("%q: deprecated=%v, want %v", name, r.deprecated, want[name])
+		}
+	}
+	if len(want) != 4 {
+		t.Fatalf("the legacy surface is four actions, not %d", len(want))
+	}
+}
+
+// Every route must be reachable, and an action this build does not implement
+// must refuse rather than answer. A nil handler in the table would panic on the
+// first real invocation instead.
+func TestEveryRouteIsReachableAndUnknownIsRefused(t *testing.T) {
+	d := &dispatcher{}
+	for name, r := range routes {
+		if r.handle == nil {
+			t.Fatalf("%q has no handler", name)
+		}
+		// With no service wired, every action must return a refusal rather than
+		// panic. The refusal itself is the surface's own sentinel, which
+		// TestErrorCodesAreTheCallersContract covers.
+		if _, err := d.dispatch(t.Context(), name, nil); err == nil && name != "Health" && name != "Capabilities" {
+			t.Errorf("%q answered with no service wired; it must refuse", name)
+		}
+	}
+	if _, err := d.dispatch(t.Context(), "NoSuchAction", nil); !errors.Is(err, errUnknownAction) {
+		t.Fatalf("an unimplemented action must be errUnknownAction, got %v", err)
+	}
+}
+
 // 🔴 decodeAnd must hand an action the INVOCATION's context.
 //
 // An earlier version substituted context.Background(), so the Lambda deadline

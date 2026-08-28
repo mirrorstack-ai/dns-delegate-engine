@@ -90,187 +90,216 @@ type dispatcher struct {
 	intents *intent.Service
 }
 
+// 🔴 THREE ACTION NAMES ARE LOAD-BEARING, AND EACH IS A CONSTANT SO THE REASON
+// TRAVELS WITH THE NAME RATHER THAN WITH A LINE IN A SWITCH.
+
+// actionIntentAuthorize is "IntentAuthorize", and it must NEVER become an alias
+// of the legacy "Authorize".
+//
+// Legacy Authorize takes the OAuth state as a REQUEST FIELD. A caller-minted
+// state is one the caller can also mint for a registration it is not holding,
+// and the completing call then has to be handed the identity, the lane and the
+// domain as separate fields — a pair of requests that can be made to disagree.
+//
+// This one mints the state itself, as a sealed envelope carrying the lane, the
+// identity, the anchor and a nonce, so Complete needs none of them as fields. It
+// also refuses unless the ownership proof resolves RIGHT NOW, and, on the
+// wildcard lane, unless this service's own consent page was acknowledged.
+//
+// A caller reaching the wrong one would be authorized with none of those checks
+// and would get no error saying so — a silent downgrade. Two distinct names turn
+// that mistake into an `unknown_action` refusal. So neither name may be pointed
+// at the other implementation, and in particular "Authorize" must not be
+// re-routed here as a migration convenience: the caller's REQUEST SHAPE selects
+// the weaker check, not the action name it sits behind.
+//
+// 🔴 LANE 2 CANNOT BE AUTHORIZED ON THIS TRANSPORT — A KNOWN GAP, NOT A DECISION.
+// The wildcard lane additionally needs a consent.Token minted under this
+// deployment's keyset, and nothing in this binary mints one: /consent renders the
+// page and stops there. A caller cannot mint one either, which is the point of a
+// MAC under a key that never leaves here. So this action refuses org_app_domain
+// with `consent_required` on every deployment of this build. Refusing is the safe
+// end of the failure; minting an acknowledgement somewhere the customer was not
+// is the claim-with-nothing-behind-it the consent page exists to replace.
+const actionIntentAuthorize = "IntentAuthorize"
+
+// actionIntentCapabilities is named on the same rule, for a hazard of the same
+// shape. It answers a strictly LARGER response than legacy "Capabilities" — the
+// two routing targets, the DCV identifier, the declared cadence, the per-lane
+// grant lifetimes, and whether each lane needs a consent page — and a client
+// decoding one into the other's struct would not fail. It would read
+// Available:false and render no connect affordance, which looks exactly like a
+// deployment that cannot offer delegated DNS.
+//
+// It publishes the routing targets and the DCV identifier deliberately. None is
+// a secret: every one ends up in a customer's own zone as the VALUE of a record
+// we ask them to accept, and publishing them is what lets somebody check, BEFORE
+// authorizing anything, that the CNAME they are about to be asked for is the one
+// this repository derives.
+const actionIntentCapabilities = "IntentCapabilities"
+
+// actionPublish is the deprecated record-list action, and it is where defect 1
+// lives: it bounds WHERE we write and nothing bounds WHAT.
+//
+// 🔴 WHILE IT IS ROUTED, THE SURFACE AS A WHOLE IS NOT BOUNDED. What MirrorStack
+// can put in a customer's zone is the UNION of what the intent surface derives
+// and whatever record list the private half hands to this one — so an audit has
+// to read both halves, and the weaker half decides. It also takes the ANCHOR as
+// a request field, so its reach is the whole zone the provider authorized rather
+// than the domain the customer connected.
+//
+// Deleting it is what turns the bound into a property of the DEPLOYMENT rather
+// than of the intent surface, and it is the next step. "Complete" is what
+// api-platform moves to; the retirement is a change to two repositories in the
+// order the package doc gives, caller first.
+const actionPublish = "Publish"
+
+// handler is one action, already bound to its service and its request type.
+type handler func(*dispatcher, context.Context, json.RawMessage) (any, error)
+
+// route is one entry in the wire surface.
+type route struct {
+	handle handler
+
+	// writes records that this action can reach a customer's zone.
+	//
+	// 🔴 DATA RATHER THAN A COMMENT, BECAUSE "WHICH ACTIONS CAN CHANGE MY ZONE"
+	// IS THE FIRST QUESTION A READER HAS AND A COMMENT DRIFTS FROM THE TABLE IT
+	// DESCRIBES. TestTheWritingActionsAreExactlyTheDeclaredSet pins it.
+	writes bool
+
+	// deprecated marks the record-list surface. Every one of these is LIVE:
+	// api-platform calls them today and not one line of their behaviour changed.
+	deprecated bool
+}
+
+// routes is the whole wire surface, in one place. A reader tracing what this
+// service can be asked to do reads this table and nothing else.
+//
+// `writes` is derived from each action's response type, not declared — see on().
+var routes = map[string]route{
+	// Observation. Writes nothing, needs no credential.
+	"Health": reads((*dispatcher).handleHealth),
+
+	// ─── the intent surface (docs/DESIGN.md) ────────────────────────────────
+	// The first three register a domain and write nothing: each computes the
+	// proof the customer must publish, derives the records, seals a registration
+	// and reaches no provider. The fourth runs at deploy time.
+	"AddOrgPlatformDomain":  on(intents, (*intent.Service).AddOrgPlatformDomain),
+	"AddOrgAppDomain":       on(intents, (*intent.Service).AddOrgAppDomain),
+	"AddAppDomain":          on(intents, (*intent.Service).AddAppDomain),
+	"BindAppToOrgAppDomain": on(intents, (*intent.Service).BindAppToOrgAppDomain),
+
+	// The lifecycle. Identical on all three lanes, which is why there is one set
+	// of these and not three.
+	"Verify":                 on(intents, (*intent.Service).Verify),
+	actionIntentAuthorize:    on(intents, (*intent.Service).Authorize),
+	"Complete":               on(intents, (*intent.Service).Complete),
+	"Advance":                on(intents, (*intent.Service).Advance),
+	"Describe":               on(intents, (*intent.Service).Describe),
+	"Orphans":                on(intents, (*intent.Service).Orphans),
+	"Release":                on(intents, (*intent.Service).Release),
+	actionIntentCapabilities: reads((*dispatcher).handleIntentCapabilities),
+
+	// ─── the deprecated record-list surface ─────────────────────────────────
+	// Every one of these is LIVE: api-platform calls them today.
+	"Capabilities": deprecate(reads((*dispatcher).handleGrantCapabilities)),
+	"Authorize":    deprecate(on(grants, (*grant.Service).Authorize)),
+	actionPublish:  deprecate(writesToAZone(on(grants, (*grant.Service).Publish))),
+	"Revoke":       deprecate(on(grants, (*grant.Service).Revoke)),
+}
+
+// writesToAZone marks the one action whose writing is INVISIBLE IN ITS TYPE.
+//
+// 🔴 THAT IT NEEDS MARKING AT ALL IS THE POINT. Every intent action that reaches
+// a customer's zone says so by returning intent.PassResponse. This one returns
+// grant.PublishResponse and is the only route in the table whose blast radius a
+// reader cannot get from its signature — which is exactly the property that made
+// the record-list surface worth replacing.
+func writesToAZone(r route) route { r.writes = true; return r }
+
+// surface is one of the two RPC surfaces: how to reach it off the dispatcher,
+// and the sentinel it answers when this deployment has not wired it.
+//
+// It is a struct rather than a func returning (svc, error) because the sentinel
+// is a property of the SURFACE, not the result of a lookup — a signature
+// returning a non-nil error on its success path reads as "this failed" to every
+// Go reader and every linter.
+type surface[Svc any] struct {
+	get         func(*dispatcher) *Svc
+	unavailable error
+}
+
+var (
+	intents = surface[intent.Service]{
+		get:         func(d *dispatcher) *intent.Service { return d.intents },
+		unavailable: intent.ErrUnavailable,
+	}
+	grants = surface[grant.Service]{
+		get:         func(d *dispatcher) *grant.Service { return d.grants },
+		unavailable: grant.ErrUnavailable,
+	}
+)
+
+// on binds one service method into a route. See decodeAnd for why the sentinel
+// travels with the surface.
+//
+// 🔴 IT DERIVES `writes` FROM THE RESPONSE TYPE RATHER THAN TAKING IT AS A FLAG.
+// intent.PassResponse is returned by exactly the actions that can reach a
+// customer's zone and by nothing else — Service.write takes one in its signature
+// — so the compiler already tracks the fact, and a hand-set boolean would only
+// be a second place to keep it. An intent action added later is classified
+// correctly without anyone remembering to say so.
+func on[Svc any, Req any, Res any](
+	sf surface[Svc],
+	run func(*Svc, context.Context, Req) (Res, error),
+) route {
+	var res Res
+	_, writes := any(res).(intent.PassResponse)
+	return route{
+		writes: writes,
+		handle: func(d *dispatcher, ctx context.Context, payload json.RawMessage) (any, error) {
+			return decodeAnd(ctx, payload, sf.get(d), sf.unavailable, run)
+		},
+	}
+}
+
+// reads builds a route for an action that answers without decoding a request.
+func reads(h handler) route { return route{handle: h} }
+
+// deprecate marks a route as belonging to the legacy record-list surface.
+func deprecate(r route) route { r.deprecated = true; return r }
+
 func (d *dispatcher) dispatch(ctx context.Context, action string, payload json.RawMessage) (any, error) {
-	switch action {
-
-	// ─── observation: writes nothing, needs no credential ────────────────────
-
-	case "Health":
-		return d.health(ctx), nil
-
-	// ─── the intent surface (docs/DESIGN.md) ─────────────────────────────────
-	//
-	// The four intents. Each of the FIRST THREE registers a domain and writes
-	// nothing — it computes the proof the customer must publish, derives the
-	// records and seals a registration, and reaches no provider at all. The
-	// fourth runs at deploy time and is the only one of the four that can
-	// publish on its own.
-
-	case "AddOrgPlatformDomain":
-		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
-			(*intent.Service).AddOrgPlatformDomain)
-	case "AddOrgAppDomain":
-		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
-			(*intent.Service).AddOrgAppDomain)
-	case "AddAppDomain":
-		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
-			(*intent.Service).AddAppDomain)
-	case "BindAppToOrgAppDomain":
-		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
-			(*intent.Service).BindAppToOrgAppDomain)
-
-	// The lifecycle. Identical on all three lanes, which is why there is one
-	// set of these and not three.
-	//
-	// 🔴 THREE ACTIONS ON THIS SURFACE WRITE TO A CUSTOMER'S ZONE: "Complete",
-	// "Advance", and "BindAppToOrgAppDomain" in the group above. All three reach
-	// reconcile.Publisher.Publish through internal/intent's `write`, and the
-	// last two share one code path (`pass`) so that "a later pass degrades the
-	// same way on every lane" is true by construction rather than by intent.
-	// Every other intent action derives, reads, seals or revokes, and puts no
-	// record in front of a provider. If you are tracing what can change a zone,
-	// those three are it — plus the deprecated "Publish" below, which is the
-	// only one that takes its records from the caller.
-
-	case "Verify":
-		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
-			(*intent.Service).Verify)
-
-	// 🔴 "IntentAuthorize", NOT "Authorize", AND THE TWO MUST NEVER BECOME
-	// ALIASES.
-	//
-	// Legacy Authorize takes the OAuth state as a REQUEST FIELD. A caller-minted
-	// state is a string the caller can also mint for a registration it is not
-	// holding, and the completing call then has to be handed the identity, the
-	// lane and the domain as separate fields — which is a pair of requests that
-	// can be made to disagree.
-	//
-	// IntentAuthorize mints the state itself, as a sealed envelope carrying the
-	// lane, the identity, the anchor and a nonce, so Complete needs none of them
-	// as fields. It also refuses unless the ownership proof resolves RIGHT NOW,
-	// and, on the wildcard lane, unless this service's own consent page was
-	// served and acknowledged.
-	//
-	// A caller that reached the wrong one would be authorized with none of those
-	// checks and would get no error saying so — a silent downgrade, which is the
-	// quietest way to lose the property this surface exists to add. Two distinct
-	// names turn that mistake into an `unknown_action` refusal instead. So
-	// neither name may ever be pointed at the other implementation, and in
-	// particular "Authorize" must not be re-routed to the intent service as a
-	// migration convenience: the caller's request shape is what selects the
-	// weaker check, not the action name it happens to be behind.
-	//
-	// 🔴 LANE 2 (org_app_domain) CANNOT BE AUTHORIZED ON THIS TRANSPORT, AND
-	// THAT IS A KNOWN GAP RATHER THAN A DECISION.
-	//
-	// The wildcard lane also requires this service's own consent page to have
-	// been served AND acknowledged, and an acknowledgement is a consent.Token
-	// minted under this deployment's keyset. Nothing in this binary mints one:
-	// the /consent route below renders the page and deliberately stops there,
-	// and there is no other call to consent.Token outside the tests. A caller
-	// cannot mint one either — that is the whole point of it being a MAC under a
-	// key that never leaves here. So IntentAuthorize refuses org_app_domain with
-	// `consent_required`, every time, on every deployment of this build.
-	//
-	// It ships that way because the refusal is the safe end of the failure. The
-	// alternative is minting the acknowledgement somewhere the customer was not,
-	// which is exactly the claim-with-nothing-behind-it the consent page exists
-	// to replace. It stays refused until the customer-facing consent route is
-	// settled: where it is served, and which event counts as the agreement.
-	case "IntentAuthorize":
-		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
-			(*intent.Service).Authorize)
-
-	case "Complete":
-		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
-			(*intent.Service).Complete)
-	case "Advance":
-		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
-			(*intent.Service).Advance)
-	case "Describe":
-		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
-			(*intent.Service).Describe)
-	case "Orphans":
-		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
-			(*intent.Service).Orphans)
-	case "Release":
-		return decodeAnd(ctx, payload, d.intents, intent.ErrUnavailable,
-			(*intent.Service).Release)
-
-	// IntentCapabilities is named on the same rule as IntentAuthorize, for a
-	// hazard of the same shape. It answers a strictly larger response than the
-	// legacy Capabilities — the two routing targets, the DCV delegation
-	// identifier, the declared cadence, the per-lane grant lifetimes and whether
-	// each lane needs a consent page — and a client that decoded one into the
-	// other's struct would not fail. It would read Available:false and render no
-	// connect affordance at all, which looks exactly like a deployment that
-	// cannot offer delegated DNS.
-	//
-	// It publishes the routing targets and the DCV identifier deliberately. None
-	// is a secret: every one of them ends up in a customer's own zone as the
-	// VALUE of a record we ask them to accept, and publishing them here is what
-	// lets somebody check, BEFORE authorizing anything, that the CNAME they are
-	// about to be asked for is the one this repository derives.
-	case "IntentCapabilities":
-		if d.intents == nil {
-			return intent.CapabilitiesResponse{}, intent.ErrUnavailable
-		}
-		return d.intents.Capabilities(ctx), nil
-
-	// ─── the deprecated record-list surface ──────────────────────────────────
-	//
-	// 🔴 EVERY CASE BELOW IS LIVE. api-platform calls them today. They are
-	// retained until it has migrated, and not one line of their behaviour has
-	// changed.
-
-	// DEPRECATED — replaced by "IntentCapabilities", which reports what the
-	// intent surface can offer and what it would put in a zone.
-	case "Capabilities":
-		if d.grants == nil {
-			return grant.CapabilitiesResponse{}, nil
-		}
-		return d.grants.Capabilities(ctx), nil
-
-	// DEPRECATED — replaced by "IntentAuthorize", which mints the state instead
-	// of accepting one, and refuses without a live ownership proof.
-	case "Authorize":
-		return decodeAnd(ctx, payload, d.grants, grant.ErrUnavailable,
-			(*grant.Service).Authorize)
-
-	// DEPRECATED — replaced by "Complete" for the first pass and "Advance" for
-	// every later one. This is the action that takes a record list, and so it is
-	// the one defect 1 lives in: it bounds where we write and nothing bounds
-	// what.
-	//
-	// 🔴 SO THE SURFACE AS A WHOLE IS NOT YET BOUNDED, AND ANY CLAIM OTHERWISE
-	// IS ABOUT THE INTENT ACTIONS ALONE. While this case is routed, what
-	// MirrorStack can put in a customer's zone is the UNION of what the intent
-	// surface derives and whatever record list the private half hands to this
-	// one — so somebody auditing the blast radius has to read both halves, and
-	// the weaker half is the one that decides.
-	//
-	// Deleting this case is what turns the bound into a property of the
-	// DEPLOYMENT rather than of the intent surface, and it is the next step.
-	// "Complete" is what api-platform moves to; the retirement is a change to
-	// two repositories in the order the package doc gives, caller first.
-	case "Publish":
-		return decodeAnd(ctx, payload, d.grants, grant.ErrUnavailable,
-			(*grant.Service).Publish)
-
-	// DEPRECATED — replaced by "Release", which opens the sealed grant itself
-	// and revokes the REFRESH token rather than the access token: revoking the
-	// refresh token kills the whole grant, where revoking only the access token
-	// leaves a credential that can mint another. It does NOT refresh first —
-	// there is nothing a refresh would add once the whole grant is going — and
-	// an envelope this deployment cannot open is reported unreadable and logged
-	// REVOKE BY HAND rather than guessed at.
-	case "Revoke":
-		return decodeAnd(ctx, payload, d.grants, grant.ErrUnavailable,
-			(*grant.Service).Revoke)
-
-	default:
+	r, ok := routes[action]
+	if !ok {
 		return nil, fmt.Errorf("%w: %q", errUnknownAction, action)
 	}
+	return r.handle(d, ctx, payload)
+}
+
+// The three actions that answer without decoding a request.
+
+func (d *dispatcher) handleHealth(ctx context.Context, _ json.RawMessage) (any, error) {
+	return d.health(ctx), nil
+}
+
+func (d *dispatcher) handleIntentCapabilities(ctx context.Context, _ json.RawMessage) (any, error) {
+	if d.intents == nil {
+		return intent.CapabilitiesResponse{}, intent.ErrUnavailable
+	}
+	return d.intents.Capabilities(ctx), nil
+}
+
+// handleGrantCapabilities answers a ZERO VALUE rather than a sentinel when the
+// surface is not wired, and that is the legacy contract rather than an oversight:
+// a console reading Available:false renders no connect affordance, where an error
+// would render a failure. Unchanged from before this table existed.
+func (d *dispatcher) handleGrantCapabilities(ctx context.Context, _ json.RawMessage) (any, error) {
+	if d.grants == nil {
+		return grant.CapabilitiesResponse{}, nil
+	}
+	return d.grants.Capabilities(ctx), nil
 }
 
 // decodeAnd unmarshals one action's request and runs it. A malformed payload is

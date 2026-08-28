@@ -135,63 +135,46 @@ func Required(l lane.Lane) bool {
 }
 
 // Token is the acknowledgement: an HMAC over the page's reference and the
-// anchor, under this deployment's keyset, encoded for a log and a support
-// ticket.
+// anchor, under this deployment's keyset.
 //
 // 🔴 IT PROVES THIS SERVICE SERVED THIS PAGE FOR THIS REGISTRATION. An ack the
 // private half could author would put us back where we started — a screen
 // somewhere claiming a customer was told about a standing wildcard, with nothing
-// behind the claim. The key that mints this never leaves this deployment, so the
-// only way to obtain one is to have been served the page and to have
-// acknowledged it.
+// behind it. The minting key never leaves this deployment.
 //
-// 🔴 MINT IT WHEN THE PAGE IS ACKNOWLEDGED, NEVER WHEN IT IS RENDERED. Page
-// deliberately does not return a token: if it did, "the page was served" and
-// "the page was agreed to" would be one event, and anybody able to fetch the URL
-// — the private half included — would hold the agreement. That the two are
-// separate functions is the whole of the control; nothing in the type system
-// enforces the ordering, and the code that serves the page owns it.
+// 🔴 MINT ON ACKNOWLEDGEMENT, NEVER ON RENDER. Page deliberately returns no
+// token: if it did, "served" and "agreed to" would be one event and anybody able
+// to fetch the URL — the private half included — would hold the agreement.
+// Nothing in the type system enforces that ordering; the code serving the page
+// owns it.
 //
-// What it binds is exactly what the page displays: the anchor, and the reference
-// printed on the page. It deliberately does NOT bind the identity — a
-// derive.Plan carries none, so the page never shows one, and a token asserting
-// the customer acknowledged something they were not shown would claim more than
-// it can support. The identity binding comes from the sealed registration the
-// reference was minted into, and reaching it is the caller's obligation:
+// It binds exactly what the page displays: the anchor and the reference. NOT the
+// identity — a derive.Plan carries none, so the page never shows one, and a
+// token asserting the customer acknowledged something they were not shown would
+// claim more than it can support. The identity binding comes from the sealed
+// registration the reference was minted into.
 //
-// 🔴 VERIFY AGAINST THE NONCE OUT OF THE SEALED REGISTRATION, NEVER ONE THE
-// CALLER SENT. sealed.Registration.ConsentNonce is minted when the domain is
-// registered and sealed in with the lane, the identity and the anchor. A
-// reference that arrives beside the token is a pair whose halves are both the
-// caller's, and a MAC over two values the caller chose is a signature on its own
-// statement: one acknowledgement would then satisfy every later authorization on
-// that anchor, forever, with the customer shown nothing again.
+// 🔴 SO VERIFY AGAINST THE NONCE OUT OF THAT SEALED REGISTRATION, NEVER ONE THE
+// CALLER SENT. A reference arriving beside the token is a pair whose halves are
+// both the caller's, and a MAC over two values the caller chose is a signature on
+// its own statement — one acknowledgement would satisfy every later authorization
+// on that anchor, forever, with the customer shown nothing again.
 //
-// 🔴 AND THE LIMIT THAT REMAINS, BECAUSE IT IS REAL AND CHECKABLE. Bound to the
-// registration, an acknowledgement is scoped to ONE REGISTRATION — not to one
-// authorization attempt. The same token verifies for every authorization of that
-// same domain, on that same lane, for as long as the registration exists. A
-// customer who agreed once and then abandoned the connect can have the grant
-// authorized later without seeing the page again.
+// 🔴 THE LIMIT THAT REMAINS, because it is real and checkable: an acknowledgement
+// is scoped to one REGISTRATION, not to one authorization attempt. The same token
+// verifies for every authorization of that domain on that lane for as long as the
+// registration exists, so a customer who agreed once and abandoned the connect can
+// have the grant authorized later without seeing the page again.
 //
-// It is not an oversight and it cannot be closed here. Single use needs a
-// counter, and a counter has to live somewhere: this service owns no database
-// (CLAUDE.md, DESIGN §7), and putting one inside a sealed envelope would not
-// help, because the private half hands the envelope back and could hand back the
-// EARLIER one — a rollback in the direction that grants more authority, which is
-// the one direction sealed's replay note says the stateless design must never
-// depend on.
+// It cannot be closed here. Single use needs a counter; this service owns no
+// database (CLAUDE.md, DESIGN §7), and a counter inside a sealed envelope does not
+// help because the private half can hand back an EARLIER envelope — a rollback in
+// the direction that grants more authority. Re-registering is not a way out
+// either: it mints a new reference, so an old ack fails against the NEW
+// registration, but it does not retire the OLD one, which remains replayable.
 //
-// 🔴 AND RE-REGISTERING IS NOT A WAY OUT OF IT. It mints a new reference, so an
-// old acknowledgement does not verify against the NEW registration — but it does
-// not retire the OLD one, which the private half may still present: a sealed
-// envelope is replayable and this service cannot tell a replay from the original
-// (sealed.go's replay note). So the acknowledgement remains spendable against the
-// old registration indefinitely.
-//
-// The two controls that actually stop a live grant are the customer's, and they
-// are the honest answer here — delete the ownership proof, or revoke at the
-// provider (DESIGN §8).
+// The two controls that do stop a live grant are the customer's: delete the
+// ownership proof, or revoke at the provider (DESIGN §8).
 func Token(s *grantcrypto.Sealer, nonce, anchor string) (string, error) {
 	if s == nil {
 		// No keyset means no acknowledgement — never an acknowledgement under an
