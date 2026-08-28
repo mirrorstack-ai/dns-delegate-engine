@@ -19,9 +19,35 @@
 // deployment's keyset produced for THIS page's reference and THIS anchor, and no
 // key that can produce one exists in MirrorStack's private half.
 //
-// Nothing here talks to a DNS provider, a resolver, a database or the network.
-// Page is a pure function of a plan and a nonce; Token and Verify are pure
-// functions of those plus this deployment's keyset.
+// Serving and agreeing are kept two events by a CHALLENGE: Page renders the
+// disclosure, Offer prints a challenge over its bytes into a form beside it, and
+// Redeem is the only thing that turns one back into a Token. Neither the render
+// nor the redemption is an RPC action, so the surface the private half calls can
+// do neither.
+//
+// 🔴 WHAT THAT PROVES, IN FULL: an acknowledgement exists only because this
+// deployment served this registration's page, showing these exact bytes, and the
+// challenge printed on it came back. It does NOT prove a human read the page.
+// Everything a redemption needs is printed on the page itself, so anything that
+// can fetch it can acknowledge it — and in production the private half is what
+// proxies the page to the customer. Nothing this service can build closes that:
+// a Lambda gated by IAM cannot authenticate a browser its own caller is
+// standing in front of, and any secret we could put on the page travels through
+// that same caller. The control is over SEQUENCE and CONTENT, not over presence;
+// docs/DESIGN.md §4 says so in the same words rather than in weaker ones.
+//
+// 🔴 THE PAGE IS CUSTOMER-REACHABLE, AND THAT DID NOT MAKE THIS CONTROL
+// STRONGER. cmd/dns-delegate-api serves /consent outside the internal secret,
+// gated on the sealed reference alone — because a page only MirrorStack can read
+// discloses nothing to the one party it is written for. It is the SAME control,
+// finally reachable by that party: presence was never proven and still is not,
+// and the private half proxying the page was never excluded and still is not.
+// What changed is that a customer can now fetch the disclosure from the service
+// that will do the writing, instead of reading a console's account of it.
+//
+// Nothing here talks to a DNS provider, a resolver, a database or the network,
+// and nothing reads a clock. Page is a pure function of a plan and a nonce; the
+// other five are pure functions of those plus this deployment's keyset.
 package consent
 
 import (
@@ -148,7 +174,7 @@ func Token(s *grantcrypto.Sealer, nonce, anchor string) (string, error) {
 	if len(active) != grantcrypto.MACSize {
 		return "", fmt.Errorf("%w: the keyset produced no MAC", ErrConsent)
 	}
-	return encode(active), nil
+	return encode(valuePrefix, active), nil
 }
 
 // Verify reports whether a token is one this deployment minted for this reference
@@ -194,7 +220,7 @@ func Verify(s *grantcrypto.Sealer, nonce, anchor, token string) bool {
 			return false
 		}
 		// No early return on a match: see the constant-time note above.
-		if hmac.Equal([]byte(candidate), []byte(encode(mac))) {
+		if hmac.Equal([]byte(candidate), []byte(encode(valuePrefix, mac))) {
 			match = true
 		}
 	}
@@ -221,34 +247,48 @@ func Verify(s *grantcrypto.Sealer, nonce, anchor, token string) bool {
 // nonce is a value this service minted, so accepting a spelling we never issued
 // would be tolerance with nothing to tolerate.
 func message(nonce, anchor string) ([]byte, error) {
+	reference, name, err := bind(nonce, anchor)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(messagePrefix + separator + reference + separator + name), nil
+}
+
+// bind is the validation both messages share: what a usable (reference, anchor)
+// pair is, decided once so the acknowledgement and the challenge cannot disagree
+// about it.
+func bind(nonce, anchor string) (string, string, error) {
 	nonce = strings.TrimSpace(nonce)
 	anchor = dnsplan.NormalizeName(anchor)
 	if len(nonce) > maxNonce {
-		return nil, fmt.Errorf("%w: the reference is %d bytes, and nothing this service mints is over %d",
+		return "", "", fmt.Errorf("%w: the reference is %d bytes, and nothing this service mints is over %d",
 			ErrConsent, len(nonce), maxNonce)
 	}
 	if len(anchor) > dnsplan.MaxDNSName {
-		return nil, fmt.Errorf("%w: the anchor is %d bytes, over the %d-byte DNS limit",
+		return "", "", fmt.Errorf("%w: the anchor is %d bytes, over the %d-byte DNS limit",
 			ErrConsent, len(anchor), dnsplan.MaxDNSName)
 	}
 	for _, part := range []string{nonce, anchor} {
 		if part == "" || strings.Contains(part, separator) {
-			return nil, fmt.Errorf(
+			return "", "", fmt.Errorf(
 				"%w: an acknowledgement needs a reference and an anchor, each present and separator-free", ErrConsent)
 		}
 	}
-	return []byte(messagePrefix + separator + nonce + separator + anchor), nil
+	return nonce, anchor, nil
 }
 
-// encode renders a MAC as the string an acknowledgement travels as:
-// grantcrypto.EncodeMAC under this package's prefix. Two of that function's
-// reasons apply here rather than all of them — this token is never typed into
-// somebody else's web form, but it is logged, quoted in a support thread and
-// copied between two systems, and it must not be base64, because the case
-// folding in fold would make two distinct MACs one acknowledgement. 59
-// characters with the prefix.
-func encode(mac []byte) string {
-	return grantcrypto.EncodeMAC(valuePrefix, mac)
+// encode renders a MAC as the string an acknowledgement or a challenge travels
+// as, under the caller's prefix: grantcrypto.EncodeMAC, where the full argument
+// for the alphabet lives. Two of its reasons apply here rather than all of them —
+// this token is never typed into somebody else's web form, but it is logged,
+// quoted in a support thread and copied between two systems, and it must not be
+// base64, because the case folding in fold would make two distinct MACs one
+// value. 59 characters with the prefix.
+//
+// It takes the prefix because this package encodes TWO things: an
+// acknowledgement and the challenge that redeems for one.
+func encode(prefix string, mac []byte) string {
+	return grantcrypto.EncodeMAC(prefix, mac)
 }
 
 // fold normalizes a candidate token into the form encode produces: trimming and

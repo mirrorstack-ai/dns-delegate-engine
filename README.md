@@ -59,7 +59,7 @@ half decides. The bound becomes a property of the **deployment** on the day the
 deletion is the next step, and it is a change to two repositories in caller-first
 order.
 
-Four more things this file would rather you heard from us than found yourself:
+Five more things this file would rather you heard from us than found yourself:
 
 - **Whether record 7 appears is a property of the deployment, not of the code.**
   Cloudflare's serving proof is read from MirrorStack's own zone, and the org
@@ -68,13 +68,34 @@ Four more things this file would rather you heard from us than found yourself:
   names none produces no `_cf-custom-hostname`, and a hostname on it can resolve,
   hold a certificate whose status reads active, and still answer 526.
   [`docs/RECORDS.md`](docs/RECORDS.md) describes the record and that failure.
-- **Lane 2 cannot be authorized on the deployed build at all.** The wildcard lane
-  requires this service's own consent page to have been acknowledged, and an
-  acknowledgement is a MAC under a key that never leaves this deployment. Nothing
-  in this binary mints one yet, so `IntentAuthorize` refuses `org_app_domain`
-  every time. It fails closed on purpose — the alternative is minting your
-  agreement somewhere you were not — and it stays that way until the
-  customer-facing consent route is settled.
+- **Lane 2's consent page does not prove a person read it.** The wildcard lane
+  is authorized by posting back a challenge printed on the page this service
+  served, so an acknowledgement can only exist where that page was rendered, with
+  those exact bytes, for that registration — and neither serving nor
+  acknowledging is an RPC action, so the private half cannot do both from the
+  surface it calls. What it cannot exclude is the private half fetching the page
+  itself: everything a redemption needs is printed on the page, and in production
+  the private half is what proxies it to you. The control is over **sequence and
+  content, not presence**, and [`docs/DESIGN.md`](docs/DESIGN.md) §4 says so in
+  the same words. Nothing this repository can build closes it — a Lambda gated by
+  IAM cannot authenticate a browser its own caller is standing in front of.
+- **The page is now yours to open, and that changed nothing else.** `/consent` is
+  served without the internal secret — the only route that is — because a page
+  only MirrorStack can read is not a disclosure. It is gated on the sealed
+  registration alone — ciphertext under this deployment's own keyset, carrying a
+  128-bit reference, which you hold because the flow handed it to you and which
+  nobody can guess or forge. Read as a control, this is **exactly what it was
+  before**;
+  what is new is that the person it was written for can reach it, and can compare
+  the words with the code in this repository rather than with a console's account
+  of them. An absent, malformed, unknown or wrong-lane reference all answer the
+  same `404`, so the page is not a way to ask what MirrorStack has been asked to
+  connect.
+- **And no deployment serves that page yet.** The route exists on both
+  transports; what is missing is infrastructure — a gateway route to this
+  function's `/consent` path, and the edge check on whatever proxies it. Until
+  one exists, `IntentAuthorize` still answers `consent_required` for
+  `org_app_domain` on every deployed build.
 - **The digest is required on `Complete`, and it is still not the cross-boundary
   control §4 implies.** It compares a plan derived here against a hex string this
   service handed the caller — `derive(reg) == derive(reg)` — so it catches a bug
@@ -206,7 +227,7 @@ service at all. Read the one you are doing.
 | routing records | one per sibling host, ×4 | **one wildcard**, `*.example.net` | one, for that hostname |
 | AWS certificate records | `account` `api` `apps` — not `cdn` | **none** | **none** |
 | the credential | held **24 hours** | **standing** | held **24 hours** |
-| consent page | not required | **required**, and 🔴 not mintable in this build | not required |
+| consent page | not required | **required** — customer-reachable, and 🔴 not yet routed in any deployment | not required |
 
 The lane 1 and lane 2 diagrams below are the **legacy record-list flow** — what
 production calls today, defect included. Under each one is what the intent
@@ -293,14 +314,17 @@ One parent, and every app you deploy gets a hostname under it. The record set is
 **not** known up front, because the apps do not exist yet — which is the whole
 reason this lane's credential behaves differently.
 
-> 🔴 **On the intent surface this lane cannot be authorized at all in this
-> build.** It is the one lane that requires this service's own consent page to
-> have been served *and* acknowledged, and an acknowledgement is a MAC minted
-> under a key that never leaves this deployment. Nothing here mints one yet, so
-> `IntentAuthorize` answers `consent_required` for `org_app_domain` every time.
-> That is the safe end of the failure — the alternative is a screen somewhere
-> claiming you agreed to a standing wildcard with nothing behind the claim — and
-> it is a known gap, not a decision. The legacy path below is what runs.
+> 🔴 **On the intent surface this lane is authorized by acknowledging a page
+> this service served, and no deployment serves that page yet.** `GET /consent`
+> renders the disclosure with a challenge over its bytes; posting the challenge
+> back mints the acknowledgement `IntentAuthorize` requires. The route is served
+> without the internal secret, gated on the sealed registration alone, so it is a
+> page your own browser can open. Neither half is an RPC action, so MirrorStack's
+> private half cannot do both from the surface it calls — but it *can* fetch the
+> page, which is why the honest claim is about sequence and content and not about
+> a person having read it ([`docs/DESIGN.md`](docs/DESIGN.md) §4). Until a
+> deployment routes that path, `IntentAuthorize` answers `consent_required` for
+> `org_app_domain` and the legacy path below is what runs.
 
 ```mermaid
 sequenceDiagram
@@ -368,7 +392,7 @@ consent page at all: `*.example.net` is the one grant whose scope you cannot
 enumerate for yourself, so the description you act on is rendered by
 [`internal/consent`](internal/consent/consent.go) from the same derivation the
 writer publishes from — not by a console this repository cannot vouch for. That
-control is built and, as the note above says, not yet reachable.
+control is built, and as the note above says, not yet routed by a deployment.
 
 [`docs/DESIGN.md`](docs/DESIGN.md) is the intent surface's contract: what the
 caller may send, what each of the four intents and seven lifecycle functions
@@ -597,7 +621,8 @@ dns-delegate-engine/
 │   ├── lane/                   the three lanes, and the rules the rest validates
 │   │                           against — identity kind, anchor shape, lifetime
 │   ├── consent/                the standing-wildcard page, rendered by the code
-│   │                           that does the writing, plus the acknowledgement
+│   │                           that does the writing, plus the challenge printed
+│   │                           on it and the acknowledgement that redeems it
 │   ├── observe/                what PUBLIC DNS says about a plan, right now
 │   ├── relay/                  records 5 and 7, read verbatim from AWS and
 │   │                           Cloudflare — with OUR credentials, in OUR zones,
