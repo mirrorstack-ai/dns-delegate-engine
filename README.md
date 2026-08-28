@@ -37,16 +37,57 @@ disagree, this file is the truth.
 
 ## The short version
 
-| Question | Answer | Where to check |
-|---|---|---|
-| Can it delete a DNS record? | **No.** There is no delete call anywhere in this service. | [`internal/dnsprovider/provider.go`](internal/dnsprovider/provider.go) — the `Provider` interface has eight methods, four of which reach the network, and none of them removes anything |
-| Can it touch a name you didn't see? | **No.** Every record must sit at or under the anchor — the exact hostname you proved you own — or the whole plan is refused. | [`internal/dnsplan/plan.go`](internal/dnsplan/plan.go), `NewSnapshot` and `Contains` |
-| Can it touch `www`, your apex, or your MX? | **No**, unless the domain you connected *is* that name. Connecting `shop.example.com` cannot reach `example.com`, `www.example.com`, or your mail records. | [`TestContainmentInACustomerZone`](internal/dnsplan/plan_test.go) asserts exactly this |
-| Can it write an A record or an MX record? | **No.** The plan vocabulary is `CNAME` and `TXT` only. | `NormalizeRecords`, and [`TestNormalizeRecordsRejectsUnsupportedTypes`](internal/dnsplan/plan_test.go) |
-| Can it take over a name you're already using? | **No.** If something already answers there and it isn't ours, the publish is refused and names what it found. You delete it yourself and authorize again. | [`ErrNameInUse`](internal/reconcile/reconcile.go) |
-| Can what gets written differ from what you approved? | **Not on the pass you authorized** — a SHA-256 over the record set is taken before you consent and re-checked before anything is written. Later passes publish records that did not exist yet, so there was nothing to approve; those are bounded by the anchor. And the check is **skipped if the caller omits the digest**, so it defends against a bug in the private half, not against the private half. | `Snapshot.Digest`, `Snapshot.Validate` |
-| **Can the private half write a record you did not ask for?** | 🔴 **Yes, today, inside your domain.** Containment bounds a record's name, never its value. This is the defect the rebuild exists to fix. | [`docs/DESIGN.md`](docs/DESIGN.md) |
-| How long does the credential live? | A platform-domain grant is held **24 hours**, and is not cut short when the last record lands. An app-domain grant is **standing**, because every new app you deploy needs a record created for it — you can revoke it at your provider at any time. | See *Grant lifetimes* below |
+<table>
+<thead>
+<tr>
+<th width="33%">Question</th>
+<th width="33%">Answer</th>
+<th width="34%">Where to check</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Can it delete a DNS record?</td>
+<td><strong>No.</strong> There is no delete call anywhere in this service.</td>
+<td><a href="internal/dnsprovider/provider.go"><code>internal/dnsprovider/provider.go</code></a> — the <code>Provider</code> interface has eight methods, four of which reach the network, and none of them removes anything</td>
+</tr>
+<tr>
+<td>Can it touch a name you didn't see?</td>
+<td><strong>No.</strong> Every record must sit at or under the anchor — the exact hostname you proved you own — or the whole plan is refused.</td>
+<td><a href="internal/dnsplan/plan.go"><code>internal/dnsplan/plan.go</code></a>, <code>NewSnapshot</code> and <code>Contains</code></td>
+</tr>
+<tr>
+<td>Can it touch <code>www</code>, your apex, or your MX?</td>
+<td><strong>No</strong>, unless the domain you connected <em>is</em> that name. Connecting <code>shop.example.com</code> cannot reach <code>example.com</code>, <code>www.example.com</code>, or your mail records.</td>
+<td><a href="internal/dnsplan/plan_test.go"><code>TestContainmentInACustomerZone</code></a> asserts exactly this</td>
+</tr>
+<tr>
+<td>Can it write an A record or an MX record?</td>
+<td><strong>No.</strong> The plan vocabulary is <code>CNAME</code> and <code>TXT</code> only.</td>
+<td><code>NormalizeRecords</code>, and <a href="internal/dnsplan/plan_test.go"><code>TestNormalizeRecordsRejectsUnsupportedTypes</code></a></td>
+</tr>
+<tr>
+<td>Can it take over a name you're already using?</td>
+<td><strong>No.</strong> If something already answers there and it isn't ours, the publish is refused and names what it found. You delete it yourself and authorize again.</td>
+<td><a href="internal/reconcile/reconcile.go"><code>ErrNameInUse</code></a></td>
+</tr>
+<tr>
+<td>Can what gets written differ from what you approved?</td>
+<td><strong>Not on the pass you authorized</strong> — a SHA-256 over the record set is taken before you consent and re-checked before anything is written. Later passes publish records that did not exist yet, so there was nothing to approve; those are bounded by the anchor. And the check is <strong>skipped if the caller omits the digest</strong>, so it defends against a bug in the private half, not against the private half.</td>
+<td><code>Snapshot.Digest</code>, <code>Snapshot.Validate</code></td>
+</tr>
+<tr>
+<td><strong>Can the private half write a record you did not ask for?</strong></td>
+<td>🔴 <strong>Yes, today, inside your domain.</strong> Containment bounds a record's name, never its value. This is the defect the rebuild exists to fix.</td>
+<td><a href="docs/DESIGN.md"><code>docs/DESIGN.md</code></a></td>
+</tr>
+<tr>
+<td>How long does the credential live?</td>
+<td>A platform-domain grant is held <strong>24 hours</strong>, and is not cut short when the last record lands. An app-domain grant is <strong>standing</strong>, because every new app you deploy needs a record created for it — you can revoke it at your provider at any time.</td>
+<td>See <em>Grant lifetimes</em> below</td>
+</tr>
+</tbody>
+</table>
 
 If you want to check one thing, check `Contains` in
 [`internal/dnsplan/plan.go`](internal/dnsplan/plan.go). It is six lines, and it is
