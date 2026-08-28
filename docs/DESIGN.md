@@ -306,13 +306,26 @@ you proved.
 | 3 | `*.<anchor>` | CNAME | the app routing target | 2 | this service |
 | 4 | `<hostname>` | CNAME | the app routing target | 3 | this service |
 | 5 | `_<token>.<host>` | CNAME | `….acm-validations.aws` | 1 only | relayed from AWS |
-| 6 | `_acme-challenge.<host>` | TXT | the DV token | all three | relayed from Cloudflare |
+| 6 | `_acme-challenge.<host>` | CNAME | `<host>.<uuid>.dcv.cloudflare.com` | all three | this service — **derived** |
 | 7 | `_cf-custom-hostname.<host>` | TXT | the serving proof | all three | relayed from Cloudflare |
 
-**Records 5, 6 and 7 are relayed, not derived.** This service derives *that* a
-proof must exist and *why*; the bytes come from AWS and Cloudflare. "The engine
+**Records 5 and 7 are relayed, not derived.** This service derives *that* a proof
+must exist and *why*; their bytes come from AWS and Cloudflare. "The engine
 derives the record set" is true of which proofs exist and false of every byte,
 and both halves of that belong in public.
+
+**Record 6 is the exception, and it is the most consequential choice here.** It
+carries no token — it is a *pointer* at Cloudflare's delegated DCV location, and
+both halves of it (the hostname you connected, a per-zone uuid) are known before
+anything is asked of anyone. So it is publishable in the first pass, and it never
+changes again: Cloudflare mints and rotates the real tokens behind it, in its own
+zone, for every future renewal.
+
+That single choice removes a whole stage from the sequence below, and it is what
+lets a closed lane hold a credential for 24 hours rather than forever. Cloudflare's
+DCV tokens live 7 days on Let's Encrypt and 14 on Google Trust Services; a form
+that put the token in the customer's zone would need republishing on that clock,
+indefinitely, by a grant we deliberately do not keep.
 
 **The proof value differs per lane**, because the lane is inside the HMAC. A
 console proof does not authorize an app-domain wildcard, and neither authorizes a
@@ -349,7 +362,7 @@ sequenceDiagram
 
     You->>CF: authorize (zone.read, dns.write — one zone)
     CF-->>Engine: code, redeemed against the sealed state
-    Engine->>CF: routing CNAMEs
+    Engine->>CF: routing CNAMEs + _acme-challenge pointers
 
     loop advance, until serving or the window closes
         Engine->>Engine: re-derive the record set
@@ -375,8 +388,9 @@ Ordering that is genuinely forced, rather than incidental:
 
 - The custom hostname is not created until the proof TXT resolves publicly, so
   record 7 cannot precede record 1.
-- Cloudflare mints record 6 only after the routing record resolves, so it cannot
-  precede record 2, 3 or 4.
+- Record 6 is forced by nothing. It is derived, so it goes out in the first pass
+  beside the routing records — which is the whole point of choosing the delegated
+  form over a minted token.
 - AWS returns a certificate id immediately and its validation record seconds
   later, so a fresh host is routinely "requested, record not known yet" for the
   first minutes of its life. That is a wait, not a fault.
@@ -397,14 +411,7 @@ agreeing to:
    that grants more authority. So the honest description is not "we write once
    when you authorize" but "we hold write access and continuously enforce a
    desired state in your zone, until you stop us."
-3. **Renewal outlives the window.** Cloudflare re-mints the DV token under the
-   same name months later, and a 24-hour grant is long gone — so lanes 1 and 3
-   need a fresh authorization at renewal, or the record added by hand. The
-   delegated form of `_acme-challenge` removes rotation entirely and is built but
-   switched off. Turning it on is the fix; until then this is a step that comes
-   back to the customer, and it should be said on the first page rather than
-   discovered.
-4. **The scheduler.** The loop body moves here; the clock that fires it does not,
+3. **The scheduler.** The loop body moves here; the clock that fires it does not,
    at least at first. "The polling service is in this repository" will be true of
    every decision the loop makes and false of when it runs, and the documentation
    has to say which.
