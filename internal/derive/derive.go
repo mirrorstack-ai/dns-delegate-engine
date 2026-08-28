@@ -375,7 +375,7 @@ func (c Config) Registration(l lane.Lane, identity, anchor, proofValue string) (
 		// Unreachable today, and retained: it is the guard a fourth lane added to
 		// Parse and forgotten in Hosts would trip. The alternative is a
 		// registration that publishes only an ownership proof and reports success.
-		return Plan{}, fmt.Errorf("%w: lane %q derives no hostname under %q", ErrDerive, parsed, echo(anchor))
+		return Plan{}, fmt.Errorf("%w: lane %q derives no hostname under %q", ErrDerive, parsed, lane.Echo(anchor))
 	}
 
 	ownership, err := ownershipItem(anchor, proofValue)
@@ -469,11 +469,15 @@ func (c Config) BindApp(parentAnchor, slug string) (Plan, error) {
 }
 
 const (
-	// dcvPrefix is the owner a certificate authority looks up. The trailing dot is
+	// DCVPrefix is the owner a certificate authority looks up. The trailing dot is
 	// inside the constant so no call site has to remember a separator — the
 	// version of that bug which ships silently produces
 	// `_acme-challengeapi.example.com`.
-	dcvPrefix = "_acme-challenge."
+	//
+	// Exported because internal/consent names this record on the page a customer
+	// agrees to, and a copy there could describe a name this package no longer
+	// derives.
+	DCVPrefix = "_acme-challenge."
 
 	// dcvDelegationZone is where Cloudflare keeps the real, rotating tokens: in
 	// its own zone, not in the customer's.
@@ -536,7 +540,7 @@ func DCVTarget(host, uuid string) string {
 func ownershipItem(anchor, value string) (Item, error) {
 	if proof.Name(anchor) == "" {
 		return Item{}, fmt.Errorf("%w: %q is too deep to carry an ownership proof at %s<anchor>",
-			ErrDerive, echo(anchor), proof.Prefix)
+			ErrDerive, lane.Echo(anchor), proof.Prefix)
 	}
 	return Item{
 		Record: dnsplan.Record{
@@ -593,12 +597,12 @@ func dcvItem(host, uuid string) (Item, error) {
 				ErrConfig, dcvDelegationUUIDEnv)
 		}
 		return Item{}, fmt.Errorf("%w: the certificate pointer for %q would be over the %d-byte DNS limit",
-			ErrDerive, echo(host), dnsplan.MaxDNSName)
+			ErrDerive, lane.Echo(host), dnsplan.MaxDNSName)
 	}
 	return Item{
 		Record: dnsplan.Record{
 			Type: "CNAME",
-			Name: dcvPrefix + host,
+			Name: DCVPrefix + host,
 			// Proxied stays false here for a sharper reason: an owner starting with
 			// an underscore is read directly by a certificate authority, and
 			// proxying it replaces the delegation with addresses. See routingItem.
@@ -641,12 +645,12 @@ func checkItem(anchor string, item Item) error {
 	// which CA may issue for it, in a zone we were lent a token for.
 	if record.Type != "CNAME" && record.Type != "TXT" {
 		return fmt.Errorf("%w: derived a %q record, and the vocabulary is CNAME and TXT",
-			ErrDerive, echo(record.Type))
+			ErrDerive, lane.Echo(record.Type))
 	}
 	if record.Name == "" || record.Value == "" {
 		// Empty is the dangerous half-formed case: a provider handed an empty owner
 		// name creates a record at the ZONE APEX.
-		return fmt.Errorf("%w: derived an incomplete %s record for %q", ErrDerive, record.Type, echo(anchor))
+		return fmt.Errorf("%w: derived an incomplete %s record for %q", ErrDerive, record.Type, lane.Echo(anchor))
 	}
 	if len(record.Name) > dnsplan.MaxDNSName {
 		return fmt.Errorf("%w: derived a %d-byte name, over the %d-byte DNS limit",
@@ -656,21 +660,21 @@ func checkItem(anchor string, item Item) error {
 		// Derived names are normalized by construction. One that is not means a
 		// caller's spelling reached a record verbatim, and two spellings of one
 		// name digest differently on the next pass.
-		return fmt.Errorf("%w: derived a name that is not normalized: %q", ErrDerive, echo(record.Name))
+		return fmt.Errorf("%w: derived a name that is not normalized: %q", ErrDerive, lane.Echo(record.Name))
 	}
 	if record.Proxied {
 		return fmt.Errorf("%w: derived a proxied record for %q, and a customer-zone record is never proxied",
-			ErrDerive, echo(record.Name))
+			ErrDerive, lane.Echo(record.Name))
 	}
 	if !dnsplan.Contains(anchor, record.Name) {
 		slog.Error("derive: refusing a plan that names something outside its anchor",
 			"anchor", anchor, "record", record.Name, "purpose", item.Purpose)
-		return fmt.Errorf("%w: %q is not at or under %q", ErrDerive, echo(record.Name), echo(anchor))
+		return fmt.Errorf("%w: %q is not at or under %q", ErrDerive, lane.Echo(record.Name), lane.Echo(anchor))
 	}
 	if item.Purpose == "" || item.Source == "" || item.Explain == "" {
 		// A row with no purpose, source or explanation is one a customer is asked
 		// to accept with nothing to accept it on.
-		return fmt.Errorf("%w: derived an unlabelled record for %q", ErrDerive, echo(record.Name))
+		return fmt.Errorf("%w: derived an unlabelled record for %q", ErrDerive, lane.Echo(record.Name))
 	}
 	return nil
 }
@@ -691,14 +695,4 @@ func envOr(key, fallback string) string {
 // nothing else in this service does.
 func splitSuffixes(raw string) []string {
 	return strings.Fields(strings.NewReplacer(",", " ", ";", " ").Replace(raw))
-}
-
-// echo bounds what a refusal quotes back, for the reason lane.echo gives: an
-// error string is somewhere a value is copied, logged, and copied again.
-func echo(s string) string {
-	const max = 64
-	if len(s) > max {
-		return s[:max] + "…(truncated)"
-	}
-	return s
 }

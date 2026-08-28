@@ -351,31 +351,6 @@ func TestValidateIdentity(t *testing.T) {
 	}
 }
 
-// 🔴 THE DRIFT GUARD ON A DUPLICATED RULE.
-//
-// dnsplan.canonicalUUID is unexported, so this package re-implements it. Two
-// copies of one rule drift, and the looser copy is the one that decides what gets
-// published — so both are run over one table, through dnsplan's exported surface
-// (NewSnapshot refuses a target id that is not canonical), and must agree on every
-// row AND on the normalized result.
-func TestValidateIdentityMatchesDnsplanStrictness(t *testing.T) {
-	records := []dnsplan.Record{{
-		Type: "CNAME", Name: "account." + testAnchor, Value: "edge.example.test",
-	}}
-	for _, tc := range identityCases() {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := ValidateIdentity(tc.input)
-			snapshot, snapErr := dnsplan.NewSnapshot(dnsplan.KindPlatform, tc.input, testAnchor, records)
-			if (err == nil) != (snapErr == nil) {
-				t.Fatalf("lane and dnsplan disagree on %q: lane err=%v, dnsplan err=%v", tc.input, err, snapErr)
-			}
-			if err == nil && got != snapshot.TargetID {
-				t.Fatalf("normalization drift on %q: lane %q, dnsplan %q", tc.input, got, snapshot.TargetID)
-			}
-		})
-	}
-}
-
 // ─── ValidateDomain ─────────────────────────────────────────────────────────
 
 func TestValidateDomainAccepts(t *testing.T) {

@@ -1,12 +1,11 @@
 package proof
 
 import (
-	"encoding/base64"
 	"strings"
 	"testing"
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
-	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport"
 )
 
 const (
@@ -20,46 +19,9 @@ const (
 	fixtureAnchor   = "example.com"
 )
 
-// goldenKeyset is 32 bytes 0x00…0x1f under one key id. Written out rather than
-// randomized so a reader can regenerate every vector in this file with any
-// HKDF/HMAC tool and check for themselves that the value we ask a customer to
-// publish is the value this code computes.
-func goldenKeyset(t *testing.T) string {
-	t.Helper()
-	raw := make([]byte, grantcrypto.KeySize)
-	for i := range raw {
-		raw[i] = byte(i)
-	}
-	return `{"active":"golden","keys":{"golden":"` + base64.StdEncoding.EncodeToString(raw) + `"}}`
-}
-
-// keysetOf builds a keyset whose material is derived from each key id, never
-// from its position — so a rotation fixture can reorder the ids and the only
-// thing that moves is which key is active.
-func keysetOf(t *testing.T, ids ...string) string {
-	t.Helper()
-	encoded := make([]string, 0, len(ids))
-	for _, id := range ids {
-		raw := make([]byte, grantcrypto.KeySize)
-		for j := range raw {
-			raw[j] = id[j%len(id)] ^ byte(j)
-		}
-		encoded = append(encoded, `"`+id+`":"`+base64.StdEncoding.EncodeToString(raw)+`"`)
-	}
-	return `{"active":"` + ids[0] + `","keys":{` + strings.Join(encoded, ",") + `}}`
-}
-
 func proverFrom(t *testing.T, keyset string) Prover {
 	t.Helper()
-	keys, err := grantcrypto.ParseKeyset(keyset)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sealer, err := grantcrypto.NewSealer(keys)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return Prover{Sealer: sealer}
+	return Prover{Sealer: testsupport.SealerFrom(t, keyset)}
 }
 
 func expected(t *testing.T, p Prover, l lane.Lane, identity, anchor string) string {
@@ -113,7 +75,7 @@ func TestTheLaneWireStringsArePinned(t *testing.T) {
 func TestGoldenValue(t *testing.T) {
 	const want = "msv1-ts3k2xmx2nzeqtcijntm324m4zf24epx7lyvgqnxs3acbxqymesq"
 
-	got := expected(t, proverFrom(t, goldenKeyset(t)), laneOrgPlatform, fixtureIdentity, fixtureAnchor)
+	got := expected(t, proverFrom(t, testsupport.GoldenKeyset(t)), laneOrgPlatform, fixtureIdentity, fixtureAnchor)
 	if got != want {
 		t.Fatalf("golden proof value = %q, want %q", got, want)
 	}
@@ -125,7 +87,7 @@ func TestGoldenValue(t *testing.T) {
 // console on it would have simultaneously proved it for `*.example.com` — every
 // name under their domain, including the ones they have not thought of.
 func TestTheLaneChangesTheValue(t *testing.T) {
-	p := proverFrom(t, goldenKeyset(t))
+	p := proverFrom(t, testsupport.GoldenKeyset(t))
 	seen := map[string]lane.Lane{}
 	for _, l := range []lane.Lane{laneOrgPlatform, laneOrgApp, laneApp} {
 		value := expected(t, p, l, fixtureIdentity, fixtureAnchor)
@@ -139,7 +101,7 @@ func TestTheLaneChangesTheValue(t *testing.T) {
 // Two orgs connecting the same domain must not be able to publish each other's
 // proof — otherwise the first to register hands the second a working claim.
 func TestTheIdentityChangesTheValue(t *testing.T) {
-	p := proverFrom(t, goldenKeyset(t))
+	p := proverFrom(t, testsupport.GoldenKeyset(t))
 	one := expected(t, p, laneOrgPlatform, fixtureIdentity, fixtureAnchor)
 	two := expected(t, p, laneOrgPlatform, "99999999-8888-7777-6666-555555555555", fixtureAnchor)
 	if one == two {
@@ -151,7 +113,7 @@ func TestTheIdentityChangesTheValue(t *testing.T) {
 // in the MAC, one record in a zone the customer does control would prove every
 // domain they ever register.
 func TestTheAnchorChangesTheValue(t *testing.T) {
-	p := proverFrom(t, goldenKeyset(t))
+	p := proverFrom(t, testsupport.GoldenKeyset(t))
 	one := expected(t, p, laneOrgPlatform, fixtureIdentity, fixtureAnchor)
 	two := expected(t, p, laneOrgPlatform, fixtureIdentity, "example.net")
 	if one == two {
@@ -163,7 +125,7 @@ func TestTheAnchorChangesTheValue(t *testing.T) {
 // the anchor with a trailing root dot, or the id in upper case, must not mint a
 // second proof and silently invalidate the record already published.
 func TestSpellingDoesNotChangeTheValue(t *testing.T) {
-	p := proverFrom(t, goldenKeyset(t))
+	p := proverFrom(t, testsupport.GoldenKeyset(t))
 	want := expected(t, p, laneOrgPlatform, fixtureIdentity, fixtureAnchor)
 	for _, variant := range []struct{ identity, anchor string }{
 		{fixtureIdentity, "EXAMPLE.COM"},
@@ -182,7 +144,7 @@ func TestSpellingDoesNotChangeTheValue(t *testing.T) {
 // must always be in the first, or we would be telling customers to publish a
 // value we then refuse.
 func TestAcceptedContainsExpected(t *testing.T) {
-	p := proverFrom(t, goldenKeyset(t))
+	p := proverFrom(t, testsupport.GoldenKeyset(t))
 	want := expected(t, p, laneOrgPlatform, fixtureIdentity, fixtureAnchor)
 	accepted, err := p.Accepted(laneOrgPlatform, fixtureIdentity, fixtureAnchor)
 	if err != nil {
@@ -202,10 +164,10 @@ func TestAcceptedContainsExpected(t *testing.T) {
 // entry wide again, every proof published under the retired key is dead and
 // those customers have to edit their own zone before their domain advances.
 func TestRotationKeepsAPublishedProofValid(t *testing.T) {
-	before := proverFrom(t, keysetOf(t, "k1", "k2"))
+	before := proverFrom(t, testsupport.Keyset(t, "k1", "k2"))
 	published := expected(t, before, laneOrgApp, fixtureIdentity, "example.net")
 
-	after := proverFrom(t, keysetOf(t, "k2", "k1")) // same material, k2 now active
+	after := proverFrom(t, testsupport.Keyset(t, "k2", "k1")) // same material, k2 now active
 	if handedOutNow := expected(t, after, laneOrgApp, fixtureIdentity, "example.net"); handedOutNow == published {
 		t.Fatal("the value handed out did not move when the active key did")
 	}
@@ -231,7 +193,7 @@ func TestRotationKeepsAPublishedProofValid(t *testing.T) {
 // and a set that reordered itself between two calls would make two identical
 // registrations look different.
 func TestAcceptedIsDeterministic(t *testing.T) {
-	p := proverFrom(t, keysetOf(t, "kb", "ka", "kc"))
+	p := proverFrom(t, testsupport.Keyset(t, "kb", "ka", "kc"))
 	first, err := p.Accepted(laneApp, fixtureIdentity, "app.example.org")
 	if err != nil {
 		t.Fatal(err)
@@ -248,7 +210,7 @@ func TestAcceptedIsDeterministic(t *testing.T) {
 }
 
 func TestRecordIsTheOwnershipTXT(t *testing.T) {
-	p := proverFrom(t, goldenKeyset(t))
+	p := proverFrom(t, testsupport.GoldenKeyset(t))
 	record, err := p.Record(laneOrgPlatform, fixtureIdentity, fixtureAnchor)
 	if err != nil {
 		t.Fatal(err)
@@ -287,7 +249,7 @@ func TestNameFailsClosed(t *testing.T) {
 	// Record refuses what Name refuses, rather than publishing a bare prefix.
 	// The long anchor is the case worth having: it is a legal anchor, so the MAC
 	// is computed fine and only the derived NAME is out of bounds.
-	p := proverFrom(t, goldenKeyset(t))
+	p := proverFrom(t, testsupport.GoldenKeyset(t))
 	for name, anchor := range map[string]string{
 		"empty":    "",
 		"too long": strings.Repeat("a.", 120) + "example.com",
@@ -302,7 +264,7 @@ func TestNameFailsClosed(t *testing.T) {
 // being injective: (lane, "x\x00example.com", "") and (lane, "x", "example.com")
 // would be the same bytes, and one proof would authorize two registrations.
 func TestExpectedRefusesInputItCannotEncode(t *testing.T) {
-	p := proverFrom(t, goldenKeyset(t))
+	p := proverFrom(t, testsupport.GoldenKeyset(t))
 	for name, input := range map[string]struct {
 		lane             lane.Lane
 		identity, anchor string
@@ -349,7 +311,7 @@ func TestZeroProverFailsClosed(t *testing.T) {
 // DNS. It has to fit one TXT character-string and contain nothing a zone file's
 // quoting, or a form that trims and splits on whitespace, can mangle.
 func TestValueSurvivesADNSControlPanel(t *testing.T) {
-	value := expected(t, proverFrom(t, goldenKeyset(t)), laneOrgPlatform, fixtureIdentity, fixtureAnchor)
+	value := expected(t, proverFrom(t, testsupport.GoldenKeyset(t)), laneOrgPlatform, fixtureIdentity, fixtureAnchor)
 	if len(value) >= 255 {
 		t.Fatalf("value is %d bytes: one TXT character-string holds 255", len(value))
 	}
@@ -368,7 +330,7 @@ func TestValueSurvivesADNSControlPanel(t *testing.T) {
 // quotes must still verify — that tolerance is the entire reason the encoding is
 // case-insensitive base32 rather than base64.
 func TestMatchesFoldsWhatAPanelDoesToAValue(t *testing.T) {
-	p := proverFrom(t, goldenKeyset(t))
+	p := proverFrom(t, testsupport.GoldenKeyset(t))
 	value := expected(t, p, laneOrgPlatform, fixtureIdentity, fixtureAnchor)
 
 	for name, observed := range map[string][]string{

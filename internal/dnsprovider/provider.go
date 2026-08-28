@@ -17,9 +17,27 @@ package dnsprovider
 
 import (
 	"context"
+	"strings"
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
 )
+
+// TrimTXTQuotes strips ONE MATCHED PAIR of surrounding double quotes — the DNS
+// presentation wrapper, which a zone file writes and most provider APIs do not.
+//
+// 🔴 IT IS THE ONE COMPARISON FORM FOR A TXT VALUE, ON THE WRITE PATH AND THE
+// READ PATH ALIKE. The write path asks "is this value already correct" and the
+// read path asks "is this proof published"; two spellings of that question mean
+// a value one accepts and the other rewrites or refuses.
+//
+// Matched, never `strings.Trim`: an unbalanced or doubled quote is DATA, and
+// eating it makes two different values compare equal.
+func TrimTXTQuotes(v string) string {
+	if len(v) >= 2 && strings.HasPrefix(v, `"`) && strings.HasSuffix(v, `"`) {
+		return v[1 : len(v)-1]
+	}
+	return v
+}
 
 // LiveRecord is one record as the provider currently holds it.
 type LiveRecord struct {

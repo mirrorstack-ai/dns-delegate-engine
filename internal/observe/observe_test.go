@@ -2,7 +2,6 @@ package observe
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"net"
 	"strings"
@@ -14,7 +13,7 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/proof"
-	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport"
 )
 
 // Every name in this file is example.com, example.net or example.org. Nothing
@@ -80,7 +79,7 @@ func (f *fakeResolver) LookupCNAME(ctx context.Context, name string) (string, er
 	if answer, ok := f.cname[name]; ok {
 		return answer.value, answer.err
 	}
-	return "", notFound(name)
+	return "", testsupport.NotFound(name)
 }
 
 func (f *fakeResolver) LookupTXT(ctx context.Context, name string) ([]string, error) {
@@ -92,7 +91,7 @@ func (f *fakeResolver) LookupTXT(ctx context.Context, name string) ([]string, er
 	if answer, ok := f.txt[name]; ok {
 		return answer.values, answer.err
 	}
-	return nil, notFound(name)
+	return nil, testsupport.NotFound(name)
 }
 
 // 🔴 The production resolver must satisfy the interface every test drives. It
@@ -105,12 +104,6 @@ var (
 	_ Resolver = &NetResolver{}
 	_ Resolver = (*fakeResolver)(nil)
 )
-
-// notFound is how a resolver spells NXDOMAIN, and also "the name exists but
-// holds nothing of this type" — the standard library reports both this way.
-func notFound(name string) error {
-	return &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
-}
 
 func timedOut(name string) error {
 	return &net.DNSError{Err: "i/o timeout", Name: name, IsTimeout: true, IsTemporary: true}
@@ -165,7 +158,7 @@ func TestPlanReportsEveryState(t *testing.T) {
 			// _cf-custom-hostname.account.example.com
 		},
 		txt: map[string]txtAnswer{
-			"_cf-custom-hostname.account.example.com": {err: notFound("_cf-custom-hostname.account.example.com")},
+			"_cf-custom-hostname.account.example.com": {err: testsupport.NotFound("_cf-custom-hostname.account.example.com")},
 		},
 	}
 
@@ -692,28 +685,6 @@ func TestPlanAsksAboutTheNormalizedName(t *testing.T) {
 // Proof: the gate.
 // ---------------------------------------------------------------------------
 
-func keysetOf(t *testing.T, ids ...string) *grantcrypto.Sealer {
-	t.Helper()
-	encoded := make([]string, 0, len(ids))
-	for _, id := range ids {
-		raw := make([]byte, grantcrypto.KeySize)
-		for j := range raw {
-			raw[j] = id[j%len(id)] ^ byte(j)
-		}
-		encoded = append(encoded, `"`+id+`":"`+base64.StdEncoding.EncodeToString(raw)+`"`)
-	}
-	document := `{"active":"` + ids[0] + `","keys":{` + strings.Join(encoded, ",") + `}}`
-	keys, err := grantcrypto.ParseKeyset(document)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sealer, err := grantcrypto.NewSealer(keys)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return sealer
-}
-
 const proofIdentity = "11111111-2222-3333-4444-555555555555"
 
 func acceptSet(t *testing.T, p proof.Prover) (accepted []string, active string) {
@@ -730,7 +701,7 @@ func acceptSet(t *testing.T, p proof.Prover) (accepted []string, active string) 
 }
 
 func TestProofIsTrueWhenTheActiveValueIsPublished(t *testing.T) {
-	prover := proof.Prover{Sealer: keysetOf(t, "current")}
+	prover := proof.Prover{Sealer: testsupport.Sealer(t, "current")}
 	accepted, active := acceptSet(t, prover)
 	name := proof.Name(anchor)
 
@@ -748,7 +719,7 @@ func TestProofIsTrueForARotatedOutAcceptedValue(t *testing.T) {
 	// look at it again. If rotating the MAC key invalidated it, every domain in
 	// the estate would go unproven at the same moment and this service would
 	// start releasing live credentials over a key change of ours.
-	prover := proof.Prover{Sealer: keysetOf(t, "current", "previous")}
+	prover := proof.Prover{Sealer: testsupport.Sealer(t, "current", "previous")}
 	accepted, active := acceptSet(t, prover)
 	if len(accepted) != 2 {
 		t.Fatalf("accept set has %d values, want one per key", len(accepted))
@@ -776,7 +747,7 @@ func TestProofIsTrueForARotatedOutAcceptedValue(t *testing.T) {
 }
 
 func TestProofIsFalseWhenNoAcceptedValueIsPublished(t *testing.T) {
-	prover := proof.Prover{Sealer: keysetOf(t, "current")}
+	prover := proof.Prover{Sealer: testsupport.Sealer(t, "current")}
 	accepted, active := acceptSet(t, prover)
 	name := proof.Name(anchor)
 
@@ -812,7 +783,7 @@ func TestProofFoldsPresentationButNotMeaning(t *testing.T) {
 	// Several DNS control panels upper-case or quote what is pasted into them.
 	// Refusing a proof over presentation would be refusing a customer who did
 	// exactly what they were asked.
-	prover := proof.Prover{Sealer: keysetOf(t, "current")}
+	prover := proof.Prover{Sealer: testsupport.Sealer(t, "current")}
 	accepted, active := acceptSet(t, prover)
 	name := proof.Name(anchor)
 
@@ -842,7 +813,7 @@ func TestProofAbsentIsNotAnError(t *testing.T) {
 	// The ordinary state of a registration the customer has not acted on yet.
 	// An error here would make the loop treat waiting as a fault and back off
 	// from a customer who is simply still typing.
-	prover := proof.Prover{Sealer: keysetOf(t, "current")}
+	prover := proof.Prover{Sealer: testsupport.Sealer(t, "current")}
 	accepted, _ := acceptSet(t, prover)
 	name := proof.Name(anchor)
 
@@ -873,7 +844,7 @@ func TestProofAbsentIsNotAnError(t *testing.T) {
 func TestProofUnknownReturnsTheErrorAndIsNeverAbsent(t *testing.T) {
 	// 🔴 A failed lookup must not reach the caller as a clean negative. Absent
 	// eventually releases a customer's credential; unknown must not be able to.
-	prover := proof.Prover{Sealer: keysetOf(t, "current")}
+	prover := proof.Prover{Sealer: testsupport.Sealer(t, "current")}
 	accepted, _ := acceptSet(t, prover)
 	name := proof.Name(anchor)
 
@@ -896,7 +867,7 @@ func TestProofUnknownReturnsTheErrorAndIsNeverAbsent(t *testing.T) {
 }
 
 func TestProofRefusesAMalformedRequest(t *testing.T) {
-	prover := proof.Prover{Sealer: keysetOf(t, "current")}
+	prover := proof.Prover{Sealer: testsupport.Sealer(t, "current")}
 	accepted, _ := acceptSet(t, prover)
 	name := proof.Name(anchor)
 
@@ -947,7 +918,7 @@ func TestProofDoesNotEchoTheAcceptSetBack(t *testing.T) {
 	// active, so there is nothing here that could be shown to a customer
 	// without picking arbitrarily. Want stays empty; proof.Prover.Expected is
 	// what a console renders.
-	prover := proof.Prover{Sealer: keysetOf(t, "current", "previous")}
+	prover := proof.Prover{Sealer: testsupport.Sealer(t, "current", "previous")}
 	accepted, active := acceptSet(t, prover)
 	name := proof.Name(anchor)
 	resolver := &fakeResolver{txt: map[string]txtAnswer{name: {values: []string{active}}}}
@@ -973,7 +944,7 @@ func TestProofMatchingAgreesWithTheProofPackage(t *testing.T) {
 	// security rule is a place for the two to drift, and the looser one would
 	// be the one that mattered. So the two are driven over one table and have
 	// to agree on every row.
-	prover := proof.Prover{Sealer: keysetOf(t, "current", "previous")}
+	prover := proof.Prover{Sealer: testsupport.Sealer(t, "current", "previous")}
 	accepted, active := acceptSet(t, prover)
 
 	rows := [][]string{
@@ -1061,9 +1032,12 @@ func TestNormalizeTXTStripsPresentationAndKeepsMeaning(t *testing.T) {
 		`"value"`:     "value",
 		`  "value"  `: "value",
 		`value`:       "value",
-		`""value""`:   "value",
-		`"`:           "",
-		``:            "",
+		// ONE matched pair, dnsprovider.TrimTXTQuotes: an unbalanced or doubled
+		// quote is data, and eating it would make two different values compare
+		// equal here while the write path still told them apart.
+		`""value""`: `"value"`,
+		`"`:         `"`,
+		``:          "",
 		// Case is meaning for a general TXT value: a difference in case is a
 		// real difference to whoever is checking it upstream.
 		`"MixedCase"`: "MixedCase",
@@ -1094,7 +1068,7 @@ func TestExplainKeepsBothHalves(t *testing.T) {
 func TestIsNotFoundRecognisesExactlyOneError(t *testing.T) {
 	// 🔴 Every mistake this function could make points the same way: toward
 	// telling a caller a record is gone when it may not be.
-	if !isNotFound(notFound("example.com")) {
+	if !isNotFound(testsupport.NotFound("example.com")) {
 		t.Error("NXDOMAIN must be recognised")
 	}
 	for _, err := range []error{

@@ -63,10 +63,13 @@ var ErrUnexpectedRecord = errors.New("relay: upstream returned a record this ser
 // not filled in yet.
 const ValidationTargetSuffix = ".acm-validations.aws"
 
-// ownershipRecordPrefix is the owner name Cloudflare mints the serving proof at.
-// It is asserted against, never constructed from: the name is relayed verbatim,
+// ServingProofPrefix is the owner name Cloudflare mints the serving proof at. It
+// is asserted against here, never constructed from: the name is relayed verbatim,
 // and this only checks that what came back is the record that was asked for.
-const ownershipRecordPrefix = "_cf-custom-hostname."
+//
+// Exported because internal/consent names this record on the page a customer
+// agrees to, and a copy there could describe a name this package would refuse.
+const ServingProofPrefix = "_cf-custom-hostname."
 
 // MaxRelayed is how many records this relay may add to one plan.
 //
@@ -293,9 +296,9 @@ func checkedServingProof(host string, record dnsplan.Record) (dnsplan.Record, er
 		return dnsplan.Record{}, fmt.Errorf("%w: the serving proof for %q is a %s, not a TXT",
 			ErrUnexpectedRecord, host, out.Type)
 	}
-	if !strings.HasPrefix(out.Name, ownershipRecordPrefix) {
+	if !strings.HasPrefix(out.Name, ServingProofPrefix) {
 		return dnsplan.Record{}, fmt.Errorf("%w: the serving proof for %q is named %q, not %s%s",
-			ErrUnexpectedRecord, host, out.Name, ownershipRecordPrefix, host)
+			ErrUnexpectedRecord, host, out.Name, ServingProofPrefix, host)
 	}
 	// An empty value is a WAIT at the adapter (Cloudflare keeps the object
 	// present with empty strings; see servingProofRecord in edge.go), so one

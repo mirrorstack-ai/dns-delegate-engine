@@ -557,7 +557,7 @@ func (s stubEdge) ServingProof(_ context.Context, host string) (dnsplan.Record, 
 	if !ok {
 		return dnsplan.Record{}, false, nil
 	}
-	return relayedRecord("TXT", ownershipRecordPrefix+host, value), true, nil
+	return relayedRecord("TXT", ServingProofPrefix+host, value), true, nil
 }
 
 // A partial answer is the normal answer: a lane-1 registration creates four
@@ -708,27 +708,27 @@ func TestAHostileEdgeIsRefusedAboveTheInterface(t *testing.T) {
 	const host = "account.example.com"
 	for name, record := range map[string]dnsplan.Record{
 		"a proof for a host nobody asked about": {
-			Type: "TXT", Name: ownershipRecordPrefix + "example.net", Value: "v"},
+			Type: "TXT", Name: ServingProofPrefix + "example.net", Value: "v"},
 		"the host itself rather than a name beneath it": {
 			Type: "TXT", Name: host, Value: "v"},
 		"a name beneath the host that is not the ownership record": {
 			Type: "TXT", Name: "_other." + host, Value: "v"},
 		"a type Cloudflare returns in another field entirely": {
-			Type: "CNAME", Name: ownershipRecordPrefix + host, Value: "v"},
+			Type: "CNAME", Name: ServingProofPrefix + host, Value: "v"},
 		"ready, with no value": {
-			Type: "TXT", Name: ownershipRecordPrefix + host, Value: ""},
+			Type: "TXT", Name: ServingProofPrefix + host, Value: ""},
 		"a value past the length one TXT string carries": {
-			Type: "TXT", Name: ownershipRecordPrefix + host,
+			Type: "TXT", Name: ServingProofPrefix + host,
 			Value: strings.Repeat("a", maxServingProofValue+1)},
 		// The publisher wraps a TXT value in quotes and does not escape what is
 		// inside, so a quote in the value moves where that string ends.
 		"a value carrying the quote that ends a TXT string": {
-			Type: "TXT", Name: ownershipRecordPrefix + host, Value: `proof" "injected`},
+			Type: "TXT", Name: ServingProofPrefix + host, Value: `proof" "injected`},
 		"a value carrying a backslash": {
-			Type: "TXT", Name: ownershipRecordPrefix + host, Value: `proof\injected`},
+			Type: "TXT", Name: ServingProofPrefix + host, Value: `proof\injected`},
 		// A control character costs twice: it is also how a log line is forged.
 		"a value carrying a control character": {
-			Type: "TXT", Name: ownershipRecordPrefix + host, Value: "proof\nlog-line-forged"},
+			Type: "TXT", Name: ServingProofPrefix + host, Value: "proof\nlog-line-forged"},
 	} {
 		edge := hostileEdge{record: record}
 		if _, ready, err := ServingProof(context.Background(), edge, host); !errors.Is(err, ErrUnexpectedRecord) || ready {

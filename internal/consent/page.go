@@ -8,6 +8,7 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/derive"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/relay"
 )
 
 // Page renders the consent page for a registration: the anchor, the wildcard that
@@ -55,7 +56,7 @@ func Page(p derive.Plan, nonce string) (string, error) {
 	// and CANNOT be given one — blocked rather than described wrongly.
 	if p.Lane != lane.OrgAppDomain {
 		return "", fmt.Errorf("%w: this page describes the %s grant, not %q",
-			ErrConsent, lane.OrgAppDomain, echo(string(p.Lane)))
+			ErrConsent, lane.OrgAppDomain, lane.Echo(string(p.Lane)))
 	}
 	// Unreachable today, and retained. The page says this grant has no expiry;
 	// package lane is where that is actually decided. If the lane table ever gives
@@ -120,7 +121,7 @@ func Page(p derive.Plan, nonce string) (string, error) {
 	}
 	if ownership.Source != derive.SourceCustomer {
 		return "", fmt.Errorf("%w: the ownership proof is marked %q rather than %q, and a proof we publish is not a stop control",
-			ErrConsent, echo(string(ownership.Source)), derive.SourceCustomer)
+			ErrConsent, lane.Echo(string(ownership.Source)), derive.SourceCustomer)
 	}
 	// The wildcard is the grant: present, ours to write, and AT THIS ANCHOR — the
 	// page names it in its heading, so a plan with some other routing name would be
@@ -132,11 +133,11 @@ func Page(p derive.Plan, nonce string) (string, error) {
 	}
 	if routing.Source != derive.SourceDerived {
 		return "", fmt.Errorf("%w: the wildcard is marked %q rather than %q",
-			ErrConsent, echo(string(routing.Source)), derive.SourceDerived)
+			ErrConsent, lane.Echo(string(routing.Source)), derive.SourceDerived)
 	}
 	if wildcard := "*." + anchor; routing.Record.Name != wildcard {
 		return "", fmt.Errorf("%w: the routing record is %q, and this page describes %q",
-			ErrConsent, echo(routing.Record.Name), wildcard)
+			ErrConsent, lane.Echo(routing.Record.Name), wildcard)
 	}
 
 	data := pageData{
@@ -145,10 +146,12 @@ func Page(p derive.Plan, nonce string) (string, error) {
 		RoutingTarget: routing.Record.Value,
 		ProofName:     ownership.Record.Name,
 		ProofValue:    ownership.Record.Value,
-		// Built from the anchor rather than from a record, because these are the
-		// names that do NOT exist yet. The placeholder is where the app's slug goes.
-		PerAppCert:    dcvPrefix + slugPlaceholder + "." + anchor,
-		PerAppServing: servingPrefix + slugPlaceholder + "." + anchor,
+		// Records 6 and 7 (docs/DESIGN.md §6), built from the anchor rather than
+		// from a record because these are the names that do NOT exist yet, and
+		// prefixed from the packages that own them: a copy here could describe a
+		// name derive no longer derives, or one relay would refuse.
+		PerAppCert:    derive.DCVPrefix + slugPlaceholder + "." + anchor,
+		PerAppServing: relay.ServingProofPrefix + slugPlaceholder + "." + anchor,
 		PerAppHost:    slugPlaceholder + "." + anchor,
 		Reference:     strings.TrimSpace(nonce),
 		Rows:          rows,
@@ -172,7 +175,7 @@ func checkItem(anchor string, item derive.Item) error {
 	record := item.Record
 	if record.Type != "CNAME" && record.Type != "TXT" {
 		return fmt.Errorf("%w: the plan holds a %q record, and the vocabulary is CNAME and TXT",
-			ErrConsent, echo(record.Type))
+			ErrConsent, lane.Echo(record.Type))
 	}
 	if record.Name == "" || record.Value == "" {
 		// Empty is the dangerous half-formed case: a blank owner name is a write at
@@ -182,14 +185,14 @@ func checkItem(anchor string, item derive.Item) error {
 	}
 	if item.Explain == "" || item.Source == "" || item.Purpose == "" {
 		return fmt.Errorf("%w: %q has no explanation to show, and an unexplained row is not consented to",
-			ErrConsent, echo(record.Name))
+			ErrConsent, lane.Echo(record.Name))
 	}
 	if record.Proxied {
 		// There is no column for this, and adding one would document a capability
 		// this service does not have: a customer-zone record is never proxied (see
 		// derive.routingItem).
 		return fmt.Errorf("%w: %q is marked proxied, and a customer-zone record never is",
-			ErrConsent, echo(record.Name))
+			ErrConsent, lane.Echo(record.Name))
 	}
 	if !dnsplan.Contains(anchor, record.Name) {
 		// Both sentinels: a caller checking this package keeps one answer, and an
@@ -198,27 +201,16 @@ func checkItem(anchor string, item derive.Item) error {
 		// would refuse, and its acknowledgement would evidence an agreement that
 		// never applied.
 		return fmt.Errorf("%w: %w: %q is not at or under %q",
-			ErrConsent, dnsplan.ErrAnchorEscape, echo(record.Name), echo(anchor))
+			ErrConsent, dnsplan.ErrAnchorEscape, lane.Echo(record.Name), lane.Echo(anchor))
 	}
 	return nil
 }
 
-const (
-	// dcvPrefix and servingPrefix own records 6 and 7 (docs/DESIGN.md §6): the same
-	// literals as internal/derive's dcvPrefix and internal/relay's
-	// ownershipRecordPrefix, unexported in packages that have no business exporting
-	// them for a renderer's benefit. TestPerAppNamesMatchWhatBindAppDerives pins
-	// this copy of the first against a plan derive produces; the second has no
-	// equivalent, because building one would need a Cloudflare answer.
-	dcvPrefix     = "_acme-challenge."
-	servingPrefix = "_cf-custom-hostname."
-
-	// slugPlaceholder stands where an app's own slug goes in a name that does not
-	// exist yet. The angle brackets are what a developer expects in a placeholder
-	// and are also HTML metacharacters: they reach the page as data and are escaped
-	// like every other value, which is the behaviour under test.
-	slugPlaceholder = "<your-app>"
-)
+// slugPlaceholder stands where an app's own slug goes in a name that does not
+// exist yet. The angle brackets are what a developer expects in a placeholder and
+// are also HTML metacharacters: they reach the page as data and are escaped like
+// every other value, which is the behaviour under test.
+const slugPlaceholder = "<your-app>"
 
 // pageData is everything the template renders. Strings only, and no method on it:
 // a template that can call code can call code that fails halfway through a
@@ -262,16 +254,6 @@ func writerWord(source derive.Source) string {
 		return "MirrorStack, relayed from AWS or Cloudflare"
 	}
 	return string(source)
-}
-
-// echo bounds what a refusal quotes back, for the reason lane.echo gives: an
-// error string is somewhere a value gets copied, logged, and copied again.
-func echo(s string) string {
-	const max = 64
-	if len(s) > max {
-		return s[:max] + "…(truncated)"
-	}
-	return s
 }
 
 // pageTemplate is parsed once, at init, with Must: a parse failure is a defect in

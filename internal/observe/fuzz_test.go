@@ -9,6 +9,7 @@ import (
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/derive"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/testsupport"
 )
 
 // ---------------------------------------------------------------------------
@@ -95,7 +96,7 @@ const (
 func fuzzLookupErr(kind uint8, name string) error {
 	switch kind % fuzzLookupKinds {
 	case fuzzLookupNotFound:
-		return notFound(name)
+		return testsupport.NotFound(name)
 	case fuzzLookupTimeout:
 		return timedOut(name)
 	case fuzzLookupServfail:

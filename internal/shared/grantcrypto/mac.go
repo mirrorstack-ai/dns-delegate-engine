@@ -4,7 +4,9 @@ import (
 	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base32"
 	"sort"
+	"strings"
 )
 
 // MACSize is the width of every value MAC produces. HMAC-SHA256 is 32 bytes,
@@ -12,6 +14,34 @@ import (
 // is a length check away from being caught instead of being encoded and handed
 // to a customer as a proof.
 const MACSize = sha256.Size
+
+// EncodeMAC renders a MAC as the string it travels as: prefix, then RFC 4648
+// base32, lowercase and unpadded.
+//
+// Chosen for a human and a form, not for density: an ownership proof is copied
+// off a MirrorStack screen, typed into somebody else's DNS control panel, stored
+// by a system we have never seen and read back out of public DNS, so it may only
+// hold characters that survive that whole round trip. base32 is
+// case-insensitive by construction and DNS tooling does fold case; base64 would
+// not survive that at all, because two distinct MACs can differ only in the case
+// of one character. Its alphabet is A–Z and 2–7 — no 0, 1, 8 or 9, so 0/O and
+// 1/l cannot be confused reading a value off one screen onto another — and it
+// holds no `+`, `/`, `=`, quote, backslash, semicolon, space or newline, so
+// nothing a zone file's quoting rules, or a form that trims and splits on
+// whitespace, can mangle, escape or truncate. Padding is dropped because `=` is
+// the character most often stripped in transit; lowercase because the rest of
+// this service normalizes DNS data to it.
+//
+// 32 bytes encode to 52 characters. One TXT character-string holds 255, so a
+// published value is never chunked and there is no ambiguity about how a
+// multi-string TXT reassembles.
+//
+// The prefix is the caller's: it makes a value self-identifying wherever it is
+// found, and versions the ENCODING separately from the message the MAC covers.
+func EncodeMAC(prefix string, mac []byte) string {
+	return prefix + strings.ToLower(
+		base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(mac))
+}
 
 // MAC computes HMAC-SHA256 under an HKDF-derived subkey of every key in the
 // keyset. It returns the MAC under the ACTIVE key first, then a MAC under every

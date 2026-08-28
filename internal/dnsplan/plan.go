@@ -151,7 +151,7 @@ func NewSnapshot(kind, targetID, anchor string, records []Record) (Snapshot, err
 	if kind != KindPlatform && kind != KindApp {
 		return Snapshot{}, fmt.Errorf("%w: unknown kind %q", ErrPlanInvalid, kind)
 	}
-	canonical, ok := canonicalUUID(targetID)
+	canonical, ok := CanonicalUUID(targetID)
 	if !ok {
 		return Snapshot{}, fmt.Errorf("%w: target id is not a canonical uuid", ErrPlanInvalid)
 	}
@@ -227,7 +227,7 @@ func (s Snapshot) Validate(storedDigest []byte) error {
 		len(s.Records) == 0 || len(s.Records) > MaxRecords {
 		return fmt.Errorf("%w: stored snapshot envelope", ErrPlanInvalid)
 	}
-	if _, ok := canonicalUUID(s.TargetID); !ok {
+	if _, ok := CanonicalUUID(s.TargetID); !ok {
 		return fmt.Errorf("%w: stored target id", ErrPlanInvalid)
 	}
 	normalized, identities, err := NormalizeRecords(s.Records)
@@ -350,14 +350,18 @@ func equalRecords(left, right []Record) bool {
 	return true
 }
 
-// canonicalUUID accepts only the canonical hyphenated form (any case) and
+// CanonicalUUID accepts only the canonical hyphenated form (any case) and
 // returns it lowercased.
 //
 // Deliberately stricter than a general UUID parser: pgtype accepts braced and
 // unhyphenated spellings, so "the same" id could arrive in several encodings.
 // Since TargetID is inside the digest, two encodings of one id would produce two
 // digests and a plan would stop matching itself.
-func canonicalUUID(s string) (string, bool) {
+//
+// 🔴 EXPORTED SO THERE IS ONE COPY. lane.ValidateIdentity is the other caller,
+// and the id is inside the ownership HMAC as well as the digest — a looser
+// second copy would mint a proof for a spelling this one refuses.
+func CanonicalUUID(s string) (string, bool) {
 	if len(s) != 36 {
 		return "", false
 	}

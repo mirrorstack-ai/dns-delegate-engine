@@ -24,12 +24,12 @@ package proof
 
 import (
 	"crypto/hmac"
-	"encoding/base32"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsprovider"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/grantcrypto"
 )
@@ -250,30 +250,10 @@ func (p Prover) message(l lane.Lane, identity, anchor string) ([]byte, error) {
 }
 
 // encode renders a MAC as the string a customer types into a DNS provider's web
-// form. Chosen for a human and a web form, not for density: the value is copied
-// off a MirrorStack screen, typed into somebody else's control panel, stored by a
-// system we have never seen, and read back by us out of public DNS, so it may
-// only contain characters that survive that whole round trip.
-//
-// base32 (RFC 4648), lowercase, unpadded. Case-insensitive by construction, and
-// DNS tooling does fold case; base64 would not survive that at all, because two
-// distinct MACs can differ only in the case of one character and folding would
-// make them one value. Its alphabet is A–Z and 2–7 — no 0, 1, 8 or 9, so 0/O and
-// 1/l cannot be confused reading a value off one screen onto another — and it
-// holds no `+`, `/`, `=`, quote, backslash, semicolon, space or newline, so
-// nothing a zone file's quoting rules, or a form that trims and splits on
-// whitespace, can mangle, escape or truncate. Padding is dropped because `=` is
-// the character most often stripped in transit; lowercase because the rest of
-// this service normalizes DNS data to it, so a value read back needs one fold
-// rather than two.
-//
-// 32 bytes encode to 52 characters, 57 with the prefix. One TXT character-string
-// holds 255, so the value is never chunked and there is no ambiguity about how a
-// multi-string TXT reassembles: the record has exactly one string, compared
-// whole.
+// form: grantcrypto.EncodeMAC under this package's prefix, which is where the
+// argument for base32 lives. 57 characters with the prefix.
 func encode(mac []byte) string {
-	return valuePrefix + strings.ToLower(
-		base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(mac))
+	return grantcrypto.EncodeMAC(valuePrefix, mac)
 }
 
 // fold normalizes a value observed in public DNS into the form encode produces.
@@ -282,7 +262,6 @@ func encode(mac []byte) string {
 // back. Nothing here widens what is accepted — the value still has to be the
 // right 52 characters.
 func fold(value string) string {
-	value = strings.TrimSpace(value)
-	value = strings.Trim(value, `"`)
+	value = dnsprovider.TrimTXTQuotes(strings.TrimSpace(value))
 	return strings.ToLower(strings.TrimSpace(value))
 }

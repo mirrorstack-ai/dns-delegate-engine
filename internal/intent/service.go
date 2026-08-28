@@ -1142,7 +1142,7 @@ func (s *Service) relayInto(ctx context.Context, plan derive.Plan) (derive.Plan,
 	var warnings []string
 	items := append(make([]derive.Item, 0, len(plan.Items)+len(plan.Hosts)*2), plan.Items...)
 
-	if hosts := certificateHosts(plan); len(hosts) > 0 {
+	if hosts := plan.Lane.CertificateHosts(plan.Anchor); len(hosts) > 0 {
 		records, err := relay.ValidationRecords(ctx, s.Certificates, hosts)
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("the certificate authority could not be read: %v", err))
@@ -1176,28 +1176,6 @@ func (s *Service) relayInto(ctx context.Context, plan derive.Plan) (derive.Plan,
 
 	plan.Items = items
 	return plan, warnings
-}
-
-// certificateHosts are the hostnames an AWS certificate is requested for.
-//
-// Lane 1 only — DESIGN §6 row 5 — and 🔴 NOT `cdn`. The CDN worker terminates TLS
-// for that hostname before anything reaches API Gateway, so no AWS certificate
-// ever covers it and no validation record is owed for it. A list that quietly
-// included `cdn` would leave one host in `describe` permanently reported as
-// waiting on an upstream that was never going to answer.
-func certificateHosts(plan derive.Plan) []string {
-	if plan.Lane != lane.OrgPlatformDomain {
-		return nil
-	}
-	const cdnLabel = "cdn"
-	out := make([]string, 0, len(plan.Hosts))
-	for _, host := range plan.Hosts {
-		if host == cdnLabel+"."+plan.Anchor {
-			continue
-		}
-		out = append(out, host)
-	}
-	return out
 }
 
 // servingHosts are the hostnames Cloudflare mints a serving proof for.

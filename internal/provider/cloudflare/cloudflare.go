@@ -175,7 +175,7 @@ func (c Client) SameValue(recordType, live, desired string) bool {
 	// unquoted payloads so a quoted read is not mistaken for "missing" — a
 	// quote-sensitive comparison reads every already-correct record as absent
 	// and rewrites it on every pass.
-	return trimTXTQuotes(live) == trimTXTQuotes(desired)
+	return dnsprovider.TrimTXTQuotes(live) == dnsprovider.TrimTXTQuotes(desired)
 }
 
 // IsDuplicate reports Cloudflare's "this record already exists" family. 81057
@@ -223,7 +223,7 @@ func input(want dnsprovider.Desired) recordInput {
 // Identical on the wire: Cloudflare treats the quotes as the presentation
 // wrapper, so the CA, the resolver and the customer all see the same value
 // either way. What changes is the API round-trip form, which is why this is safe
-// only alongside SameValue comparing through trimTXTQuotes.
+// only alongside SameValue comparing through dnsprovider.TrimTXTQuotes.
 //
 // Idempotent on an ALREADY-quoted value, which matters because the value can
 // arrive from three places that disagree: Cloudflare's own API read-back, a
@@ -234,16 +234,7 @@ func quoteTXTValue(v string) string {
 	if v == "" {
 		return v
 	}
-	return `"` + trimTXTQuotes(v) + `"`
-}
-
-// trimTXTQuotes strips one layer of surrounding double quotes. Inner quotes are
-// left alone — only the DNS presentation wrapper goes.
-func trimTXTQuotes(v string) string {
-	if len(v) >= 2 && strings.HasPrefix(v, `"`) && strings.HasSuffix(v, `"`) {
-		return v[1 : len(v)-1]
-	}
-	return v
+	return `"` + dnsprovider.TrimTXTQuotes(v) + `"`
 }
 
 func (c Client) do(ctx context.Context, token, method, path string, body, out any) error {

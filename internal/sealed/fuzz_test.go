@@ -3,7 +3,6 @@ package sealed
 import (
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"strings"
 	"testing"
 
@@ -21,32 +20,7 @@ import (
 // Cloudflare account, no clock that a fuzzed input can move.
 // ---------------------------------------------------------------------------
 
-// fuzzSealer is testSealer with a testing.TB receiver, so a seed corpus can be
-// built from *testing.F as well as from *testing.T. It holds the SAME key, so
-// the envelope fixtures below open under either.
-//
-// Duplicated rather than shared because sealed_test.go is another agent's file
-// on this branch; if the two are ever unified, this is the copy to delete.
-func fuzzSealer(tb testing.TB) *grantcrypto.Sealer {
-	tb.Helper()
-	key := make([]byte, grantcrypto.KeySize)
-	for i := range key {
-		key[i] = byte(i*7 + 1)
-	}
-	raw := fmt.Sprintf(`{"active":%q,"keys":{%q:%q}}`,
-		testKeyID, testKeyID, base64.StdEncoding.EncodeToString(key))
-	keys, err := grantcrypto.ParseKeyset(raw)
-	if err != nil {
-		tb.Fatalf("parse test keyset: %v", err)
-	}
-	sealer, err := grantcrypto.NewSealer(keys)
-	if err != nil {
-		tb.Fatalf("new test sealer: %v", err)
-	}
-	return sealer
-}
-
-// Two registration envelopes, sealed once under fuzzSealer's key and pasted
+// Two registration envelopes, sealed once under testSealer's key and pasted
 // here rather than re-sealed at run time.
 //
 // 🔴 THEY ARE CONSTANTS BECAUSE A FUZZ TARGET MUST BE DETERMINISTIC. AES-GCM
@@ -122,7 +96,7 @@ func FuzzArbitraryBytesNeverOpen(f *testing.F) {
 		f.Add(seed)
 	}
 
-	sealer := fuzzSealer(f)
+	sealer := testSealer(f)
 	f.Fuzz(func(t *testing.T, envelope string) {
 		if r, err := OpenRegistration(sealer, envelope); err == nil {
 			if r == (Registration{}) {
@@ -193,7 +167,7 @@ func FuzzOneEnvelopeTypeNeverOpensAsTheOther(f *testing.F) {
 	f.Add("", "", "", "", int64(0), false)
 	f.Add("org_platform_domain", testIdentity, "example.com", "", testIssuedAt, false)
 
-	sealer := fuzzSealer(f)
+	sealer := testSealer(f)
 	f.Fuzz(func(t *testing.T, wire, identity, anchor, nonce string, issuedAt int64, ack bool) {
 		l, err := laneOrSkip(wire)
 		if err != nil {
@@ -265,7 +239,7 @@ func FuzzTamperedCiphertextNeverOpens(f *testing.F) {
 		}
 	}
 
-	sealer := fuzzSealer(f)
+	sealer := testSealer(f)
 	f.Fuzz(func(t *testing.T, which uint8, pos uint32, val uint8) {
 		base := fuzzEnvelopeNoReference
 		if which%2 == 1 {
@@ -328,7 +302,7 @@ func FuzzEnvelopeStringsAreNotCanonical(f *testing.F) {
 	f.Add(uint8(0))
 	f.Add(uint8(1))
 
-	sealer := fuzzSealer(f)
+	sealer := testSealer(f)
 	f.Fuzz(func(t *testing.T, which uint8) {
 		base := fuzzEnvelopeNoReference
 		if which%2 == 1 {
