@@ -176,6 +176,11 @@ nonce.
 **Refuses unless `verify` passes right now.** The caller echoes the state back
 and cannot author one.
 
+On the `org_app_domain` lane it additionally refuses unless this service's own
+consent page was served and acknowledged — see *Decided* below. A wildcard is
+the one grant whose scope a customer cannot enumerate for themselves, so the
+description they act on has to come from here.
+
 ### `complete(state, code, codeVerifier, expectDigest)`
 
 Exchanges the authorization code, seals the resulting credential, and publishes
@@ -397,21 +402,81 @@ Ordering that is genuinely forced, rather than incidental:
 
 ---
 
+## Decided
+
+### The wildcard lane gets its own consent page, served from here
+
+`*.<anchor>` covers every name the customer has not listed, and a proof per lane
+makes authorizing it a *separate* act but not an *informed* one — the only
+description of what they are agreeing to would come from a console this
+repository cannot vouch for.
+
+So before the provider redirect on the `org_app_domain` lane, **this service
+serves the consent page itself**, on a host the customer can verify, showing the
+anchor, the lane, and the exact record set with its digest. `authorize` refuses
+to mint a `state` for that lane unless the page was served and acknowledged.
+
+The cost is real and worth naming: the engine gains a product surface — a route,
+HTML, something to keep designed and translated. It is accepted because a
+wildcard is the one grant whose scope a customer cannot enumerate for themselves.
+
+The other two lanes keep the console's screen. Their record sets are closed and
+listed in full, so there is nothing a second page would tell you that
+[`RECORDS.md`](RECORDS.md) does not.
+
+### The scheduler moves here as well
+
+The earlier draft kept the clock in the private half and moved only the loop
+body. That was the wrong cut. The principle is simpler and stricter:
+
+> **Everything that touches a customer's DNS-provider authorization is public.**
+> Not just what it decides — when it runs, and what it is permitted to do.
+
+A repository that owns every decision but not the schedule that fires them is
+only mostly auditable, and "mostly" is the wrong answer to the question this
+repository exists to settle. So the schedule and its IAM move here, and come out
+of the private half rather than being duplicated into both — the same mistake the
+credential grants made at cutover, which took a separate change to undo.
+
+Two things have to be worked out before that is a pull request, and neither is
+hand-waving:
+
+- **Only the delegated-DNS arm moves.** The org-domain poller advances other
+  things on the same 5-minute schedule, and those stay private. The split has to
+  be by capability, not by convenience.
+- **Enumeration.** A scheduler here needs to know *which* registrations to
+  advance, and this service owns no database. Either the private half hands it a
+  work list each tick — which keeps statelessness and means the private half can
+  still withhold work, no worse than today — or the engine learns to enumerate,
+  which is where a store would have to come back. The first is preferred and has
+  to be proven sufficient before the second is considered.
+
+### `name_in_use` is its own failure code
+
+`reconcile.ErrNameInUse` reached the caller as `provider_failure` with
+`retry: true`. Retrying is correct — the customer may delete the record and it
+then succeeds — but the code said "the provider refused" when the truth is "the
+customer must act", and a console cannot turn that into an instruction.
+
+It becomes a distinct code carrying the hostname and what currently answers
+there, still retryable. It is a wire change shared with the private half, so both
+sides move in the same wave.
+
+---
+
 ## Still open
 
-Recorded here rather than settled quietly, because each changes what you are
+Recorded here rather than settled quietly, because it changes what you are
 agreeing to:
 
-1. **The wildcard lane needs its own consent surface.** A proof per lane forces a
-   separate act, but `*.<anchor>` covers every name you have not listed, and the
-   only description of that today comes from a console this repository cannot
-   vouch for.
-2. **We re-create a record you delete.** A service with no state cannot count
-   deletions, and a counter in a sealed blob is rollback-able in the direction
-   that grants more authority. So the honest description is not "we write once
-   when you authorize" but "we hold write access and continuously enforce a
-   desired state in your zone, until you stop us."
-3. **The scheduler.** The loop body moves here; the clock that fires it does not,
-   at least at first. "The polling service is in this repository" will be true of
-   every decision the loop makes and false of when it runs, and the documentation
-   has to say which.
+**We re-create a record you delete.** A service with no state cannot count
+deletions, and a counter in a sealed blob is rollback-able in the direction that
+grants more authority — so it cannot go there. The honest description is not "we
+write once when you authorize" but "we hold write access and continuously enforce
+a desired state in your zone, until you stop us."
+
+The two stop controls are the answer, and both are yours: delete the ownership
+proof, and every write stops within one tick; or revoke at your provider, which
+works whether or not we cooperate. What is unresolved is not the behaviour but
+whether a customer should be able to say "leave this one name alone" without
+revoking the whole grant — and a stateless service has nowhere to remember that.

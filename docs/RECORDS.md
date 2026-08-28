@@ -253,12 +253,17 @@ stored envelope. A publish that fails *after* that rotation still returns the ne
 sealed token so it can be persisted — reporting only the failure would leave the
 private half holding a token the provider had already replaced.
 
-🔴 **One caveat on that table, stated because it is currently true.** The key and
-the OAuth client are read from two secrets that the private half's account role
-*also* still holds read access to, left from the pre-cutover in-process path. No
-code uses it — the delegated path runs entirely here — but the grant exists, so
-"ciphertext it holds no key for" is a property of the code and not yet of the
-permissions. Removing those grants is the outstanding half of the cutover.
+**One caveat, stated because it was true until recently.** The key and the OAuth
+client are read from two secrets that the private half's account role *also* held
+read access to, left from the pre-cutover in-process path — duplicated onto it
+rather than moved. No code used them, but a granted capability is
+indistinguishable from a used one to anyone auditing from outside, so
+"ciphertext it holds no key for" was a property of the code and not of the
+permissions.
+
+Those grants are being removed, along with the rollback to the legacy path that
+depended on them. Once that deploys, no private MirrorStack function can read
+either secret, and the sentence above is true of the IAM as well.
 
 ### Lifetimes
 
