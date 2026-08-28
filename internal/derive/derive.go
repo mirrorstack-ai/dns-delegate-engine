@@ -222,6 +222,12 @@ type Config struct {
 	// Cloudflare derives from. See DCVTarget.
 	DCVDelegationUUID string
 
+	// DCVDelegationUUIDApp is the same identifier for the app/SaaS zone, which
+	// serves lanes 2 and 3. Empty means "not told" and falls back to
+	// DCVDelegationUUID, which is what an unmigrated single-variable deployment
+	// has — see dcvDelegationUUIDLegacyEnv.
+	DCVDelegationUUIDApp string
+
 	// ReservedSuffixes are the names nobody may connect: MirrorStack's own. A
 	// name under one has no customer at the other end — the ownership proof for
 	// it would be published by us, the defect docs/DESIGN.md §1 exists to remove,
@@ -243,10 +249,25 @@ const (
 	defaultOrgRoutingTarget = "connect.mirrorstack.ai"
 	defaultAppRoutingTarget = "connect.mirrorstack.app"
 
-	orgRoutingTargetEnv  = "CF_SAAS_ORG_TARGET"
-	appRoutingTargetEnv  = "CF_SAAS_TARGET"
-	dcvDelegationUUIDEnv = "CF_ORG_DCV_DELEGATION_UUID"
-	reservedSuffixesEnv  = "MS_RESERVED_DOMAIN_SUFFIXES"
+	orgRoutingTargetEnv = "CF_SAAS_ORG_TARGET"
+	appRoutingTargetEnv = "CF_SAAS_TARGET"
+	// 🔴 ONE PER SAAS ZONE, BECAUSE THE IDENTIFIER IS PER ZONE.
+	//
+	// Cloudflare's endpoint is GET /zones/{zone_id}/dcv_delegation/uuid — under
+	// /zones/, and it answers differently for each. Lane 1 hostnames live in the
+	// org zone and lanes 2 and 3 in the app zone, so a single variable covering
+	// both is a value that is correct for one and a guess about the other, and a
+	// guess here aims record 6 at a namespace Cloudflare never writes to. That is
+	// precisely the failure the missing hostname label caused, one label further
+	// along, and it fails the same way: resolving perfectly, validating never.
+	dcvDelegationUUIDOrgEnv = "CF_DCV_DELEGATION_UUID_ORG"
+	dcvDelegationUUIDAppEnv = "CF_DCV_DELEGATION_UUID_APP"
+
+	// dcvDelegationUUIDLegacyEnv is the single variable that covered both zones.
+	// Read only when neither of the two above is set, and logged when it is used,
+	// so an unmigrated deployment keeps working while saying so.
+	dcvDelegationUUIDLegacyEnv = "CF_ORG_DCV_DELEGATION_UUID"
+	reservedSuffixesEnv        = "MS_RESERVED_DOMAIN_SUFFIXES"
 )
 
 // platformSuffixes are MirrorStack's own registrable domains, reserved
@@ -259,23 +280,94 @@ var platformSuffixes = []string{"mirrorstack.ai", "mirrorstack.app"}
 //
 //	CF_SAAS_ORG_TARGET           record 2's value      (default above)
 //	CF_SAAS_TARGET               records 3 and 4       (default above)
-//	CF_ORG_DCV_DELEGATION_UUID   record 6's uuid half  (no default)
+//	CF_DCV_DELEGATION_UUID_ORG   record 6's uuid, org zone   (no default)
+//	CF_DCV_DELEGATION_UUID_APP   record 6's uuid, app zone   (no default)
 //	MS_RESERVED_DOMAIN_SUFFIXES  extra reserved names  (added to the hardcoded pair)
 //
 // The uuid has no default on purpose: empty is a truthful "this deployment has
 // not been told", which Validate turns into a refusal rather than a record
 // pointing at `.dcv.cloudflare.com` with a missing label. It is the FALLBACK for
 // a deployment holding no Cloudflare credential — internal/relay reads the real
-// one per zone and overrides it — and one variable cannot be right for both of
-// our SaaS zones, which is the second reason not to trust it. Unlike
+// one per zone and overrides it. There is one variable PER ZONE, because the
+// identifier is per zone; a deployment still setting the old single
+// CF_ORG_DCV_DELEGATION_UUID gets it for both and a warning saying so. Unlike
 // shared/config.MustEnv this
 // never exits, so Validate names the unset value as an error at the call site
 // rather than as a process that died at boot.
+// dcvUUIDFor reads one zone's identifier, falling back to the single variable
+// that used to cover both. The fallback logs, because a value shared by two
+// zones is right for at most one of them and silence would make that invisible.
+func dcvUUIDFor(key string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	legacy := strings.TrimSpace(os.Getenv(dcvDelegationUUIDLegacyEnv))
+	if legacy != "" {
+		slog.Warn("derive: falling back to the single-zone DCV identifier; it is right for at most one of our two SaaS zones",
+			"missing", key, "using", dcvDelegationUUIDLegacyEnv)
+	}
+	return legacy
+}
+
+// DCVUUID is the delegation identifier for the zone this lane's hostnames live
+// in: the org zone for lane 1, the app zone for lanes 2 and 3.
+//
+// An unset app value falls back to the org one, which is what a deployment still
+// on the single legacy variable has. dcvUUIDEnvFor names the variable a refusal
+// should mention, so an operator is told which of the two to set.
+func (c Config) DCVUUID(l lane.Lane) string {
+	if l == lane.OrgPlatformDomain {
+		return strings.TrimSpace(c.DCVDelegationUUID)
+	}
+	if v := strings.TrimSpace(c.DCVDelegationUUIDApp); v != "" {
+		return v
+	}
+	return strings.TrimSpace(c.DCVDelegationUUID)
+}
+
+// ValidateLane checks what Validate cannot: the delegation identifier for the
+// zone THIS lane's hostnames live in. Separate because the identifier is per
+// zone and a deployment may legitimately have one and not the other.
+func (c Config) ValidateLane(l lane.Lane) error {
+	uuid := c.DCVUUID(l)
+	if uuid == "" {
+		return fmt.Errorf("%w: %s is not set, so no certificate pointer can be derived",
+			ErrConfig, dcvUUIDEnvFor(l))
+	}
+	if _, err := lane.ValidateSlug(uuid); err != nil {
+		return fmt.Errorf("%w: %s must be one DNS label: %w", ErrConfig, dcvUUIDEnvFor(l), err)
+	}
+	return nil
+}
+
+// WithDCVUUID returns a copy whose identifier for this lane's zone is uuid.
+//
+// 🔴 IT SETS THE FIELD THAT LANE ACTUALLY READS. Writing DCVDelegationUUID for
+// an app lane looks right and does nothing: DCVUUID prefers the app field when
+// it is set, so a value fetched from Cloudflare for the app zone would be
+// silently discarded in favour of a stale configured one.
+func (c Config) WithDCVUUID(l lane.Lane, uuid string) Config {
+	if l == lane.OrgPlatformDomain {
+		c.DCVDelegationUUID = uuid
+		return c
+	}
+	c.DCVDelegationUUIDApp = uuid
+	return c
+}
+
+func dcvUUIDEnvFor(l lane.Lane) string {
+	if l == lane.OrgPlatformDomain {
+		return dcvDelegationUUIDOrgEnv
+	}
+	return dcvDelegationUUIDAppEnv
+}
+
 func ConfigFromEnv() Config {
 	return Config{
-		OrgRoutingTarget:  envOr(orgRoutingTargetEnv, defaultOrgRoutingTarget),
-		AppRoutingTarget:  envOr(appRoutingTargetEnv, defaultAppRoutingTarget),
-		DCVDelegationUUID: strings.TrimSpace(os.Getenv(dcvDelegationUUIDEnv)),
+		OrgRoutingTarget:     envOr(orgRoutingTargetEnv, defaultOrgRoutingTarget),
+		AppRoutingTarget:     envOr(appRoutingTargetEnv, defaultAppRoutingTarget),
+		DCVDelegationUUID:    dcvUUIDFor(dcvDelegationUUIDOrgEnv),
+		DCVDelegationUUIDApp: dcvUUIDFor(dcvDelegationUUIDAppEnv),
 		ReservedSuffixes: append(append([]string(nil), platformSuffixes...),
 			splitSuffixes(os.Getenv(reservedSuffixesEnv))...),
 	}
@@ -298,12 +390,13 @@ func (c Config) Validate() error {
 	// since the looser of two copies is the one that matters. The length and
 	// alphabet Cloudflare uses today are NOT pinned: an unverified 16-hex rule
 	// would refuse a value Cloudflare itself handed us.
-	if strings.TrimSpace(c.DCVDelegationUUID) == "" {
-		return fmt.Errorf("%w: %s is not set, so no certificate pointer can be derived", ErrConfig, dcvDelegationUUIDEnv)
-	}
-	if _, err := lane.ValidateSlug(c.DCVDelegationUUID); err != nil {
-		return fmt.Errorf("%w: %s must be one DNS label: %w", ErrConfig, dcvDelegationUUIDEnv, err)
-	}
+	// 🔴 THE DELEGATION IDENTIFIER IS CHECKED PER LANE, NOT HERE.
+	//
+	// It is per ZONE, and the caller may have fetched one zone's from Cloudflare
+	// while the other has nothing configured — a deployment that can serve lane 3
+	// perfectly well. Refusing it here because the org zone is unset would take
+	// down a lane whose identifier was never in question. ValidateLane is the
+	// check, and dcvItem is the last line of defence under it.
 	if len(c.ReservedSuffixes) == 0 {
 		return fmt.Errorf("%w: no reserved suffixes, so a MirrorStack name could be connected as a customer domain", ErrConfig)
 	}
@@ -376,6 +469,9 @@ func (c Config) Registration(l lane.Lane, identity, anchor, proofValue string) (
 		// skipped the proof hands over.
 		return Plan{}, fmt.Errorf("%w: no ownership proof value for the anchor", ErrDerive)
 	}
+	if err := c.ValidateLane(parsed); err != nil {
+		return Plan{}, err
+	}
 	hosts := parsed.Hosts(anchor)
 	if len(hosts) == 0 {
 		// Unreachable today, and retained: it is the guard a fourth lane added to
@@ -402,7 +498,7 @@ func (c Config) Registration(l lane.Lane, identity, anchor, proofValue string) (
 				host)))
 		}
 		for _, host := range hosts {
-			item, err := dcvItem(host, c.DCVDelegationUUID)
+			item, err := dcvItem(parsed, host, c.DCVUUID(parsed))
 			if err != nil {
 				return Plan{}, err
 			}
@@ -426,7 +522,7 @@ func (c Config) Registration(l lane.Lane, identity, anchor, proofValue string) (
 		items = append(items, routingItem(anchor, c.AppRoutingTarget, fmt.Sprintf(
 			"Points %s at MirrorStack. This is the only record here a browser follows, so deleting it takes the site down immediately.",
 			anchor)))
-		item, err := dcvItem(anchor, c.DCVDelegationUUID)
+		item, err := dcvItem(parsed, anchor, c.DCVUUID(parsed))
 		if err != nil {
 			return Plan{}, err
 		}
@@ -466,8 +562,13 @@ func (c Config) BindApp(parentAnchor, slug string) (Plan, error) {
 	if err != nil {
 		return Plan{}, fmt.Errorf("%w: %w", ErrDerive, err)
 	}
+	if err := c.ValidateLane(lane.OrgAppDomain); err != nil {
+		return Plan{}, err
+	}
 	host := slug + "." + anchor
-	item, err := dcvItem(host, c.DCVDelegationUUID)
+	// BindApp is the org-app-domain lane by construction — it exists only under
+	// a parent registered on it — so the app zone's identifier is the right one.
+	item, err := dcvItem(lane.OrgAppDomain, host, c.DCVUUID(lane.OrgAppDomain))
 	if err != nil {
 		return Plan{}, err
 	}
@@ -601,12 +702,12 @@ func routingItem(host, target, explain string) Item {
 // request's — a deep anchor plus a long slug — and no shortening keeps the
 // pointer pointing anywhere. Refusing the whole plan beats leaving a hostname
 // routed to MirrorStack with a certificate that can never validate.
-func dcvItem(host, uuid string) (Item, error) {
+func dcvItem(l lane.Lane, host, uuid string) (Item, error) {
 	target := DCVTarget(host, uuid)
 	if target == "" {
 		if strings.TrimSpace(uuid) == "" {
 			return Item{}, fmt.Errorf("%w: %s is not set, so no certificate pointer can be derived",
-				ErrConfig, dcvDelegationUUIDEnv)
+				ErrConfig, dcvUUIDEnvFor(l))
 		}
 		return Item{}, fmt.Errorf("%w: the certificate pointer for %q would be over the %d-byte DNS limit",
 			ErrDerive, lane.Echo(host), dnsplan.MaxDNSName)

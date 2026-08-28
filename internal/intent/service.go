@@ -208,9 +208,21 @@ func (s *Service) Capabilities(ctx context.Context) CapabilitiesResponse {
 	// environment says. Reported rather than swallowed, because an unconfigured
 	// deployment and a MISCONFIGURED one otherwise look identical from outside —
 	// the trap cfoauth.FromEnv documents.
-	derived, _ := s.deriveFor(ctx, lane.OrgPlatformDomain)
-	if err := derived.Validate(); err != nil {
-		out.ConfigError = err.Error()
+	// Per lane, because the delegation identifier is per ZONE: a deployment can
+	// hold the app zone's and not the org zone's, and reporting only the first
+	// lane's answer would call that fully configured. The first problem found is
+	// the one reported — an operator fixes them one at a time, and naming the
+	// variable to set matters more than listing every lane it breaks.
+	for _, l := range []lane.Lane{lane.OrgPlatformDomain, lane.OrgAppDomain, lane.AppDomain} {
+		derived, _ := s.deriveFor(ctx, l)
+		err := derived.Validate()
+		if err == nil {
+			err = derived.ValidateLane(l)
+		}
+		if err != nil {
+			out.ConfigError = err.Error()
+			break
+		}
 	}
 	cfg := s.oauthConfig(ctx)
 	if cfg == nil {
@@ -273,7 +285,7 @@ func (s *Service) laneCapabilities(ctx context.Context) []LaneCapability {
 			GrantSeconds:        grantSeconds(l),
 			ConsentPage:         consent.Required(l),
 			EdgeZone:            zoneID,
-			DCVDelegationUUID:   cfg.DCVDelegationUUID,
+			DCVDelegationUUID:   cfg.DCVUUID(l),
 			DCVDelegationSource: source,
 		})
 	}
@@ -1222,9 +1234,27 @@ func (s *Service) derivedPlan(ctx context.Context, reg sealed.Registration) (der
 // plan api-platform hashes before the customer authorizes, so a deployment that
 // falls back and later recovers tells a customer on the consent screen that the
 // plan changed. It did: the pointer really moved.
+// deriveFor resolves the delegation identifier for this lane and returns the
+// config the derivation will actually use, plus which source won.
+//
+// 🔴 A CHANGE OF SOURCE INVALIDATES AN IN-FLIGHT CONSENT, AND THAT IS CORRECT.
+//
+// Record 6's value is inside the plan digest the customer authorized against, so
+// a pass that derives it from Cloudflare after an earlier one used the configured
+// value produces a different plan. Complete refuses it as `plan_changed` — not
+// `plan_invalid` — which tells the caller to re-render and ask again rather than
+// that it hit a bug.
+//
+// Sealing the identifier into the registration would remove the churn and is the
+// wrong trade: the plan would then be written from a value the current
+// configuration says is wrong, which is the drift the digest exists to catch. A
+// customer being asked to re-authorize because the record genuinely changed is
+// the honest outcome. Operators should expect a source flip to interrupt every
+// consent screen open at that moment, and IntentCapabilities reports the source
+// per lane so the flip is visible rather than inferred.
 func (s *Service) deriveFor(ctx context.Context, l lane.Lane) (derive.Config, string) {
 	cfg := s.Derive
-	configured := strings.TrimSpace(cfg.DCVDelegationUUID)
+	configured := cfg.DCVUUID(l)
 	fetched, ok, err := relay.DelegationUUID(ctx, s.Delegation, l)
 	switch {
 	case err != nil:
@@ -1238,8 +1268,10 @@ func (s *Service) deriveFor(ctx context.Context, l lane.Lane) (derive.Config, st
 				"and is being ignored; correct the environment",
 				"lane", l, "configured", configured, "cloudflare", fetched)
 		}
-		cfg.DCVDelegationUUID = fetched
-		return cfg, DCVFromCloudflare
+		// Through WithDCVUUID, so the value lands on the field THIS lane reads —
+		// the identifier is per zone, and assigning the org field for an app lane
+		// would be discarded in favour of a stale configured value.
+		return cfg.WithDCVUUID(l, fetched), DCVFromCloudflare
 	}
 	if configured == "" {
 		return cfg, ""

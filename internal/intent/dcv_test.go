@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
+
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/relay"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/shared/cfedge"
@@ -234,5 +236,41 @@ func TestAFetchedIdentifierAloneIsAValidConfiguration(t *testing.T) {
 	want := appHostname + "." + cloudflareUUID + ".dcv.cloudflare.com"
 	if targets := dcvTargets(out.Records); len(targets) != 1 || targets[0] != want {
 		t.Fatalf("want %q, got %v", want, targets)
+	}
+}
+
+// 🔴 A CHANGE OF DELEGATION SOURCE MUST READ AS `plan_changed`, NEVER
+// `plan_invalid`.
+//
+// Record 6's value is inside the digest the customer authorized against, so
+// deriving the identifier from Cloudflare after an earlier pass used the
+// configured one genuinely changes the plan. The caller's contract says
+// plan_invalid means "this is a bug and retrying cannot help", and a caller that
+// believes it may abandon the domain — over a configuration that is now MORE
+// correct than it was.
+func TestAChangeOfDelegationSourceAsksForReauthorizationRatherThanReportingABug(t *testing.T) {
+	h := newHarness(t)
+	h.svc.Derive.DCVDelegationUUID = "configured0000ab"
+	h.svc.Derive.DCVDelegationUUIDApp = "configured0000ab"
+
+	out := h.register(t, lane.OrgPlatformDomain, testOrg, platformDomain)
+	h.publishProof(t, out)
+	staleDigest := out.Digest
+
+	// Cloudflare now answers, and disagrees with the environment.
+	h.svc.Delegation = delegationServer(t, "fromcloudflare00")
+
+	state := h.authorize(t, out)
+	_, err := h.svc.Complete(t.Context(), CompleteRequest{
+		State: state, Code: "code", CodeVerifier: "chal-verifier", ExpectDigest: staleDigest,
+	})
+	if err == nil {
+		t.Fatal("a digest taken under the old identifier must not publish")
+	}
+	if !errors.Is(err, dnsplan.ErrPlanChanged) {
+		t.Fatalf("want ErrPlanChanged so the caller re-renders; got %v", err)
+	}
+	if errors.Is(err, dnsplan.ErrPlanInvalid) && !errors.Is(err, dnsplan.ErrPlanChanged) {
+		t.Fatal("plan_invalid tells the caller this cannot be retried, which is wrong here")
 	}
 }
