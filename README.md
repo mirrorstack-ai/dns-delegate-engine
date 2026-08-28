@@ -40,31 +40,31 @@ disagree, this file is the truth.
 <table>
 <thead>
 <tr>
-<th width="33%">Question</th>
-<th width="33%">Answer</th>
-<th width="34%">Where to check</th>
+<th width="22%">Question</th>
+<th width="50%">Answer</th>
+<th width="28%">Where to check</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>Can it delete a DNS record?</td>
 <td><strong>No.</strong> There is no delete call anywhere in this service.</td>
-<td><a href="internal/dnsprovider/provider.go"><code>internal/dnsprovider/provider.go</code></a> — the <code>Provider</code> interface has eight methods, four of which reach the network, and none of them removes anything</td>
+<td><a href="internal/dnsprovider/provider.go"><code>provider.go</code></a> — the <code>Provider</code> interface has eight methods, four of which reach the network, and none of them removes anything</td>
 </tr>
 <tr>
 <td>Can it touch a name you didn't see?</td>
 <td><strong>No.</strong> Every record must sit at or under the anchor — the exact hostname you proved you own — or the whole plan is refused.</td>
-<td><a href="internal/dnsplan/plan.go"><code>internal/dnsplan/plan.go</code></a>, <code>NewSnapshot</code> and <code>Contains</code></td>
+<td><a href="internal/dnsplan/plan.go"><code>plan.go</code></a>, <code>NewSnapshot</code> and <code>Contains</code></td>
 </tr>
 <tr>
 <td>Can it touch <code>www</code>, your apex, or your MX?</td>
 <td><strong>No</strong>, unless the domain you connected <em>is</em> that name. Connecting <code>shop.example.com</code> cannot reach <code>example.com</code>, <code>www.example.com</code>, or your mail records.</td>
-<td><a href="internal/dnsplan/plan_test.go"><code>TestContainmentInACustomerZone</code></a> asserts exactly this</td>
+<td><a href="internal/dnsplan/plan_test.go"><code>plan_test.go</code></a> asserts exactly this</td>
 </tr>
 <tr>
 <td>Can it write an A record or an MX record?</td>
 <td><strong>No.</strong> The plan vocabulary is <code>CNAME</code> and <code>TXT</code> only.</td>
-<td><code>NormalizeRecords</code>, and <a href="internal/dnsplan/plan_test.go"><code>TestNormalizeRecordsRejectsUnsupportedTypes</code></a></td>
+<td><code>NormalizeRecords</code>, and <a href="internal/dnsplan/plan_test.go"><code>plan_test.go</code></a></td>
 </tr>
 <tr>
 <td>Can it take over a name you're already using?</td>
@@ -97,6 +97,62 @@ bounding a *name* is not enough, and what replaces it.
 For the complete list of what lands in your zone, including the two records that
 are relayed verbatim from AWS and Cloudflare rather than chosen by anyone at
 MirrorStack, see [`docs/RECORDS.md`](docs/RECORDS.md).
+
+---
+
+## What actually happens when you connect a domain
+
+This is today's flow, defect included. Read step 2 first: **the record list is
+chosen entirely by MirrorStack's private half**, and the only thing this service
+checks is that each name sits under your domain.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant Console as MirrorStack console<br/>(private)
+    participant Engine as dns-delegate-engine<br/>(this repository)
+    participant CF as Your DNS provider
+    participant ACM as AWS certificate manager
+    participant Edge as MirrorStack edge
+
+    You->>Console: connect example.com
+    Console->>Console: derive the record list
+    Console-->>You: here are the records, and their SHA-256
+
+    You->>CF: authorize (zone.read, dns.write — one zone)
+    CF-->>Engine: authorization code
+
+    Note over Engine: refuse unless every NAME is at or<br/>under example.com. The VALUES are<br/>not checked against anything.
+    Engine->>CF: ownership TXT + routing CNAMEs
+    Engine-->>Console: sealed credential, held 24h
+
+    loop every 5 minutes, for up to 24 hours
+        Console->>Console: re-derive the record list
+        Console->>ACM: has the validation record appeared?
+        Console->>Edge: has the custom hostname minted its proofs?
+        Console->>Engine: publish what is new
+        Engine->>CF: _9f8c….account.example.com, _acme-challenge.account.example.com,<br/>_cf-custom-hostname.account.example.com
+    end
+
+    Note over Engine: 24 hours after you authorized
+    Engine->>CF: revoke the credential
+```
+
+Three things that diagram makes obvious, and which the rebuild changes:
+
+- **The loop belongs to the private half.** Every re-derivation, every decision
+  about what to publish next, happens where you cannot read it. This service is
+  called once per pass and told what to write.
+- **The ownership TXT is written by us, in step 7.** It is also what gates the
+  custom hostname in step 13 — so the record that is supposed to prove you own
+  the domain is satisfied by our own write.
+- **Three records arrive late** because they are answers from AWS and Cloudflare
+  that do not exist when you authorize. That is why the credential is held rather
+  than spent once, and it is not going to change.
+
+[`docs/DESIGN.md`](docs/DESIGN.md) has the same diagram for the shape being built,
+where the loop, the derivation and the proof all move.
 
 ---
 
