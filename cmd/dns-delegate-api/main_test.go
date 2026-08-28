@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -832,4 +833,199 @@ func TestTheEdgeReadsAreWiredOnlyWhenBothAZoneAndACredentialAreNamed(t *testing.
 	if zones := reporter.EdgeZones(); zones.OrgPlatform != "org-zone" || zones.App != "app-zone" {
 		t.Fatalf("the per-lane zones are mis-wired: %#v", zones)
 	}
+}
+
+// 🔴 THE ACKNOWLEDGEMENT IS PRODUCED BY POSTING BACK WHAT THE PAGE CARRIED, AND
+// BY NOTHING ELSE. A registration alone must never be enough: that is the bare
+// `ConsentAck` this design exists to not have, and holding one would let anything
+// able to reach this route mint a customer's agreement to a standing wildcard.
+func TestOnlyTheChallengeOffTheServedPageMintsAnAcknowledgement(t *testing.T) {
+	d, sealer := intentDispatcher(t)
+	h := d.httpHandler("s3cret")
+	registration := registrationFor(t, sealer, lane.OrgAppDomain, "example.net")
+
+	page := gatedGet(h, consentURL(registration))
+	if page.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", page.Code, page.Body.String())
+	}
+	challenge := challengeFrom(t, page.Body.String())
+
+	// Nothing but the challenge redeems: no field, an empty one, and one invented
+	// by whoever is asking.
+	for _, form := range []url.Values{
+		{},
+		{"challenge": {""}},
+		{"challenge": {"mschal1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+	} {
+		if got := gatedPost(h, consentURL(registration), form).Code; got != http.StatusBadRequest {
+			t.Errorf("the form %v must not acknowledge: want 400, got %d", form, got)
+		}
+	}
+
+	rec := gatedPost(h, consentURL(registration), url.Values{"challenge": {challenge}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var answer struct {
+		OK       bool `json:"ok"`
+		Response struct {
+			ConsentToken string `json:"consentToken"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &answer); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !answer.OK || !consent.Verify(sealer, testConsentReference, "example.net", answer.Response.ConsentToken) {
+		t.Fatalf("the acknowledgement must be the one IntentAuthorize checks: %q", answer.Response.ConsentToken)
+	}
+	// 🔴 It is credential-shaped, and a shared cache holding it would hand
+	// somebody else's agreement to the next request.
+	if cc := rec.Result().Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("want no-store on the acknowledgement, got %q", cc)
+	}
+}
+
+func TestAcknowledgingIsGatedLikeEveryOtherRoute(t *testing.T) {
+	d, sealer := intentDispatcher(t)
+	h := d.httpHandler("s3cret")
+	target := consentURL(registrationFor(t, sealer, lane.OrgAppDomain, "example.net"))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, target, strings.NewReader("challenge=x")))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("acknowledging must be behind the internal secret, got %d", rec.Code)
+	}
+	if got := gatedPost(h, "/consent", url.Values{"challenge": {"x"}}).Code; got != http.StatusBadRequest {
+		t.Errorf("a POST with no registration is the caller's fault: want 400, got %d", got)
+	}
+}
+
+// 🔴 NEITHER HALF OF THE CONSENT FLOW IS A WIRE ACTION, AND NEITHER MAY BECOME
+// ONE. This Lambda is IAM-gated, so an entry in `routes` is something
+// MirrorStack's private half can call; with "serve the page" and "acknowledge it"
+// both on that surface, the private half holds a customer's agreement to a
+// standing wildcard with no customer involved and the control is gone. The
+// failure is silent — adding a route breaks no test that exists — which is why
+// this one names both spellings.
+func TestNoWireActionServesOrAcknowledgesTheConsentPage(t *testing.T) {
+	d, _ := intentDispatcher(t)
+	for _, action := range []string{"ConsentPage", "ConsentAck", "AcknowledgeConsent", "Consent"} {
+		if _, err := d.dispatch(context.Background(), action, nil); !errors.Is(err, errUnknownAction) {
+			t.Errorf("🔴 %q is dispatchable: the consent flow must live only on the page's own route", action)
+		}
+	}
+	for action := range routes {
+		if strings.Contains(action, "onsent") {
+			t.Errorf("🔴 the route table names %q", action)
+		}
+	}
+}
+
+// The consent route is reachable on the transport a real deployment has: API
+// Gateway, mapped at a path with a stage in front of it. Everything else keeps
+// the static probe, because mirrorstack-infra maps that at a path this file does
+// not know.
+func TestTheGatewayServesTheConsentPathAndProbesEverythingElse(t *testing.T) {
+	d, sealer := intentDispatcher(t)
+	d.web = d.httpHandler("s3cret")
+	registration := registrationFor(t, sealer, lane.OrgAppDomain, "example.net")
+
+	page := gatewayCall(t, d, "GET", "/dns-delegate/consent",
+		url.Values{"registration": {registration}}.Encode(), "")
+	if page["statusCode"] != http.StatusOK {
+		t.Fatalf("the gateway must serve the consent page, got %#v", page)
+	}
+	body, _ := page["body"].(string)
+	if !strings.Contains(body, "*.example.net") {
+		t.Fatal("the gateway served something other than the consent page")
+	}
+
+	ack := gatewayCall(t, d, "POST", "/dns-delegate/consent",
+		url.Values{"registration": {registration}}.Encode(),
+		url.Values{"challenge": {challengeFrom(t, body)}}.Encode())
+	if ack["statusCode"] != http.StatusOK {
+		t.Fatalf("the gateway must serve the acknowledgement, got %#v", ack)
+	}
+
+	// 🔴 Unchanged for every other path: the probe answers 200 without touching
+	// the dispatcher, whatever stage or base path infra puts in front of it.
+	probe := gatewayCall(t, d, "GET", "/dns-delegate/healthz", "", "")
+	if probe["statusCode"] != http.StatusOK || probe["body"] != `{"ok":true}` {
+		t.Fatalf("the health probe must keep its static answer, got %#v", probe)
+	}
+	// And the gate rides along: a gateway route is not a way around it.
+	unsecreted := &dispatcher{intents: d.intents, web: d.httpHandler("s3cret")}
+	got := unsecretedGatewayCall(t, unsecreted, "/dns-delegate/consent",
+		url.Values{"registration": {registration}}.Encode())
+	if got["statusCode"] != http.StatusUnauthorized {
+		t.Fatalf("the internal secret must gate the gateway route too, got %#v", got)
+	}
+}
+
+func gatedPost(h http.Handler, target string, form url.Values) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(form.Encode()))
+	req.Header.Set("X-MS-Internal-Secret", "s3cret")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func gatewayCall(t *testing.T, d *dispatcher, method, path, query, body string) map[string]any {
+	t.Helper()
+	return invokeGateway(t, d, gatewayPayload(t, method, path, query, body, map[string]string{
+		"x-ms-internal-secret": "s3cret",
+		"content-type":         "application/x-www-form-urlencoded",
+	}))
+}
+
+func unsecretedGatewayCall(t *testing.T, d *dispatcher, path, query string) map[string]any {
+	t.Helper()
+	return invokeGateway(t, d, gatewayPayload(t, "GET", path, query, "", nil))
+}
+
+func invokeGateway(t *testing.T, d *dispatcher, payload json.RawMessage) map[string]any {
+	t.Helper()
+	out, err := d.lambdaHandler(context.Background(), payload)
+	if err != nil {
+		t.Fatalf("lambdaHandler: %v", err)
+	}
+	got, ok := out.(map[string]any)
+	if !ok {
+		t.Fatalf("want a gateway response, got %#v", out)
+	}
+	return got
+}
+
+// gatewayPayload is an API Gateway payload format 2.0 request, built here rather
+// than imported so this file states the shape it decodes.
+func gatewayPayload(
+	t *testing.T, method, path, query, body string, headers map[string]string,
+) json.RawMessage {
+	t.Helper()
+	event := map[string]any{
+		"rawPath":        path,
+		"rawQueryString": query,
+		"headers":        headers,
+		"body":           body,
+		"requestContext": map[string]any{"http": map[string]any{"method": method}},
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return encoded
+}
+
+// challengeFrom reads the one hidden input off the served page: what a test
+// posts back is what a browser would.
+var challengeValue = regexp.MustCompile(`name="challenge" value="([^"]+)"`)
+
+func challengeFrom(t *testing.T, page string) string {
+	t.Helper()
+	match := challengeValue.FindStringSubmatch(page)
+	if len(match) != 2 {
+		t.Fatal("the served page carries no challenge, so nobody could acknowledge it")
+	}
+	return match[1]
 }

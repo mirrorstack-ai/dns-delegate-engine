@@ -516,25 +516,77 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (VerifyResponse
 // writer read one function, or the page is not rendered at all.
 //
 // It returns no acknowledgement token: being shown the page and agreeing to it
-// are two events, and consent.Token belongs to the second. If rendering minted
-// one, everybody who could fetch the page — the private half included — would
-// hold a customer's agreement to a standing wildcard, unread.
+// are two events, and consent.Token belongs to the second. What it prints
+// instead is a CHALLENGE over the disclosure's bytes, which AcknowledgeConsent
+// is the only thing that redeems.
 //
 // It takes no reference either: the one printed comes out of the sealed
 // registration, the value Authorize checks the acknowledgement against. Any other
 // reference collects an agreement that could never be verified; a caller-chosen
 // one collects an agreement that verifies against nothing this service issued.
 func (s *Service) ConsentPage(ctx context.Context, registration string) (string, error) {
-	reg, err := s.openRegistration(ctx, registration)
+	reg, plan, err := s.consentPlan(ctx, registration)
 	if err != nil {
 		return "", err
+	}
+	// The challenge is computed over the disclosure ALONE — consent.Offer renders
+	// the same plan again with the form around it — so what a challenge binds is
+	// what the customer read and not the apparatus for agreeing to it.
+	page, err := consent.Page(plan, reg.ConsentNonce)
+	if err != nil {
+		return "", err
+	}
+	challenge, err := consent.Challenge(s.sealer(ctx), reg.ConsentNonce, reg.Anchor, page)
+	if err != nil {
+		return "", err
+	}
+	return consent.Offer(plan, reg.ConsentNonce, challenge)
+}
+
+// AcknowledgeConsent redeems the challenge printed on a served page into the
+// acknowledgement Authorize requires.
+//
+// 🔴 IT IS NOT AN RPC ACTION, AND MUST NOT BECOME ONE. This Lambda is IAM-gated,
+// so an action here is one the private half can call, and with "serve page" and
+// "acknowledge" both on that surface it holds a customer's agreement unread. Both
+// live on cmd/dns-delegate-api's /consent route instead. internal/consent's
+// package comment states what that proves, and it does NOT prove a human was
+// there.
+//
+// It re-derives the plan rather than trusting anything sent with the challenge,
+// so a disclosure that changed since it was rendered — a moved routing target, a
+// rotated proof value — no longer redeems, and the customer reads the new one.
+func (s *Service) AcknowledgeConsent(ctx context.Context, registration, challenge string) (string, error) {
+	reg, plan, err := s.consentPlan(ctx, registration)
+	if err != nil {
+		return "", err
+	}
+	page, err := consent.Page(plan, reg.ConsentNonce)
+	if err != nil {
+		return "", err
+	}
+	return consent.Redeem(s.sealer(ctx), reg.ConsentNonce, reg.Anchor, page, challenge)
+}
+
+// consentPlan is the prelude both halves share: open the registration, refuse
+// the lanes and the builds that cannot carry an acknowledgement, and derive the
+// plan.
+//
+// 🔴 IT DERIVES THROUGH derivedPlan, THE SAME FUNCTION Complete AND Advance
+// PUBLISH FROM, on BOTH halves. Rendering and redeeming against two derivations
+// would let a challenge verify against a disclosure that was never served.
+func (s *Service) consentPlan(ctx context.Context, registration string) (sealed.Registration, derive.Plan, error) {
+	reg, err := s.openRegistration(ctx, registration)
+	if err != nil {
+		return sealed.Registration{}, derive.Plan{}, err
 	}
 	// consent.Page refuses the other lanes too, in its own terms. This refusal
 	// names the REQUEST as what was wrong, so a caller asking for the wrong lane's
 	// screen is not told instead that its plan is malformed.
 	if !consent.Required(reg.Lane) {
-		return "", fmt.Errorf("%w: %s publishes a closed, listable record set and has no consent page",
-			ErrInvalidRequest, reg.Lane)
+		return sealed.Registration{}, derive.Plan{},
+			fmt.Errorf("%w: %s publishes a closed, listable record set and has no consent page",
+				ErrInvalidRequest, reg.Lane)
 	}
 	// Fail closed rather than rendering a page nobody could act on. A lane-2
 	// registration with no sealed reference was minted by a build without this
@@ -542,20 +594,20 @@ func (s *Service) ConsentPage(ctx context.Context, registration string) (string,
 	// acknowledgement at Authorize with no way to tell why. Re-registering mints
 	// one.
 	if reg.ConsentNonce == "" {
-		return "", fmt.Errorf(
+		return sealed.Registration{}, derive.Plan{}, fmt.Errorf(
 			"%w: this registration carries no consent reference, so no acknowledgement for it could ever be verified",
 			ErrInvalidRequest)
-	}
-	plan, err := s.derivedPlan(ctx, reg)
-	if err != nil {
-		return "", err
 	}
 	// consent.ErrConsent travels intact rather than folded into one of this
 	// package's sentinels: its causes have different audiences — a reference this
 	// deployment did not mint is the caller's, a plan shape the page cannot
 	// describe is ours — and flattening them reports a derivation fault as a bad
 	// request.
-	return consent.Page(plan, reg.ConsentNonce)
+	plan, err := s.derivedPlan(ctx, reg)
+	if err != nil {
+		return sealed.Registration{}, derive.Plan{}, err
+	}
+	return reg, plan, nil
 }
 
 // Authorize returns the provider's consent URL, and mints the OAuth state itself.

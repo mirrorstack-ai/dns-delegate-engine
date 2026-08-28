@@ -14,9 +14,10 @@ first thing below.
 >
 > Two parts do not, and each is marked where it belongs:
 >
-> - **Lane 2 cannot be authorized at all.** Nothing in the deployed binary mints
->   the consent acknowledgement its `authorize` requires, so that lane is
->   refused every time. §4.
+> - **Lane 2's consent page is served by no deployment.** The flow is built —
+>   the page carries a challenge, posting it back mints the acknowledgement
+>   `authorize` requires — but nothing routes that path, so the lane is still
+>   refused every time. What the acknowledgement does and does not prove is §4.
 > - **The rate floor in `internal/schedule` is declared and enforced nowhere.**
 >   §8.
 >
@@ -297,19 +298,40 @@ from here rather than from a console this repository cannot vouch for. The other
 two lanes keep the console's screen: their record sets are closed and listed in
 full below.
 
-🔴 **Which means lane 2 cannot be authorized on this build at all, and that is
-a gap rather than a decision.** An acknowledgement is a MAC minted under this
-deployment's key, over a reference sealed into the registration — and nothing in
-the deployed binary mints one. The page itself is written, but on this build it is
-reachable only on the local-development HTTP route: no wire action returns it, so
-the deployed Lambda serves it to nobody. The flow deliberately stops there,
-because where that page is served and which event counts as the agreement are not
-settled. So `IntentAuthorize` refuses
-`org_app_domain` with `consent_required`, every time, on every deployment of
-this build. It ships that way because the refusal is the safe end of the
-failure: the alternative is minting the acknowledgement somewhere the customer
-was not, which is precisely the claim-with-nothing-behind-it the consent page
-exists to replace.
+#### How the acknowledgement is obtained
+
+`GET /consent?registration=…` renders the disclosure and, beneath it, one form
+carrying a **challenge**: a MAC over the reference sealed into the registration,
+the anchor, and the SHA-256 of the disclosure that was rendered. `POST` the
+challenge back to the same URL and this service mints the acknowledgement
+`authorize` requires.
+
+**Neither half is an RPC action, and neither may become one.** This Lambda is
+IAM-gated, so its only callers are MirrorStack's own services; "serve the page"
+and "acknowledge it" as two actions would let the private half call both, and the
+control would evaporate into a flag it sets for itself. Both live on the page's
+own HTTP route instead, which a deployment reaches through API Gateway.
+
+🔴 **What this proves, and what it does not.** An acknowledgement exists only
+because this deployment served *this* registration's page showing *these exact
+bytes*, and the challenge printed on it came back — so it cannot be minted for a
+page that was never rendered, and it stops verifying the moment the disclosure
+changes.
+
+It does **not** prove a human read the page. Everything a redemption needs is
+printed on the page, so anything that can fetch the page can acknowledge it — and
+in production the private half is what proxies the page to you. Nothing this
+service can build closes that: a Lambda gated by IAM cannot authenticate a
+browser its own caller is standing in front of, and any secret we could put on
+the page travels through that same caller. **The control is over sequence and
+content, not over presence.** Read it as: *the words you were shown are the words
+this code will act on, and they were served by the code that will do the writing*
+— not as *a person definitely read them*.
+
+The remaining deployment step is infrastructure, not code: a route to this
+function's `/consent` path, and the internal secret on whatever proxies it. Until
+one exists, the page is served in local development only and `IntentAuthorize`
+answers `consent_required` for `org_app_domain`.
 
 ### `complete(state, code, codeVerifier, expectDigest)`
 
