@@ -237,6 +237,56 @@ type Config struct {
 	// worse than no guard. reserved() folds both routing targets in as well,
 	// since connecting the name a routing CNAME points at would publish a loop.
 	ReservedSuffixes []string
+
+	// ExemptHostsOrgPlatform and ExemptHostsOrgApp are individual hostnames
+	// admitted despite sitting under a reserved suffix — the company's own
+	// staging hosts, so the delegated path can be exercised end to end without
+	// buying a domain.
+	//
+	// 🔴 PER LANE, AND THAT IS THE POINT RATHER THAN TIDINESS.
+	//
+	// The two lanes address DIFFERENT Cloudflare zones: lane 1's hostnames live
+	// in the org zone, lane 2's in the app zone, and each has its own DCV
+	// delegation identifier. A single flat list would let a name be registered on
+	// either lane, which is both wider than intended and destroys the only reason
+	// these entries are useful — deliberately admitting an APP-zone name on the
+	// ORG lane, and vice versa, is what proves the per-zone identifier is
+	// actually selected per zone rather than shared. Get that wrong and record 6
+	// aims at a namespace Cloudflare never writes to: it resolves perfectly and
+	// validates never.
+	//
+	// Lane 3 (app_domain) has no list on purpose. Nothing needs exercising there
+	// that lanes 1 and 2 do not already cover, and an empty list is the narrower
+	// answer.
+	//
+	// 🔴 EXACT NAMES, NEVER SUFFIXES, and every entry must itself sit under a
+	// reserved suffix. lane.ValidateDomainExempt enforces both and refuses EVERY
+	// domain if either is violated, rather than quietly ignoring a bad entry:
+	// a list that silently permits nothing is how a real exemption gets added
+	// later without review.
+	//
+	// Empty is the normal state and the production intent. An entry here is a
+	// name MirrorStack owns, whose ownership proof MirrorStack publishes — which
+	// proves nothing about a customer and is only acceptable because nobody is
+	// served from it.
+	ExemptHostsOrgPlatform []string
+	ExemptHostsOrgApp      []string
+}
+
+// exemptFor is the exemption list for the zone THIS lane's hostnames live in.
+//
+// Mirrors DCVUUID's shape deliberately: both answer "which of the two zones is
+// this lane in?", and two functions disagreeing about that is the bug class the
+// per-zone identifier exists to prevent.
+func (c Config) exemptFor(l lane.Lane) []string {
+	if l == lane.OrgAppDomain {
+		return c.ExemptHostsOrgApp
+	}
+	if l == lane.OrgPlatformDomain {
+		return c.ExemptHostsOrgPlatform
+	}
+	// Lane 3 is exempted from nothing.
+	return nil
 }
 
 const (
@@ -268,6 +318,14 @@ const (
 	// so an unmigrated deployment keeps working while saying so.
 	dcvDelegationUUIDLegacyEnv = "CF_ORG_DCV_DELEGATION_UUID"
 	reservedSuffixesEnv        = "MS_RESERVED_DOMAIN_SUFFIXES"
+
+	// exemptHostsOrgPlatformEnv and exemptHostsOrgAppEnv name INDIVIDUAL
+	// hostnames admitted despite sitting under a reserved suffix, per lane. See
+	// Config.ExemptHostsOrgPlatform for why this is split by lane and
+	// lane.ValidateDomainExempt for the four properties that keep it from
+	// becoming a way to reserve nothing.
+	exemptHostsOrgPlatformEnv = "MS_EXEMPT_HOSTS_ORG_PLATFORM"
+	exemptHostsOrgAppEnv      = "MS_EXEMPT_HOSTS_ORG_APP"
 )
 
 // platformSuffixes are MirrorStack's own registrable domains, reserved
@@ -283,6 +341,8 @@ var platformSuffixes = []string{"mirrorstack.ai", "mirrorstack.app"}
 //	CF_DCV_DELEGATION_UUID_ORG   record 6's uuid, org zone   (no default)
 //	CF_DCV_DELEGATION_UUID_APP   record 6's uuid, app zone   (no default)
 //	MS_RESERVED_DOMAIN_SUFFIXES  extra reserved names  (added to the hardcoded pair)
+//	MS_EXEMPT_HOSTS_ORG_PLATFORM exact hostnames admitted under a reserved suffix, lane 1
+//	MS_EXEMPT_HOSTS_ORG_APP      exact hostnames admitted under a reserved suffix, lane 2
 //
 // The uuid has no default on purpose: empty is a truthful "this deployment has
 // not been told", which Validate turns into a refusal rather than a record
@@ -370,6 +430,8 @@ func ConfigFromEnv() Config {
 		DCVDelegationUUIDApp: dcvUUIDFor(dcvDelegationUUIDAppEnv),
 		ReservedSuffixes: append(append([]string(nil), platformSuffixes...),
 			splitSuffixes(os.Getenv(reservedSuffixesEnv))...),
+		ExemptHostsOrgPlatform: splitSuffixes(os.Getenv(exemptHostsOrgPlatformEnv)),
+		ExemptHostsOrgApp:      splitSuffixes(os.Getenv(exemptHostsOrgAppEnv)),
 	}
 }
 
@@ -457,7 +519,7 @@ func (c Config) Registration(l lane.Lane, identity, anchor, proofValue string) (
 	if _, err := lane.ValidateIdentity(identity); err != nil {
 		return Plan{}, fmt.Errorf("%w: %w", ErrDerive, err)
 	}
-	anchor, err = lane.ValidateDomain(anchor, c.reserved())
+	anchor, err = lane.ValidateDomainExempt(anchor, c.reserved(), c.exemptFor(parsed))
 	if err != nil {
 		return Plan{}, fmt.Errorf("%w: %w", ErrDerive, err)
 	}
@@ -554,7 +616,10 @@ func (c Config) BindApp(parentAnchor, slug string) (Plan, error) {
 	if err := c.Validate(); err != nil {
 		return Plan{}, err
 	}
-	anchor, err := lane.ValidateDomain(parentAnchor, c.reserved())
+	// BindApp is lane 2 by construction — it binds an app under an ORG APP
+	// DOMAIN — so it reads that lane's list rather than taking one as a
+	// parameter a caller could get wrong.
+	anchor, err := lane.ValidateDomainExempt(parentAnchor, c.reserved(), c.exemptFor(lane.OrgAppDomain))
 	if err != nil {
 		return Plan{}, fmt.Errorf("%w: %w", ErrDerive, err)
 	}
