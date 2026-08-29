@@ -333,13 +333,14 @@ sequenceDiagram
     CF-->>Engine: code, redeemed against the sealed state
     Engine->>CF: *.example.net
     Engine-->>API: sealed credential, STANDING
+    Note over API: stored as ciphertext api-platform holds no key for
 
     loop every app you deploy, from now on
         API->>Engine: BindAppToOrgAppDomain(registration, blog)
         Engine->>Edge: has the custom hostname minted its proofs?
         Engine->>CF: _acme-challenge.blog.example.net (pointer),<br/>_cf-custom-hostname.blog.example.net
-        Engine-->>API: what it wrote, and the credential's new expiry
-        Note over Engine: the credential's expiry slides forward
+        Engine-->>API: what it wrote, and the credential re-sealed
+        Note over API: the expiry slides forward — on the row, here
     end
 
     Note over You,CF: revoke at your provider whenever you want
@@ -433,13 +434,20 @@ sequenceDiagram
     CF-->>Engine: code, redeemed against the sealed state
     Engine->>CF: example.org CNAME + _acme-challenge pointer
 
-    loop advance, until serving and at every renewal
+    Engine-->>API: sealed credential, held 24h
+
+    loop advance, every 5 minutes for up to 24 hours
         API->>Engine: Advance(registration, sealed credential)
         Engine->>Engine: re-derive, and re-check the proof TXT
         Engine->>Edge: has the custom hostname minted its proofs?
         Engine->>CF: _cf-custom-hostname.example.org
         Engine-->>API: what it wrote, and whether the credential still lives
     end
+
+    Note over API,Engine: 24 hours after you authorized
+    API->>Engine: Advance
+    Engine->>CF: revoke the credential
+    Engine-->>API: released — nothing left to hold
 
     Note over You,CF: delete the proof TXT — writes stop on the first pass<br/>that sees it gone in PUBLIC DNS
 ```
