@@ -16,7 +16,7 @@
 //     the CUSTOMER's to publish (derive.SourceCustomer, never in what this
 //     service writes), re-checked on every pass that writes.
 //
-// 🔴 THE CREDENTIAL BOUNDARY, INHERITED VERBATIM FROM internal/grant.
+// 🔴 THE CREDENTIAL BOUNDARY.
 //
 // Cloudflare rotates the refresh token on every use, so a failure that arrives
 // after a refresh leaves the caller's stored token already dead. Reporting that
@@ -27,9 +27,9 @@
 // happened. EVERYTHING else is reported in the response, including every outcome
 // that describes the CUSTOMER's zone or choices — no credential held, the proof
 // withdrawn, the provider unreachable. Those are answers, not faults, and a
-// caller renders each differently (see Result). That is wider than grant's line
+// caller renders each differently (see Result). That is wider than a line drawn
 // at "consumed or rotated": manual and stopped consume nothing and are still not
-// errors, and everything grant reported in a response is still reported here.
+// errors.
 //
 // Nothing here opens a database, because this service owns none (CLAUDE.md,
 // DESIGN §7). Every fact that survives between two calls travels as a sealed
@@ -46,10 +46,10 @@ import (
 )
 
 // RPC-level errors: the refusals that consume nothing and describe the REQUEST
-// or the DEPLOYMENT rather than the customer's zone. They are intent's own
-// sentinels rather than grant's, because the two surfaces are on their way to
-// being one and the survivor should not import the other; the semantics are
-// identical, deliberately.
+// or the DEPLOYMENT rather than the customer's zone. errorCode in
+// cmd/dns-delegate-api maps each onto the code the caller acts on, so a refusal
+// that consumed nothing never reaches api-platform as a reason to release a
+// grant.
 var (
 	// ErrUnavailable means this deployment cannot offer delegated DNS: no OAuth
 	// client, or no keyset. A truthful state, not a fault — the console renders
@@ -775,8 +775,7 @@ const (
 )
 
 // Failure describes an outcome that reached the provider, or the reason there is
-// no usable credential. It is the shape internal/grant established and callers
-// already branch on.
+// no usable credential.
 type Failure struct {
 	// Code is the caller's contract. Retry is what distinguishes "try again
 	// later" from "this grant is dead".
@@ -785,8 +784,8 @@ type Failure struct {
 	Retry   bool   `json:"retry"`
 }
 
-// Failure codes, inherited from internal/grant so a caller's switch survives the
-// move to this surface.
+// Failure codes. They are the caller's contract, so a code is added rather than
+// respelled: api-platform branches on these strings.
 const (
 	// FailureProvider — refused or unreachable. The grant is intact; a later pass
 	// may succeed.

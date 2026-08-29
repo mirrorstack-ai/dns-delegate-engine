@@ -1,37 +1,28 @@
 # Every record MirrorStack can write in your zone
 
-The complete reference for the intent surface: if a record is not described
-here, nothing on that surface can produce it.
+The complete reference: if a record is not described here, nothing this service
+can be asked to do produces it.
 
-Two bounds hold on **both** surfaces, enforced in `internal/dnsplan` with no
-path around either — the vocabulary is `CNAME` and `TXT` only, and every record
-must sit at or under the anchor. But on the legacy `publish(records)` surface
-the name and the value *inside* those bounds are the caller's to choose, so that
-surface can put a record in your zone that this file does not list. That is the
-defect the rebuild exists to close, and it is why every entry below says which
-surface it is describing.
+Two bounds are enforced in `internal/dnsplan` with no path around either — the
+vocabulary is `CNAME` and `TXT` only, and every record must sit at or under the
+anchor. What is *inside* those bounds is derived here rather than chosen by the
+caller, which is why this file can be a complete list rather than a description
+of a shape. The record-list surface that could put an unlisted record in your
+zone is deleted; [`DESIGN.md`](DESIGN.md) §1 is what it was.
 
 **The three lanes are listed separately**, because they do not write the same
 records. An app domain never gets an AWS certificate record; a platform domain
 never gets a wildcard; and a domain attached to a single app gets the tightest
 anchor of the three. Read the one you are doing.
 
-Each entry says **who writes it**, and today there are two surfaces to say it
-about. The intent surface [`DESIGN.md`](DESIGN.md) describes is deployed and
-running. The legacy `publish(records)` surface it replaces is **still routed in
-the same binary, behind the same OAuth client**, and MirrorStack's private half
-still calls it. Where a row differs between the two, both are given — and where
-they differ, the weaker one is what bounds the deployment until the legacy
-action is deleted.
+Each entry says **who writes it** — you, or this service under your grant.
 
 ---
 
 ## The anchor
 
-The anchor is the hostname you are connecting. On the intent surface it is the
-only bound on what a delegated write can reach. On the legacy surface it is a
-field on the request, which is a different thing entirely — read to the end of
-this section before relying on the table:
+The anchor is the hostname you are connecting, and it is the only bound on what
+a delegated write can reach:
 
 | connecting | anchor | reachable | never reachable |
 |---|---|---|---|
@@ -43,32 +34,20 @@ this section before relying on the table:
 The suffix is matched with a leading dot, so `evilexample.com` is not under
 `example.com`. A wildcard `*.<anchor>` is under it and is allowed.
 
-Who chooses the anchor, and what proves it, is the one thing that differs most
-between the two surfaces:
+Who chooses the anchor, and what proves it, is the whole of why the table above
+can be relied on:
 
-🔴 **On the legacy `publish(records)` surface the anchor is a field on the
-publish request.** It is not derived from anything, and on the authorization-code
-path nothing binds it to anything you proved — so the table above does not
-describe that surface. Connecting `shop.example.com` yields a credential your
-provider scoped to the whole `example.com` zone, and a publish naming
-`example.com` as its anchor reaches `www.example.com` with every check in this
-repository passing.
-
-The ownership TXT does not close that either, because on this surface **we write
-it ourselves**, and the gate on connecting a hostname is a public lookup for that
-same record — so the proof is satisfied by our own write and proves nothing.
-That surface is still routed.
-
-✅ **On the intent surface the proof is yours.** The anchor comes out of a
-registration this service sealed and the caller cannot edit; the TXT value is
+✅ **The proof is yours.** The anchor comes out of a registration this service
+sealed and the caller cannot edit; the TXT value is
 `HMAC(K, lane‖identity‖anchor)`, recomputed here rather than accepted from
 anyone; and it is re-resolved in public DNS before `authorize` will mint a
 consent URL and again on every later pass. That is what makes the anchor a bound
 you set rather than one we assert.
 
-Until the legacy action is deleted, the first of those is what your zone is
-actually bounded by — which is to say, by your provider's zone scope and not by
-an anchor at all. See [`DESIGN.md`](DESIGN.md)'s status block.
+The surface this replaced took the anchor as a **field on the publish request**,
+bound to nothing you had proved, so its reach was your provider's zone scope
+rather than a hostname. It is deleted — see [`DESIGN.md`](DESIGN.md) §1 for what
+it was and why.
 
 ---
 
@@ -137,13 +116,14 @@ with an app whose slug is `blog`:
 - **The credential is standing**, because the records it exists to write are for
   apps that do not exist yet, and its expiry slides forward each time it
   publishes. That is the trade to think hardest about on this repository.
-- 🔴 **On the intent surface this lane cannot be authorized on this build at
-  all.** It is the one lane that requires this service's own consent page to have
-  been acknowledged — a wildcard is the one grant whose scope you cannot
-  enumerate for yourself — and nothing in the deployed binary mints an
-  acknowledgement. So `authorize` refuses it every time. What runs today for this
-  lane is the legacy record-list path. [`DESIGN.md`](DESIGN.md) §4 has the
-  reasoning and why refusing is the safe end of the failure.
+- 🔴 **This lane cannot be authorized on this build at all.** It is the one lane
+  that requires this service's own consent page to have been acknowledged — a
+  wildcard is the one grant whose scope you cannot enumerate for yourself — and
+  no deployment routes that page, so `authorize` refuses it every time. Nothing
+  weaker sits behind the refusal: the record-list path that used to run this lane
+  is deleted, so the wildcard is added by hand until the page is served.
+  [`DESIGN.md`](DESIGN.md) §4 has the reasoning and why refusing is the safe end
+  of the failure.
 
 ---
 
@@ -193,12 +173,11 @@ Proves the domain is yours. Everything downstream is gated on it: no custom
 hostname is created until a public lookup returns the token, and no certificate
 record can exist before a custom hostname does.
 
-**Written by you on the intent surface**, and **by MirrorStack on the legacy
-one.** That difference is the whole point of the rebuild: a proof we write
-ourselves proves nothing.
+**Written by you.** The surface this replaced wrote it itself, which is the whole
+point of the rebuild: a proof we write ourselves proves nothing.
 
-**On the intent surface it is a stop control.** Delete it and every write from
-this service stops on the first pass after the deletion is visible in public DNS
+**It is a stop control.** Delete it and every write from this service stops on
+the first pass after the deletion is visible in public DNS
 — your record's TTL, then up to one interval plus the jitter, which is five
 minutes and one more with the numbers this build declares. Nothing has to reach
 MirrorStack for that to take effect, and nobody has to agree to it.
@@ -209,11 +188,7 @@ nameserver failure must not be read as you saying no — otherwise a blip on our
 side would release a live credential and strand a working domain — so the stop
 is on an answer, never on the absence of one.
 
-**On the legacy surface, deleting it does nothing.** Nothing re-checks it there;
-that is defect two in [`DESIGN.md`](DESIGN.md) §1.
-
-**Retained on both.** Nothing in this service deletes a record, this one
-included.
+**Retained.** Nothing in this service deletes a record, this one included.
 
 ### routing · `<host>` or `*.<domain>` CNAME
 
@@ -377,18 +352,13 @@ knowing before you connect a domain whose subdomains are delegated separately.
 The envelope is bound, by the AEAD's associated data, to what identifies whose
 grant it is — so it cannot be moved to another organization, another domain, or
 a wider anchor. Any of those fails to authenticate, which releases the grant
-rather than widening it. The bindings differ by surface:
+rather than widening it. It is bound to **the lane**, the identity — an org id on
+lanes 1 and 2, an **app** id on lane 3 — and the anchor.
 
-| surface | the sealed grant is bound to |
-|---|---|
-| legacy `publish(records)` | the organization, the row, the anchor |
-| intent | **the lane**, the identity — an org id on lanes 1 and 2, an **app** id on lane 3 — and the anchor |
-
-🔴 **The lane is the binding the legacy form had no way to express.** One org can
-connect the same domain on two lanes. Those are two separate consents, two
-separate ownership proofs and two separate grants — and without the lane inside
-the seal, a grant obtained for the wildcard lane would open in the platform
-lane's row and write there.
+🔴 **The lane is in the seal.** One org can connect the same domain on two
+lanes. Those are two separate consents, two separate ownership proofs and two
+separate grants — and without the lane, a grant obtained for the wildcard lane
+would open in the platform lane's row and write there.
 
 What the intent form does **not** distinguish is two registrations with the same
 lane, identity and anchor: there is no row id in the seal, because this service
@@ -412,9 +382,9 @@ indistinguishable from a used one to anyone auditing from outside, so
 "ciphertext it holds no key for" was a property of the code and not of the
 permissions.
 
-Those grants are being removed, along with the rollback to the legacy path that
-depended on them. Once that deploys, no private MirrorStack function can read
-either secret, and the sentence above is true of the IAM as well.
+Those grants are being removed. Once that deploys, no private MirrorStack
+function can read either secret, and the sentence above is true of the IAM as
+well.
 
 ### Lifetimes
 
@@ -425,8 +395,8 @@ either secret, and the sentence above is true of the IAM as well.
 | why | the record set is closed and knowable up front | the records it exists to write are for apps that **do not exist yet** | the record set is closed, and smaller than lane 1 |
 
 All three are revocable at your provider at any time, independently of
-MirrorStack. And on the intent surface all three stop on the first pass after a
-deleted ownership proof becomes visible in public DNS — your record's TTL, then
+MirrorStack. And all three stop on the first pass after a deleted ownership proof
+becomes visible in public DNS — your record's TTL, then
 up to one interval plus the jitter — with the one exception described under
 [ownership](#ownership--_mirrorstack-challengeanchor-txt): a pass that cannot
 reach a resolver publishes and warns rather than stopping.

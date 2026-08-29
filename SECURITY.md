@@ -64,10 +64,9 @@ These are open **right now**, stated at the top of the README and in
 
 | | |
 |---|---|
-| The legacy `publish(records)` action is still routed | It takes both the record list **and the anchor** as request fields. It is not bounded by the connected domain — its reach is the whole zone the provider authorized. Retiring it is the next change, caller first. |
 | `verify()` validates no DNSSEC, and its quorum is opt-in | Multi-perspective validation and direct authoritative lookups both exist now (`internal/observe`), but the default is a single recursive resolver and **no signature is checked anywhere**. `capabilities.resolution` reports which of these a given deployment is running — and whether it can reach the vantage points it was configured with; [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) states what each closes. |
 | The rate floor is declared, not enforced | Nothing here slows a caller that advances a registration in a loop. |
-| Lane 2 cannot be authorized | Nothing in the deployed binary mints a consent acknowledgement, so it refuses. Fail-closed. |
+| Lane 2 cannot be authorized | Nothing in the deployed binary mints a consent acknowledgement, so it refuses. Fail-closed, and with the record-list surface deleted there is nothing weaker behind the refusal. |
 
 Finding a *new* way to exploit one of these is still worth reporting. Telling us
 one of them exists is not, and we are listing them here so nobody wastes an

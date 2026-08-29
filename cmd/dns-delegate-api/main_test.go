@@ -19,7 +19,6 @@ import (
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/consent"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/derive"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
-	"github.com/mirrorstack-ai/dns-delegate-engine/internal/grant"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/intent"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/observe"
@@ -33,7 +32,7 @@ import (
 )
 
 func readyDispatcher() *dispatcher {
-	return &dispatcher{grants: &grant.Service{
+	return &dispatcher{intents: &intent.Service{
 		OAuth: testsupport.StubOAuth{Cfg: &cfoauth.Config{Config: oauth2.Config{
 			ClientID: "cid", RedirectURL: "https://account.example/cb", Scopes: []string{"dns.write"},
 		}}},
@@ -101,9 +100,10 @@ func TestLambdaHandlerRejectsAMalformedEnvelope(t *testing.T) {
 
 func TestHealthIsTruthfulAboutDelegation(t *testing.T) {
 	if got := (&dispatcher{}).health(context.Background()); got.OK || got.Delegation != "unconfigured" {
-		t.Fatalf("no grant service must report unconfigured: %#v", got)
+		t.Fatalf("no service wired must report unconfigured: %#v", got)
 	}
-	if got := (&dispatcher{grants: &grant.Service{}}).health(context.Background()); got.OK || got.Delegation != "unconfigured" {
+	if got := (&dispatcher{intents: &intent.Service{}}).health(context.Background()); got.OK ||
+		got.Delegation != "unconfigured" {
 		t.Fatalf("no OAuth client must report unconfigured: %#v", got)
 	}
 	// A client without a keyset is a REAL, supported state: grants publish but
@@ -111,6 +111,13 @@ func TestHealthIsTruthfulAboutDelegation(t *testing.T) {
 	// out of rotation over a capability it does not need for the console lane.
 	if got := readyDispatcher().health(context.Background()); !got.OK || got.Delegation != "no-keyset" {
 		t.Fatalf("a client without a keyset is healthy but cannot hold: %#v", got)
+	}
+	held := &dispatcher{intents: &intent.Service{
+		OAuth: testsupport.StubOAuth{Cfg: &cfoauth.Config{Config: oauth2.Config{ClientID: "cid"}}},
+		Keys:  testsupport.StubKeys{Held: newSealer(t)},
+	}}
+	if got := held.health(context.Background()); !got.OK || got.Delegation != "ready" {
+		t.Fatalf("a client and a keyset must report ready: %#v", got)
 	}
 }
 
@@ -174,33 +181,6 @@ func TestPublishWorkflowStampsTheCommit(t *testing.T) {
 	}
 }
 
-// 🔴 Retiring the deprecated surface must not present as an outage.
-//
-// health reads whichever surface is wired, preferring the intent one. Both
-// resolve the same two credentials from the same two loaders, so the answers are
-// identical today and the branch is a no-op — which is exactly why nothing else
-// would catch it breaking. The day somebody deletes d.grants, a healthy
-// deployment must not start answering "unconfigured" and get pulled out of
-// rotation by mirrorstack-infra's probe.
-func TestHealthSurvivesTheDeprecatedServiceBeingRemoved(t *testing.T) {
-	oauth := testsupport.StubOAuth{Cfg: &cfoauth.Config{Config: oauth2.Config{ClientID: "cid"}}}
-
-	intentsOnly := &dispatcher{intents: &intent.Service{OAuth: oauth}}
-	if got := intentsOnly.health(context.Background()); !got.OK || got.Delegation != "no-keyset" {
-		t.Fatalf("the intent surface alone must report a healthy no-keyset deployment: %#v", got)
-	}
-
-	held := &dispatcher{intents: &intent.Service{OAuth: oauth, Keys: testsupport.StubKeys{Held: newSealer(t)}}}
-	if got := held.health(context.Background()); !got.OK || got.Delegation != "ready" {
-		t.Fatalf("a client and a keyset must report ready: %#v", got)
-	}
-
-	if got := (&dispatcher{intents: &intent.Service{}}).health(context.Background()); got.OK ||
-		got.Delegation != "unconfigured" {
-		t.Fatalf("an intent surface with no OAuth client must report unconfigured: %#v", got)
-	}
-}
-
 // 🔴 EVERY INTENT ACTION MUST BE REACHABLE. A missing case is not a compile
 // error and not a panic — it is an `unknown_action` refusal, which api-platform
 // maps to a hard failure. A lane that was wired end to end in internal/intent
@@ -241,78 +221,51 @@ func TestEveryIntentActionIsDispatched(t *testing.T) {
 	}
 }
 
-// 🔴 ADDITIVE, NOT REPLACING. api-platform calls these five today. Removing or
-// renaming one takes production down, and the failure would be a version skew
-// that only shows up under live traffic — this table is the cheapest place to
-// find out instead.
-func TestTheDeprecatedActionsAreStillDispatched(t *testing.T) {
+// 🔴 THE RECORD-LIST ACTIONS MUST REFUSE, NOT ANSWER. A caller still sending one
+// has to fail loudly: `unknown_action` is the one code api-platform's client maps
+// to a hard error rather than a retry, so a version skew shows up as a refusal
+// with a name in it instead of as a write nobody bounded.
+//
+// Health is here because it is the one action a caller reaches with no service
+// wired, and it must keep answering — mirrorstack-infra's probe reads it.
+func TestTheRetiredRecordListActionsAreRefused(t *testing.T) {
 	d := &dispatcher{}
 
-	for _, action := range []string{"Health", "Capabilities"} {
-		if _, err := d.dispatch(context.Background(), action, nil); err != nil {
-			t.Errorf("%s must still answer without an error, got %v", action, err)
-		}
-	}
-	// Capabilities with no service is a zero response and NOT a refusal, which
-	// is what it has always been. A caller reads Available:false from it.
-	out, err := d.dispatch(context.Background(), "Capabilities", nil)
-	if err != nil {
-		t.Fatalf("Capabilities: %v", err)
-	}
-	if _, ok := out.(grant.CapabilitiesResponse); !ok {
-		t.Fatalf("Capabilities must keep answering grant.CapabilitiesResponse, got %T", out)
+	if _, err := d.dispatch(context.Background(), "Health", nil); err != nil {
+		t.Errorf("Health must answer without an error, got %v", err)
 	}
 
-	for _, action := range []string{"Authorize", "Publish", "Revoke"} {
+	for _, action := range []string{"Capabilities", "Authorize", "Publish", "Revoke"} {
 		_, err := d.dispatch(context.Background(), action, nil)
-		if errors.Is(err, errUnknownAction) {
-			t.Errorf("%s was removed; api-platform calls it today", action)
-			continue
+		if !errors.Is(err, errUnknownAction) {
+			t.Errorf("%s must be gone from the wire surface, got %v", action, err)
 		}
-		if !errors.Is(err, grant.ErrUnavailable) {
-			t.Errorf("%s: want grant.ErrUnavailable, got %v", action, err)
+		if got := errorCode(err); got != "unknown_action" {
+			t.Errorf("%s: want code unknown_action, got %q", action, got)
 		}
 	}
 }
 
-// 🔴 THE TWO AUTHORIZE ACTIONS ARE DIFFERENT ACTS AND MUST STAY DIFFERENT NAMES.
+// 🔴 THE RETIRED Authorize MUST NOT COME BACK AS A SPELLING OF THIS ONE. It took
+// the OAuth state as a request field, so a caller could mint one for a
+// registration it was not holding; IntentAuthorize mints the state itself and
+// refuses without a live ownership proof and, on the wildcard lane, an
+// acknowledged consent page.
 //
-// Legacy Authorize accepts the OAuth state as a request field; IntentAuthorize
-// mints it, and refuses without a live ownership proof and — on the wildcard
-// lane — an acknowledged consent page. A caller that reached the wrong one would
-// be authorized with none of those checks and would get no error saying so.
-//
-// The second half of this test is that silent downgrade, written out: the SAME
-// legacy payload succeeds on one action and is refused on the other. If the two
-// were ever aliased, the refusal below would become an authorization URL.
-func TestTheTwoAuthorizeActionsCannotBeConfused(t *testing.T) {
-	empty := &dispatcher{}
-
-	_, legacyErr := empty.dispatch(context.Background(), "Authorize", nil)
-	if !errors.Is(legacyErr, grant.ErrUnavailable) || errors.Is(legacyErr, intent.ErrUnavailable) {
-		t.Fatalf("Authorize must route to the deprecated grant surface, got %v", legacyErr)
-	}
-	_, intentErr := empty.dispatch(context.Background(), "IntentAuthorize", nil)
-	if !errors.Is(intentErr, intent.ErrUnavailable) || errors.Is(intentErr, grant.ErrUnavailable) {
-		t.Fatalf("IntentAuthorize must route to the intent surface, got %v", intentErr)
+// The second half is that downgrade written out. A caller-minted state and a
+// PKCE challenge — the whole of the old request — must be refused, because it
+// carries no registration. Repointing the old name here, or loosening this one
+// to accept the old shape, would turn that refusal back into an authorization
+// URL and no test but this one would notice.
+func TestTheRetiredAuthorizeShapeIsRefused(t *testing.T) {
+	if _, err := (&dispatcher{}).dispatch(context.Background(), "Authorize", nil); !errors.Is(err, errUnknownAction) {
+		t.Fatalf("Authorize must be gone from the wire surface, got %v", err)
 	}
 
-	// A legacy payload: a caller-minted state and a PKCE challenge, and no
-	// registration anywhere.
 	payload := json.RawMessage(`{"state":"caller-minted","codeChallenge":"nBeK4c"}`)
-
-	legacy := readyDispatcher()
-	out, err := legacy.dispatch(context.Background(), "Authorize", payload)
-	if err != nil {
-		t.Fatalf("the deprecated Authorize must keep accepting a caller-minted state: %v", err)
-	}
-	if got, ok := out.(grant.AuthorizeResponse); !ok || got.AuthorizationURL == "" {
-		t.Fatalf("want a legacy authorization URL, got %#v", out)
-	}
-
 	intents, _ := intentDispatcher(t)
 	if _, err := intents.dispatch(context.Background(), "IntentAuthorize", payload); err == nil {
-		t.Fatal("🔴 IntentAuthorize accepted a legacy caller-minted state — the two actions have been aliased")
+		t.Fatal("🔴 IntentAuthorize accepted the retired caller-minted state")
 	} else if got := errorCode(err); got != "invalid_request" {
 		t.Fatalf("want invalid_request for a payload carrying no registration, got %q (%v)", got, err)
 	}
@@ -326,28 +279,11 @@ func TestTheTwoAuthorizeActionsCannotBeConfused(t *testing.T) {
 // It fails if an action starts or stops returning PassResponse, which is the
 // change that would silently reclassify it.
 func TestTheWritingActionsAreExactlyTheDeclaredSet(t *testing.T) {
-	want := map[string]bool{
-		"Complete": true, "Advance": true, "BindAppToOrgAppDomain": true,
-		// The one action whose writing is invisible in its type, and the reason
-		// the record-list surface is worth replacing.
-		actionPublish: true,
-	}
+	want := map[string]bool{"Complete": true, "Advance": true, "BindAppToOrgAppDomain": true}
 	for name, r := range routes {
 		if r.writes != want[name] {
 			t.Errorf("%q: writes=%v, want %v", name, r.writes, want[name])
 		}
-	}
-}
-
-func TestTheDeprecatedActionsAreExactlyTheLegacyFour(t *testing.T) {
-	want := map[string]bool{"Capabilities": true, "Authorize": true, actionPublish: true, "Revoke": true}
-	for name, r := range routes {
-		if r.deprecated != want[name] {
-			t.Errorf("%q: deprecated=%v, want %v", name, r.deprecated, want[name])
-		}
-	}
-	if len(want) != 4 {
-		t.Fatalf("the legacy surface is four actions, not %d", len(want))
 	}
 }
 
@@ -363,7 +299,7 @@ func TestEveryRouteIsReachableAndUnknownIsRefused(t *testing.T) {
 		// With no service wired, every action must return a refusal rather than
 		// panic. The refusal itself is the surface's own sentinel, which
 		// TestErrorCodesAreTheCallersContract covers.
-		if _, err := d.dispatch(t.Context(), name, nil); err == nil && name != "Health" && name != "Capabilities" {
+		if _, err := d.dispatch(t.Context(), name, nil); err == nil && name != "Health" {
 			t.Errorf("%q answered with no service wired; it must refuse", name)
 		}
 	}
@@ -418,8 +354,6 @@ func TestErrorCodesAreTheCallersContract(t *testing.T) {
 	}{
 		{errUnknownAction, "unknown_action"},
 		{fmt.Errorf("%w: x", errInvalidInput), "invalid_request"},
-		{fmt.Errorf("%w: x", grant.ErrInvalidRequest), "invalid_request"},
-		{grant.ErrUnavailable, "unavailable"},
 		{fmt.Errorf("%w: x", dnsplan.ErrAnchorEscape), "anchor_escape"},
 		{fmt.Errorf("%w: x", dnsplan.ErrPlanChanged), "plan_changed"},
 		{fmt.Errorf("%w: x", dnsplan.ErrPlanPreparing), "plan_preparing"},

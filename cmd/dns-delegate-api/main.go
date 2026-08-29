@@ -12,25 +12,22 @@
 //     503). /consent is gated on the sealed reference instead — see
 //     serveConsent for why that is the whole gate it can have.
 //
-// # Two surfaces, one binary, and the older one is on its way out
+// # One surface, and the record list is gone
 //
-// The INTENT surface (internal/intent) is what this repository is built around:
-// a caller names a domain and an intent and cannot name a DNS record at all,
-// every byte reaching a customer's zone is derived in internal/derive or relayed
-// verbatim from AWS or Cloudflare in internal/relay, and the anchor is proven by
-// a TXT record the CUSTOMER publishes, re-checked on every pass that writes. The
-// GRANT surface (internal/grant) is the record-list API that preceded it —
-// Authorize / Publish / Revoke, caller-supplied records — and closes neither of
-// the two defects docs/DESIGN.md §1 describes: nothing bounds a record's VALUE,
-// and the ownership proof was a record we published, gated on a lookup of that
-// same write.
+// The INTENT surface (internal/intent) is the whole of it: a caller names a
+// domain and an intent and cannot name a DNS record at all, every byte reaching
+// a customer's zone is derived in internal/derive or relayed verbatim from AWS
+// or Cloudflare in internal/relay, and the anchor is proven by a TXT record the
+// CUSTOMER publishes, re-checked on every pass that writes.
 //
-// 🔴 IT IS RETAINED ANYWAY, AND DELETING IT IS NOT A CLEANUP. api-platform calls
-// Health, Capabilities, Authorize, Publish and Revoke today; removing or
-// renaming any of them takes production down, so the intent actions were added
-// BESIDE them rather than over them. Each deprecated case below names the intent
-// action that replaces it. The retirement happens when the caller has moved, and
-// it is a change to two repositories, in that order.
+// The record-list surface that preceded it — Capabilities, Authorize, Publish
+// and Revoke, over caller-supplied records — is deleted, together with
+// internal/grant. While it was routed, what MirrorStack could put in a
+// customer's zone was the UNION of what this surface derives and whatever list
+// the private half handed the other one, so the bound docs/DESIGN.md §1
+// describes was a property of one surface rather than of the deployment. The
+// four names are gone from `routes`, so a caller still sending one gets an
+// `unknown_action` refusal.
 package main
 
 import (
@@ -51,7 +48,6 @@ import (
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/derive"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
-	"github.com/mirrorstack-ai/dns-delegate-engine/internal/grant"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/intent"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/lane"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/observe"
@@ -83,9 +79,7 @@ var errUnknownAction = errors.New("unknown action")
 var errInvalidInput = errors.New("invalid request payload")
 
 type dispatcher struct {
-	// grants is the deprecated record-list surface. See the package doc.
-	grants *grant.Service
-	// intents is the surface docs/DESIGN.md describes.
+	// intents is the surface docs/DESIGN.md describes, and the only one.
 	intents *intent.Service
 
 	// web is the HTTP transport, built once in main and served on BOTH
@@ -95,20 +89,14 @@ type dispatcher struct {
 	web http.Handler
 }
 
-// Three action names are load-bearing, and each is a constant so the reason
-// travels with the name rather than with a line in a switch.
+// Two action names are load-bearing, and each is a constant so the reason
+// travels with the name rather than with a row in the table.
 
-// actionIntentAuthorize is "IntentAuthorize", and it must NEVER become an alias
-// of the legacy "Authorize". Legacy Authorize takes the OAuth state as a REQUEST
-// FIELD — one the caller can mint for a registration it is not holding — and
-// Complete is then handed identity, lane and domain as separate fields that can
-// be made to disagree. This one mints the state itself, sealed over lane,
-// identity, anchor and nonce, and refuses unless the ownership proof resolves
-// RIGHT NOW and, on the wildcard lane, unless the consent page was acknowledged.
-// A caller reaching the wrong one gets none of those checks and no error saying
-// so; two names make that an `unknown_action` refusal instead. So neither name
-// may point at the other implementation, "Authorize" least of all as a migration
-// convenience: the REQUEST SHAPE selects the weaker check, not the action name.
+// actionIntentAuthorize is "IntentAuthorize", and the prefix must not be tidied
+// away now that the record-list "Authorize" is gone: this is the name
+// api-platform's client puts on the wire, so renaming it here is a version skew
+// that shows up only under live traffic, as an `unknown_action` refusal on every
+// connect.
 //
 // 🔴 THE WILDCARD LANE'S ACKNOWLEDGEMENT IS NOT REACHABLE FROM THIS TABLE, AND
 // MUST NOT BECOME REACHABLE. It is minted by posting back the challenge printed
@@ -119,30 +107,13 @@ type dispatcher struct {
 // and does not prove.
 const actionIntentAuthorize = "IntentAuthorize"
 
-// actionIntentCapabilities is named on the same rule, for a hazard of the same
-// shape: it answers a strictly LARGER response than legacy "Capabilities"
-// (docs/DESIGN.md §4 lists it), and a client decoding one into the other's
-// struct would not fail — it would read Available:false and render no connect
-// affordance, indistinguishable from a deployment that cannot offer delegated
-// DNS. Publishing the routing targets and the DCV identifier is deliberate: none
-// is a secret, every one ends up in a customer's own zone as the VALUE of a
+// actionIntentCapabilities is a constant for the same wire reason. What it
+// publishes is deliberate: the routing targets and the DCV identifier are not
+// secrets, every one of them ends up in a customer's own zone as the VALUE of a
 // record we ask them to accept, and publishing them lets somebody check BEFORE
 // authorizing that the CNAME they will be asked for is the one this repository
 // derives.
 const actionIntentCapabilities = "IntentCapabilities"
-
-// actionPublish is the deprecated record-list action, and where defect 1 lives:
-// it bounds WHERE we write and nothing bounds WHAT.
-//
-// 🔴 WHILE IT IS ROUTED, THE SURFACE AS A WHOLE IS NOT BOUNDED. What MirrorStack
-// can put in a customer's zone is the UNION of what the intent surface derives
-// and whatever record list the private half hands to this one, so an audit has
-// to read both halves and the weaker one decides. It also takes the ANCHOR as a
-// request field, so its reach is the whole zone the provider authorized rather
-// than the domain the customer connected. Deleting it is what turns the bound
-// into a property of the DEPLOYMENT rather than of the intent surface, and it is
-// the next step; "Complete" is what api-platform moves to.
-const actionPublish = "Publish"
 
 // handler is one action, already bound to its service and its request type.
 type handler func(*dispatcher, context.Context, json.RawMessage) (any, error)
@@ -157,10 +128,6 @@ type route struct {
 	// first question a reader has, and a comment drifts from the table it
 	// describes. TestTheWritingActionsAreExactlyTheDeclaredSet pins it.
 	writes bool
-
-	// deprecated marks the record-list surface. Not one line of its behaviour
-	// changed when this table replaced the switch.
-	deprecated bool
 }
 
 // routes is the whole wire surface. A reader tracing what this service can be
@@ -189,40 +156,20 @@ var routes = map[string]route{
 	"Orphans":                on(intents, (*intent.Service).Orphans),
 	"Release":                on(intents, (*intent.Service).Release),
 	actionIntentCapabilities: reads((*dispatcher).handleIntentCapabilities),
-
-	// ─── the deprecated record-list surface ─────────────────────────────────
-	"Capabilities": deprecate(reads((*dispatcher).handleGrantCapabilities)),
-	"Authorize":    deprecate(on(grants, (*grant.Service).Authorize)),
-	actionPublish:  deprecate(writesToAZone(on(grants, (*grant.Service).Publish))),
-	"Revoke":       deprecate(on(grants, (*grant.Service).Revoke)),
 }
 
-// writesToAZone marks the one action whose writing is INVISIBLE IN ITS TYPE.
-//
-// 🔴 THAT IT NEEDS MARKING AT ALL IS THE POINT. Every intent action reaching a
-// customer's zone says so by returning intent.PassResponse. This one returns
-// grant.PublishResponse and is the only route whose blast radius a reader cannot
-// get from its signature — the property that made the record-list surface worth
-// replacing.
-func writesToAZone(r route) route { r.writes = true; return r }
-
-// surface is one of the two RPC surfaces: how to reach it off the dispatcher and
-// the sentinel it answers unwired. See decodeAnd for why it is per-surface.
+// surface is an RPC surface: how to reach it off the dispatcher and the sentinel
+// it answers unwired. There is one today; it stays parameterised because the
+// sentinel is per-surface, and decodeAnd says why that matters.
 type surface[Svc any] struct {
 	get         func(*dispatcher) *Svc
 	unavailable error
 }
 
-var (
-	intents = surface[intent.Service]{
-		get:         func(d *dispatcher) *intent.Service { return d.intents },
-		unavailable: intent.ErrUnavailable,
-	}
-	grants = surface[grant.Service]{
-		get:         func(d *dispatcher) *grant.Service { return d.grants },
-		unavailable: grant.ErrUnavailable,
-	}
-)
+var intents = surface[intent.Service]{
+	get:         func(d *dispatcher) *intent.Service { return d.intents },
+	unavailable: intent.ErrUnavailable,
+}
 
 // on binds one service method into a route, deriving `writes` from the response
 // type rather than taking a flag: intent.PassResponse is returned by exactly the
@@ -246,9 +193,6 @@ func on[Svc any, Req any, Res any](
 // reads builds a route for an action that answers without decoding a request.
 func reads(h handler) route { return route{handle: h} }
 
-// deprecate marks a route as belonging to the legacy record-list surface.
-func deprecate(r route) route { r.deprecated = true; return r }
-
 func (d *dispatcher) dispatch(ctx context.Context, action string, payload json.RawMessage) (any, error) {
 	r, ok := routes[action]
 	if !ok {
@@ -257,7 +201,7 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, payload json.R
 	return r.handle(d, ctx, payload)
 }
 
-// The three actions that answer without decoding a request.
+// The two actions that answer without decoding a request.
 
 func (d *dispatcher) handleHealth(ctx context.Context, _ json.RawMessage) (any, error) {
 	return d.health(ctx), nil
@@ -268,16 +212,6 @@ func (d *dispatcher) handleIntentCapabilities(ctx context.Context, _ json.RawMes
 		return intent.CapabilitiesResponse{}, intent.ErrUnavailable
 	}
 	return d.intents.Capabilities(ctx), nil
-}
-
-// handleGrantCapabilities answers a ZERO VALUE rather than a sentinel when the
-// surface is not wired — the legacy contract, not an oversight: Available:false
-// renders no connect affordance, where an error renders a failure.
-func (d *dispatcher) handleGrantCapabilities(ctx context.Context, _ json.RawMessage) (any, error) {
-	if d.grants == nil {
-		return grant.CapabilitiesResponse{}, nil
-	}
-	return d.grants.Capabilities(ctx), nil
 }
 
 // decodeAnd unmarshals one action's request and runs it. A malformed payload is
@@ -294,10 +228,10 @@ func (d *dispatcher) handleGrantCapabilities(ctx context.Context, _ json.RawMess
 // ambiguous for anything not a decoded API error — so reconcile re-reads rather
 // than guessing.
 //
-// unavailable is the calling surface's OWN not-wired sentinel, not one shared
-// value, because errorCode derives the caller's contract from it: grant's
-// sentinel returned from an intent action would be correct by luck, and would
-// stop being correct the moment the two vocabularies diverge.
+// unavailable is the calling surface's OWN not-wired sentinel rather than one
+// shared value, because errorCode derives the caller's contract from it: a
+// second surface added here would need its own, and borrowing intent's would be
+// correct only by luck.
 func decodeAnd[Svc any, Req any, Res any](
 	ctx context.Context,
 	payload json.RawMessage,
@@ -363,12 +297,6 @@ type healthResponse struct {
 // after this Lambda started counts — without contacting the provider, and
 // publishes the deployed commit (see the `commit` var).
 //
-// It reads whichever surface is wired, preferring the intent one. Both resolve
-// the same two credentials from the same loaders, so today that branch is a
-// no-op; it exists for the day the deprecated service is deleted, when removing
-// d.grants would otherwise leave a healthy deployment answering "unconfigured"
-// and mirrorstack-infra's health check reading the service as down.
-//
 // An incomplete derivation configuration is deliberately NOT reported here. It
 // is a real fault, but it belongs in IntentCapabilities, which says exactly what
 // is missing; failing health over it would take a deployment out of rotation for
@@ -382,28 +310,23 @@ type healthResponse struct {
 // or serves refusals that look like customer mistakes. The threshold is never
 // lowered to fit what is reachable; see observe.Probe.
 func (d *dispatcher) health(ctx context.Context) healthResponse {
-	var available, canHold bool
-	var resolution *intent.ResolutionCapability
-	switch {
-	case d.intents != nil:
-		caps := d.intents.Capabilities(ctx)
-		available, canHold = caps.Available, caps.CanHold
-		resolution = &caps.Resolution
-	case d.grants != nil:
-		caps := d.grants.Capabilities(ctx)
-		available, canHold = caps.Available, caps.CanHold
-	}
-	out := healthResponse{Commit: commit, Resolution: resolution}
-	switch {
-	case !available:
+	out := healthResponse{Commit: commit}
+	if d.intents == nil {
 		out.Delegation = "unconfigured"
 		return out
-	case !canHold:
+	}
+	caps := d.intents.Capabilities(ctx)
+	out.Resolution = &caps.Resolution
+	switch {
+	case !caps.Available:
+		out.Delegation = "unconfigured"
+		return out
+	case !caps.CanHold:
 		out.Delegation = "no-keyset"
 	default:
 		out.Delegation = "ready"
 	}
-	out.OK = !resolversDegraded(resolution)
+	out.OK = !resolversDegraded(out.Resolution)
 	return out
 }
 
@@ -416,11 +339,9 @@ func resolversDegraded(r *intent.ResolutionCapability) bool {
 }
 
 func main() {
-	// One OAuth loader and one keyset loader, SHARED by both surfaces. They
-	// cache on a TTL and re-read their secret when it expires, so a credential
-	// rotated after this Lambda started is picked up without a redeploy; sharing
-	// them stops the two surfaces disagreeing about which credential is current
-	// while one is being retired.
+	// One OAuth loader and one keyset loader. They cache on a TTL and re-read
+	// their secret when it expires, so a credential rotated after this Lambda
+	// started is picked up without a redeploy.
 	oauth := cfoauth.NewDefaultLoader()
 	keys := grantcrypto.NewDefaultLoader()
 	// Cloudflare is the first provider. A second is an adapter beside it plus a
@@ -457,7 +378,6 @@ func main() {
 	reach := &observe.Probe{Resolver: resolver, Name: derived.OrgRoutingTarget}
 
 	d := &dispatcher{
-		grants: &grant.Service{OAuth: oauth, Keys: keys, Publisher: publisher},
 		intents: &intent.Service{
 			OAuth:     oauth,
 			Keys:      keys,
@@ -973,7 +893,6 @@ func errorCode(err error) string {
 	// ── the two general refusals, both meaning nothing was consumed ──
 
 	case errors.Is(err, errInvalidInput),
-		errors.Is(err, grant.ErrInvalidRequest),
 		errors.Is(err, intent.ErrInvalidRequest),
 		// lane.ErrInvalid wraps every identity, domain and slug refusal, and
 		// arrives inside intent.ErrInvalidRequest today. Naming it keeps the
@@ -982,8 +901,7 @@ func errorCode(err error) string {
 		errors.Is(err, lane.ErrInvalid):
 		return "invalid_request"
 
-	case errors.Is(err, grant.ErrUnavailable),
-		errors.Is(err, intent.ErrUnavailable):
+	case errors.Is(err, intent.ErrUnavailable):
 		return "unavailable"
 
 	default:

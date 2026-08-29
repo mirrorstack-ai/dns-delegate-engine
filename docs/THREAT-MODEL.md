@@ -39,7 +39,7 @@ codebase are labelled as such for exactly this reason.
 | choose the domain | ✅ | ✅ | — |
 | prove the domain | ✅ **only you** | — | — |
 | choose which records exist | — | — | ✅ derived here |
-| choose a record's **value** | — | 🔴 **on the legacy surface, yes** | ✅ on the intent surface |
+| choose a record's **value** | — | — | ✅ derived here |
 | hold the provider credential | — | as ciphertext it has no key for | ✅ |
 | delete a record | ✅ | — | ❌ **no delete exists** |
 | stop everything | ✅ **two ways** | — | — |
