@@ -396,6 +396,7 @@ func (s *Service) register(ctx context.Context, l lane.Lane, identity, domain st
 		Hosts:        plan.Hosts,
 		Records:      recordViews(plan.Items),
 		Digest:       hex.EncodeToString(snapshot.Digest()),
+		Reviewable:   reviewableIdentities(snapshot.Records),
 		GrantSeconds: grantSeconds(l),
 	}
 	for _, item := range plan.Items {
@@ -939,6 +940,7 @@ func (s *Service) Describe(ctx context.Context, req DescribeRequest) (DescribeRe
 		Anchor:       reg.Anchor,
 		Hosts:        merged.Hosts,
 		Digest:       hex.EncodeToString(review.Digest()),
+		Reviewable:   reviewableIdentities(review.Records),
 		GrantSeconds: grantSeconds(reg.Lane),
 		Warnings:     warnings,
 	}

@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/derive"
+	"github.com/mirrorstack-ai/dns-delegate-engine/internal/dnsplan"
 	"github.com/mirrorstack-ai/dns-delegate-engine/internal/observe"
 )
 
@@ -289,6 +290,35 @@ func recordView(item derive.Item) RecordView {
 	}
 }
 
+// Reviewable is the identity list a caller compares a customer's reviewed set
+// against: exactly the records Digest is computed over, in the same
+// TYPE|name|value form dnsplan uses.
+//
+// 🔴 IT IS NOT Records, AND THE DIFFERENCE IS WHY THIS EXISTS. Records is
+// everything a console should SHOW — the ownership proof the customer publishes,
+// and on Describe the relayed ACM and serving rows too. Digest binds only what
+// this service will WRITE from its own derivation. On lane 1 converged that is
+// 8 rows against as many as 16.
+//
+// Comparing a reviewed list against Records therefore mismatches in two ways
+// that no customer action can fix: the ownership row is theirs and its value is
+// recomputed here, and the relayed rows ARRIVE DURING THE CONSENT WINDOW, so the
+// list grows while the digest deliberately does not. A caller that binds to the
+// larger set manufactures a plan-changed refusal out of upstreams answering.
+//
+// Built from the same publishable() the digest is taken over, so the two cannot
+// drift — see TestTheReviewableSetIsExactlyWhatTheDigestBinds.
+func reviewableIdentities(records []dnsplan.Record) []string {
+	_, identities, err := dnsplan.NormalizeRecords(records)
+	if err != nil {
+		// NewSnapshot already normalized these to build the digest, so a failure
+		// here means the two disagree — report nothing rather than a partial list
+		// a caller would compare against.
+		return nil
+	}
+	return identities
+}
+
 // recordViews projects a whole plan, in plan order.
 func recordViews(items []derive.Item) []RecordView {
 	out := make([]RecordView, 0, len(items))
@@ -354,6 +384,12 @@ type RegisteredResponse struct {
 	// derived, publishable set, the customer's own proof excluded because we
 	// never write it. Complete refuses a plan that does not reproduce it.
 	Digest string `json:"digest"`
+
+	// Reviewable is exactly what Digest binds, as TYPE|name|value identities: the
+	// set a caller compares a customer's reviewed list against. It is a SUBSET of
+	// Records — see reviewableIdentities for why comparing against Records instead
+	// manufactures a plan-changed refusal no customer action can fix.
+	Reviewable []string `json:"reviewable,omitempty"`
 
 	// GrantSeconds is how long a grant on this lane is held once authorized, 0
 	// meaning STANDING. Published so the private half stores an expiry it did not
@@ -498,8 +534,14 @@ type DescribeResponse struct {
 	// in the keyset rather than against today's value. See Service.Describe.
 	Proof RecordView `json:"proof"`
 
-	Verified     bool     `json:"verified"`
-	Digest       string   `json:"digest"`
+	Verified bool   `json:"verified"`
+	Digest   string `json:"digest"`
+
+	// Reviewable is exactly what Digest binds, as TYPE|name|value identities: the
+	// set a caller compares a customer's reviewed list against. It is a SUBSET of
+	// Records — see reviewableIdentities for why comparing against Records instead
+	// manufactures a plan-changed refusal no customer action can fix.
+	Reviewable   []string `json:"reviewable,omitempty"`
 	GrantSeconds int64    `json:"grantSeconds"`
 	Warnings     []string `json:"warnings,omitempty"`
 }

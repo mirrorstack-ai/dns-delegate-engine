@@ -372,6 +372,13 @@ It also **re-resolves the ownership proof itself**, after the digest and before
 the code is exchanged. The sealed state is a ten-minute receipt of the check
 `authorize` made; without this second look there would be a ten-minute window in
 which the proof is already gone and this service still writes.
+What a caller compares a customer's reviewed list against is `reviewable` — the
+identities `digest` is computed over, returned by the registration intents and by
+`describe`. It is deliberately smaller than `records`: that list also carries the
+ownership proof, which is the customer's to publish, and on `describe` the
+relayed rows too, which arrive *during* the consent window. Binding to `records`
+would manufacture a plan-changed refusal out of an upstream answering.
+
 `expectDigest` is **required**; an empty value is refused, because an
 integrity check a caller can switch off by omitting a field is a claim rather
 than a control. Three things it is *not*, and they matter more than the
