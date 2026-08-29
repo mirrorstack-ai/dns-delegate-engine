@@ -248,14 +248,19 @@ sequenceDiagram
     Engine-->>API: sealed credential, held 24h
 
     loop advance, every 5 minutes for up to 24 hours
+        API->>Engine: Advance(registration, sealed credential)
         Engine->>Engine: re-derive, and re-check the proof TXT
         Engine->>ACM: has the validation record appeared?
         Engine->>Edge: has the custom hostname minted its proofs?
         Engine->>CF: _9f8c….account.example.com,<br/>_cf-custom-hostname.account.example.com
+        Engine-->>API: what it wrote, and whether the credential still lives
+        API-->>Web: progress, on the card you left open
     end
 
-    Note over Engine: 24 hours after you authorized
+    Note over API,Engine: 24 hours after you authorized
+    API->>Engine: Advance
     Engine->>CF: revoke the credential
+    Engine-->>API: released — nothing left to hold
 ```
 
 Three things about this lane:
@@ -333,6 +338,7 @@ sequenceDiagram
         API->>Engine: BindAppToOrgAppDomain(registration, blog)
         Engine->>Edge: has the custom hostname minted its proofs?
         Engine->>CF: _acme-challenge.blog.example.net (pointer),<br/>_cf-custom-hostname.blog.example.net
+        Engine-->>API: what it wrote, and the credential's new expiry
         Note over Engine: the credential's expiry slides forward
     end
 
@@ -428,9 +434,11 @@ sequenceDiagram
     Engine->>CF: example.org CNAME + _acme-challenge pointer
 
     loop advance, until serving and at every renewal
+        API->>Engine: Advance(registration, sealed credential)
         Engine->>Engine: re-derive, and re-check the proof TXT
         Engine->>Edge: has the custom hostname minted its proofs?
         Engine->>CF: _cf-custom-hostname.example.org
+        Engine-->>API: what it wrote, and whether the credential still lives
     end
 
     Note over You,CF: delete the proof TXT — writes stop on the first pass<br/>that sees it gone in PUBLIC DNS
