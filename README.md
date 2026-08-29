@@ -222,36 +222,45 @@ one you publish**, and nothing else happens until it resolves.
 sequenceDiagram
     autonumber
     actor You
-    participant Console as MirrorStack console<br/>(private)
+    participant Web as web-account<br/>(the browser UI)
+    participant API as api-platform<br/>(private)
     participant Engine as dns-delegate-engine<br/>(this repository)
     participant CF as Your DNS provider
     participant ACM as AWS certificate manager
     participant Edge as MirrorStack edge
 
-    You->>Console: connect example.com
-    Console->>Engine: AddOrgPlatformDomain(org, example.com)
-    Engine-->>Console: proof TXT + the full record list + digest
-    Console-->>You: publish this one TXT yourself
+    You->>Web: connect example.com
+    Web->>API: connect this domain
+    API->>Engine: AddOrgPlatformDomain(org, example.com)
+    Engine-->>API: proof TXT + the full record list + digest
+    API-->>Web: the proof, and what will be written
+    Web-->>You: publish this one TXT yourself
 
     You->>CF: _mirrorstack-challenge.example.com
-    Console->>Engine: IntentAuthorize
+    Web->>API: I have published it
+    API->>Engine: IntentAuthorize
     Engine->>Engine: verify — public DNS only
-    Engine-->>Console: consent URL + sealed state
+    Engine-->>API: consent URL + sealed state
 
     You->>CF: authorize (zone.read, dns.write — one zone)
     CF-->>Engine: code, redeemed against the sealed state
     Engine->>CF: routing CNAMEs<br/>+ _acme-challenge pointers (no token, nothing to wait for)
-    Engine-->>Console: sealed credential, held 24h
+    Engine-->>API: sealed credential, held 24h
 
     loop advance, every 5 minutes for up to 24 hours
+        API->>Engine: Advance(registration, sealed credential)
         Engine->>Engine: re-derive, and re-check the proof TXT
         Engine->>ACM: has the validation record appeared?
         Engine->>Edge: has the custom hostname minted its proofs?
         Engine->>CF: _9f8c….account.example.com,<br/>_cf-custom-hostname.account.example.com
+        Engine-->>API: what it wrote, and whether the credential still lives
+        API-->>Web: progress, on the card you left open
     end
 
-    Note over Engine: 24 hours after you authorized
+    Note over API,Engine: 24 hours after you authorized
+    API->>Engine: Advance
     Engine->>CF: revoke the credential
+    Engine-->>API: released — nothing left to hold
 ```
 
 Three things about this lane:
@@ -301,32 +310,37 @@ reason this lane's credential behaves differently.
 sequenceDiagram
     autonumber
     actor You
-    participant Console as MirrorStack console<br/>(private)
+    participant Web as web-account<br/>(the browser UI)
+    participant API as api-platform<br/>(private)
     participant Engine as dns-delegate-engine<br/>(this repository)
     participant CF as Your DNS provider
     participant Edge as MirrorStack edge
 
-    You->>Console: connect example.net as an app domain
-    Console->>Engine: AddOrgAppDomain(org, example.net)
-    Engine-->>Console: proof TXT + the full record list + digest
-    Console-->>You: publish this one TXT yourself
+    You->>Web: connect example.net as an app domain
+    Web->>API: connect this app domain
+    API->>Engine: AddOrgAppDomain(org, example.net)
+    Engine-->>API: proof TXT + the full record list + digest
+    API-->>Web: the proof, and what will be written
+    Web-->>You: publish this one TXT yourself
 
     You->>CF: _mirrorstack-challenge.example.net
     You->>Engine: read /consent, post the challenge back
-    Engine-->>Console: the acknowledgement
-    Console->>Engine: IntentAuthorize (with the acknowledgement)
-    Engine-->>Console: consent URL + sealed state
+    Engine-->>API: the acknowledgement
+    API->>Engine: IntentAuthorize (with the acknowledgement)
+    Engine-->>API: consent URL + sealed state
 
     You->>CF: authorize (zone.read, dns.write — one zone)
     CF-->>Engine: code, redeemed against the sealed state
     Engine->>CF: *.example.net
-    Engine-->>Console: sealed credential, STANDING
+    Engine-->>API: sealed credential, STANDING
+    Note over API: stored as ciphertext api-platform holds no key for
 
     loop every app you deploy, from now on
-        Console->>Engine: BindAppToOrgAppDomain(registration, blog)
+        API->>Engine: BindAppToOrgAppDomain(registration, blog)
         Engine->>Edge: has the custom hostname minted its proofs?
         Engine->>CF: _acme-challenge.blog.example.net (pointer),<br/>_cf-custom-hostname.blog.example.net
-        Note over Engine: the credential's expiry slides forward
+        Engine-->>API: what it wrote, and the credential re-sealed
+        Note over API: the expiry slides forward — on the row, here
     end
 
     Note over You,CF: revoke at your provider whenever you want
@@ -397,29 +411,43 @@ Every step of the diagram below is in this repository.
 sequenceDiagram
     autonumber
     actor You
-    participant App as MirrorStack app settings
+    participant Web as web-applications<br/>(the browser UI)
+    participant API as api-platform<br/>(private)
     participant Engine as dns-delegate-engine<br/>(this repository)
     participant CF as Your DNS provider
     participant Edge as MirrorStack edge
 
-    App->>Engine: AddAppDomain(app, example.org)
-    Engine-->>App: proof TXT + the full record list + digest
-    App-->>You: publish this one TXT yourself
+    You->>Web: add example.org to this app
+    Web->>API: add this domain
+    API->>Engine: AddAppDomain(app, example.org)
+    Engine-->>API: proof TXT + the full record list + digest
+    API-->>Web: the proof, and what will be written
+    Web-->>You: publish this one TXT yourself
 
     You->>CF: _mirrorstack-challenge.example.org
-    App->>Engine: IntentAuthorize
+    Web->>API: I have published it
+    API->>Engine: IntentAuthorize
     Engine->>Engine: verify — public DNS only
-    Engine-->>App: consent URL + sealed state
+    Engine-->>API: consent URL + sealed state
 
     You->>CF: authorize (zone.read, dns.write — one zone)
     CF-->>Engine: code, redeemed against the sealed state
     Engine->>CF: example.org CNAME + _acme-challenge pointer
 
-    loop advance, until serving and at every renewal
+    Engine-->>API: sealed credential, held 24h
+
+    loop advance, every 5 minutes for up to 24 hours
+        API->>Engine: Advance(registration, sealed credential)
         Engine->>Engine: re-derive, and re-check the proof TXT
         Engine->>Edge: has the custom hostname minted its proofs?
         Engine->>CF: _cf-custom-hostname.example.org
+        Engine-->>API: what it wrote, and whether the credential still lives
     end
+
+    Note over API,Engine: 24 hours after you authorized
+    API->>Engine: Advance
+    Engine->>CF: revoke the credential
+    Engine-->>API: released — nothing left to hold
 
     Note over You,CF: delete the proof TXT — writes stop on the first pass<br/>that sees it gone in PUBLIC DNS
 ```
