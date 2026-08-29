@@ -327,6 +327,138 @@ func ValidateDomain(name string, reserved []string) (string, error) {
 	return normalized, nil
 }
 
+// ValidateDomainExempt is ValidateDomain with a narrow, EXACT-MATCH escape from
+// the reserved-suffix rule.
+//
+// 🔴 WHY THIS EXISTS, STATED PLAINLY FOR A READER WHO DISTRUSTS IT.
+//
+// The reserved list refuses every name under MirrorStack's own registrable
+// domains, because a name we own has no customer at the other end: the ownership
+// proof for it would be published BY US, which proves nothing, and the
+// customer-grant write path would have become a platform-zone editor. That rule
+// is the reason this repository is worth reading.
+//
+// It also makes the delegated path impossible to exercise end to end without
+// buying a domain, because every host the company controls is refused. An
+// unexercised path is its own risk: the first real customer becomes the first
+// test, and a wrong DCV target fails silently at RENEWAL, months later.
+//
+// So: specific hostnames, named one at a time, may be admitted. Nothing else
+// changes — they are still bound by anchor containment, still need a published
+// proof, still get a sealed registration.
+//
+// 🔴 FOUR PROPERTIES MAKE THIS SAFE TO SHIP IN A PUBLIC REPOSITORY, AND ALL
+// FOUR ARE ENFORCED BELOW RATHER THAN PROMISED IN A COMMENT:
+//
+//  1. EXACT MATCH, NEVER A SUFFIX. `dnsplan.Contains` is not used here. Exempting
+//     `staging.example.com` admits that one name and NOT `api.staging.example.com`,
+//     so an entry cannot widen into the subtree beneath it. A suffix-shaped
+//     exemption is the whole failure mode this is written to exclude.
+//  2. AN ENTRY MAY NOT BE A RESERVED SUFFIX ITSELF. Exempting `mirrorstack.ai`
+//     would readmit every name under it through the front door; that entry is
+//     refused and every domain refused with it, the same fail-closed shape the
+//     malformed-suffix guard uses.
+//  3. AN ENTRY THAT IS NOT UNDER A RESERVED SUFFIX IS REFUSED. It would be a
+//     no-op that reads like permission, and a list whose entries do nothing is
+//     how a real exemption gets added later without anyone noticing.
+//  4. EVERY USE IS LOGGED. An exemption that is quiet is an exemption nobody
+//     removes.
+//
+// The empty list is the normal state and costs nothing: with no entries this is
+// ValidateDomain exactly.
+func ValidateDomainExempt(name string, reserved, exempt []string) (string, error) {
+	// Structure first, and by delegating: an exemption must never admit a name
+	// that is not a legal domain, and duplicating the structural rules here is
+	// how the two copies drift.
+	normalized, err := ValidateDomain(name, nil)
+	if err != nil {
+		return "", err
+	}
+
+	suffixes := make([]string, 0, len(reserved))
+	for _, entry := range reserved {
+		suffix := dnsplan.NormalizeName(entry)
+		if suffix == "" || strings.HasPrefix(suffix, ".") {
+			// ValidateDomain reports these precisely; re-run it for the message
+			// rather than inventing a second wording that could disagree.
+			return ValidateDomain(name, reserved)
+		}
+		suffixes = append(suffixes, suffix)
+	}
+
+	// 🔴 THE WHOLE EXEMPTION LIST IS CHECKED BEFORE ANYTHING ELSE, INCLUDING FOR
+	// DOMAINS THAT ARE NOT RESERVED AT ALL.
+	//
+	// The first draft validated entries only once the name under test turned out
+	// to be reserved. That made a malformed list invisible on every ordinary
+	// customer domain — which is the entire population in production — so a
+	// decorative or dangerous entry could sit there indefinitely and surface only
+	// the first time somebody registered a MirrorStack name. Caught by
+	// TestExemptingAReservedSuffixItselfRefusesEveryDomain, which asserts the
+	// refusal on a NON-reserved domain precisely because that is the case the
+	// ordering bug hid.
+	normalizedExempt := make([]string, 0, len(exempt))
+	for _, entry := range exempt {
+		candidate := dnsplan.NormalizeName(entry)
+		if candidate == "" {
+			slog.Error("lane: refusing every domain because the exemption list carries an entry that normalizes to nothing")
+			return "", fmt.Errorf("%w: the reserved-suffix exemption list is malformed", ErrInvalid)
+		}
+		// Property 2. An exemption that IS a reserved suffix readmits its whole
+		// subtree, which is the rule inverted rather than narrowed.
+		for _, suffix := range suffixes {
+			if candidate == suffix {
+				slog.Error("lane: refusing every domain because an exemption names a reserved suffix itself",
+					"entry", candidate)
+				return "", fmt.Errorf(
+					"%w: the exemption %q is a reserved suffix; exemptions name ONE host beneath one",
+					ErrInvalid, Echo(candidate))
+			}
+		}
+		// Property 3. An entry outside every reserved suffix exempts nothing and
+		// reads like it does.
+		under := false
+		for _, suffix := range suffixes {
+			if dnsplan.Contains(suffix, candidate) {
+				under = true
+				break
+			}
+		}
+		if !under {
+			slog.Error("lane: refusing every domain because an exemption is not under any reserved suffix",
+				"entry", candidate)
+			return "", fmt.Errorf(
+				"%w: the exemption %q is under no reserved suffix, so it permits nothing",
+				ErrInvalid, Echo(candidate))
+		}
+		normalizedExempt = append(normalizedExempt, candidate)
+	}
+
+	var under string
+	for _, suffix := range suffixes {
+		if dnsplan.Contains(suffix, normalized) {
+			under = suffix
+			break
+		}
+	}
+	if under == "" {
+		return normalized, nil // not reserved at all; no exemption needed
+	}
+
+	for _, candidate := range normalizedExempt {
+		// Property 1. Exact, not Contains.
+		if candidate == normalized {
+			// Property 4.
+			slog.Warn("lane: admitting a name under a reserved suffix because it is explicitly exempted",
+				"domain", normalized, "reserved_suffix", under)
+			return normalized, nil
+		}
+	}
+
+	return "", fmt.Errorf("%w: %q is at or under the reserved suffix %q",
+		ErrInvalid, Echo(normalized), Echo(under))
+}
+
 // ValidateSlug accepts a single LDH label of at most 63 bytes and returns it
 // lowercased.
 //
