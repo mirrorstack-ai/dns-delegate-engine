@@ -283,7 +283,7 @@ func (s *Service) laneCapabilities(ctx context.Context) []LaneCapability {
 			Hosts:               description,
 			Anchor:              "the domain you connect, and every record sits at or under it",
 			GrantSeconds:        grantSeconds(l),
-			ConsentPage:         consent.Required(l),
+			ConsentPage:         consent.HasPage(l),
 			EdgeZone:            zoneID,
 			DCVDelegationUUID:   cfg.DCVUUID(l),
 			DCVDelegationSource: source,
@@ -364,11 +364,18 @@ func (s *Service) register(ctx context.Context, l lane.Lane, identity, domain st
 	// 🔴 THE CONSENT REFERENCE IS MINTED HERE, AND SEALED IN. The acknowledgement
 	// is a MAC over (reference, anchor); minting the reference at registration is
 	// what makes it a value THIS service issued for THIS domain, rather than one
-	// half of a MAC the caller chose (AuthorizeRequest.ConsentToken). Lanes are
-	// selected by consent.Required, the single rule for which lanes have a page,
-	// so an unrecognised lane gets a reference rather than silently getting none.
+	// half of a MAC the caller chose (AuthorizeRequest.ConsentToken).
+	//
+	// 🔴 BOTH PREDICATES, BECAUSE THE REFERENCE IS NOT SPENT WHERE IT IS NEEDED.
+	// A lane with a page needs one to SERVE that page — org_app_domain still has a
+	// disclosure and no longer demands the acknowledgement — and an unrecognised
+	// lane needs one because it is Required and would otherwise be refused twice
+	// over, once for the missing acknowledgement and once for the missing
+	// reference. A registration is sealed exactly once, so the reference has to be
+	// minted for every lane that could ever want it; the cost of an unused one is
+	// 32 characters inside an envelope.
 	consentNonce := ""
-	if consent.Required(l) {
+	if consent.HasPage(l) || consent.Required(l) {
 		consentNonce, err = sealed.NewNonce()
 		if err != nil {
 			return RegisteredResponse{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
@@ -584,7 +591,7 @@ func (s *Service) consentPlan(ctx context.Context, registration string) (sealed.
 	// consent.Page refuses the other lanes too, in its own terms. This refusal
 	// names the REQUEST as what was wrong, so a caller asking for the wrong lane's
 	// screen is not told instead that its plan is malformed.
-	if !consent.Required(reg.Lane) {
+	if !consent.HasPage(reg.Lane) {
 		return sealed.Registration{}, derive.Plan{},
 			fmt.Errorf("%w: %s publishes a closed, listable record set and has no consent page",
 				ErrInvalidRequest, reg.Lane)
@@ -662,8 +669,16 @@ func (s *Service) Authorize(ctx context.Context, req AuthorizeRequest) (Authoriz
 	// because consent.Verify rejects an empty component rather than MACing over
 	// one; the alternative is a wildcard authorized against a value nobody
 	// issued.
+	// 🔴 NOT REQUIRED, BUT HONOURED IF SUPPLIED — and the asymmetry is the whole
+	// of the change. No lane demands an acknowledgement any more (consent.Required
+	// says why), so an ABSENT token is now a normal authorize. A token that IS
+	// supplied must still verify: accepting a bad one because none was needed
+	// would seal ConsentAck on the strength of a value nobody issued, and the
+	// state carries that flag into Complete. So the ceremony stays exercised
+	// end-to-end and re-arming remains one entry in consent.Required rather than a
+	// rebuild of this branch.
 	acknowledged := false
-	if consent.Required(reg.Lane) {
+	if strings.TrimSpace(req.ConsentToken) != "" || consent.Required(reg.Lane) {
 		if !consent.Verify(sealer, reg.ConsentNonce, reg.Anchor, req.ConsentToken) {
 			return AuthorizeResponse{}, fmt.Errorf(
 				"%w: %s requires this service's consent page to have been served and acknowledged for %q",

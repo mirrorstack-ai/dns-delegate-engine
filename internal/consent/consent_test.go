@@ -56,7 +56,27 @@ func renderedPage(t *testing.T, plan derive.Plan, nonce string) string {
 
 // ───────────────────────────── Required ─────────────────────────────
 
-func TestRequiredIsTrueOnlyForTheWildcardLane(t *testing.T) {
+// 🔴 NO KNOWN LANE DEMANDS AN ACKNOWLEDGEMENT (owner's decision, 2026-08-30).
+//
+// org_app_domain did until it was measured in production: the private half has
+// no call that obtains a Token, so every authorize on the wildcard lane was
+// refused and the lane could not be completed by anyone. See Required's comment.
+func TestNoKnownLaneDemandsAnAcknowledgement(t *testing.T) {
+	for _, l := range []lane.Lane{lane.OrgPlatformDomain, lane.OrgAppDomain, lane.AppDomain} {
+		if Required(l) {
+			t.Errorf("Required(%q) = true, want false", l)
+		}
+	}
+}
+
+// 🔴 THE WILDCARD LANE KEEPS ITS PAGE, AND THAT IS THE POINT OF THE SPLIT.
+//
+// Dropping the requirement must not take the disclosure with it: the page is the
+// only rendering of what a standing wildcard grant is, it is what re-arming
+// would MAC over, and Offer/Redeem are useless without it. A change that made
+// Required return false everywhere AND deleted the page would pass the test
+// above and lose the thing worth keeping.
+func TestOnlyTheWildcardLaneHasAPage(t *testing.T) {
 	for _, tc := range []struct {
 		lane lane.Lane
 		want bool
@@ -65,9 +85,26 @@ func TestRequiredIsTrueOnlyForTheWildcardLane(t *testing.T) {
 		{lane.OrgAppDomain, true},
 		{lane.AppDomain, false},
 	} {
-		if got := Required(tc.lane); got != tc.want {
-			t.Errorf("Required(%q) = %v, want %v", tc.lane, got, tc.want)
+		if got := HasPage(tc.lane); got != tc.want {
+			t.Errorf("HasPage(%q) = %v, want %v", tc.lane, got, tc.want)
 		}
+	}
+}
+
+// 🔴 AN UNRECOGNISED LANE HAS NO PAGE AND IS STILL REQUIRED, SO IT IS BLOCKED.
+//
+// That pairing is the fail-closed property, and it only reads as deliberate if
+// both halves are asserted together: it cannot obtain an acknowledgement it
+// cannot be shown, so a new lane is refused rather than quietly waved through
+// or — worse — shown the wildcard page, which would tell its customer their
+// grant is standing when nobody has decided that.
+func TestAnUnrecognisedLaneIsBlockedRatherThanDescribedWrongly(t *testing.T) {
+	const unknown = lane.Lane("org_something_new")
+	if !Required(unknown) {
+		t.Error("an unrecognised lane must still demand an acknowledgement")
+	}
+	if HasPage(unknown) {
+		t.Error("an unrecognised lane must not be given the wildcard lane's page")
 	}
 }
 

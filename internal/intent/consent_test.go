@@ -21,10 +21,14 @@ func TestLaneTwoIsAuthorizedByAcknowledgingThePageThatWasServed(t *testing.T) {
 	out := h.register(t, lane.OrgAppDomain, testOrg, appParent)
 	h.publishProof(t, out)
 
+	// 🔴 THE LANE NO LONGER DEMANDS THIS, AND THAT IS ASSERTED HERE RATHER THAN
+	// LEFT AS AN ABSENCE. Authorizing with no acknowledgement is the ordinary path
+	// now (consent.Required says why); the ceremony below still has to work,
+	// because it is what re-arming would turn back on.
 	if _, err := h.svc.Authorize(t.Context(), AuthorizeRequest{
 		Registration: out.Registration, CodeChallenge: "chal",
-	}); !errors.Is(err, ErrConsentRequired) {
-		t.Fatalf("want ErrConsentRequired with no acknowledgement, got %v", err)
+	}); err != nil {
+		t.Fatalf("the wildcard lane must authorize without an acknowledgement: %v", err)
 	}
 
 	page, err := h.svc.ConsentPage(t.Context(), out.Registration)

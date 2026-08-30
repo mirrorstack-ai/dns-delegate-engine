@@ -218,20 +218,23 @@ func TestAuthorizeMintsAStateCarryingTheSealedFacts(t *testing.T) {
 	}
 }
 
-// 🔴 The wildcard lane needs this service's own consent page. `*.example.net` is
-// the one grant whose scope a customer cannot enumerate for themselves.
-func TestAuthorizeRefusesTheWildcardLaneWithoutAnAcknowledgedConsentPage(t *testing.T) {
+// 🔴 AN ACKNOWLEDGEMENT IS OPTIONAL NOW, BUT A SUPPLIED ONE IS STILL CHECKED.
+//
+// No lane demands the page any more (consent.Required says why), so authorizing
+// without a token is the ordinary path. The refusals below are the half that did
+// NOT relax: a token for another anchor, or over a reference this service never
+// sealed into this registration, must still be refused — accepting one because
+// none was needed would seal ConsentAck on a value nobody issued, and Complete
+// reads that flag out of the state.
+func TestASuppliedAcknowledgementIsStillVerifiedEvenThoughNoneIsRequired(t *testing.T) {
 	h := newHarness(t)
 	out := h.register(t, lane.OrgAppDomain, testOrg, appParent)
 	h.publishProof(t, out)
 
-	if !consent.Required(lane.OrgAppDomain) {
-		t.Fatal("this test is meaningless if the wildcard lane does not require consent")
-	}
 	if _, err := h.svc.Authorize(t.Context(), AuthorizeRequest{
 		Registration: out.Registration, CodeChallenge: "chal",
-	}); !errors.Is(err, ErrConsentRequired) {
-		t.Fatalf("want ErrConsentRequired with no token, got %v", err)
+	}); err != nil {
+		t.Fatalf("the wildcard lane must authorize with no acknowledgement: %v", err)
 	}
 
 	// The reference the acknowledgement is a MAC over is the REGISTRATION's,
@@ -285,11 +288,16 @@ func TestAuthorizeRefusesTheWildcardLaneWithoutAnAcknowledgedConsentPage(t *test
 	if err != nil || !state.ConsentAck {
 		t.Fatalf("the acknowledgement must be sealed INTO the state: %#v %v", state, err)
 	}
-	// The other two lanes keep the console's screen and owe no acknowledgement.
-	for _, l := range []lane.Lane{lane.OrgPlatformDomain, lane.AppDomain} {
+	// No lane owes an acknowledgement, and only the wildcard one has a page to be
+	// shown. Asserted together because the split between those two questions is
+	// what let the requirement be dropped without losing the disclosure.
+	for _, l := range []lane.Lane{lane.OrgPlatformDomain, lane.OrgAppDomain, lane.AppDomain} {
 		if consent.Required(l) {
 			t.Fatalf("%s must not require this service's consent page", l)
 		}
+	}
+	if !consent.HasPage(lane.OrgAppDomain) {
+		t.Fatal("the wildcard lane must keep its disclosure page so re-arming stays a one-line change")
 	}
 }
 
@@ -1194,11 +1202,20 @@ func TestTheWildcardParentAsksTheEdgeNothingAndABoundAppAsksForItself(t *testing
 	}
 }
 
-// A state minted without the consent page must not complete either. The
-// acknowledgement is sealed INTO the state precisely so a later check can rely
-// on it, and a state written by a build without the gate would otherwise sail
-// straight past Authorize's refusal.
-func TestCompleteRefusesAWildcardStateThatWasNeverAcknowledged(t *testing.T) {
+// 🔴 A WILDCARD STATE WITH NO ACKNOWLEDGEMENT NOW COMPLETES, AND THE RE-CHECK
+// THAT WOULD HAVE REFUSED IT IS DELIBERATELY LEFT IN PLACE.
+//
+// Complete re-reads ConsentAck out of the sealed state so a state minted by a
+// build without the gate cannot sail past Authorize's refusal. That defence is
+// inert while consent.Required answers false for every lane, and it is retained
+// rather than deleted for the same reason Offer/Redeem/Page are: re-arming is
+// meant to be one entry in that switch, and a control removed here would have to
+// be rebuilt and re-argued instead.
+//
+// This test therefore asserts the CURRENT contract — it completes — so that
+// turning the requirement back on fails loudly here rather than silently
+// changing what a customer sees.
+func TestAWildcardStateCompletesWithoutAnAcknowledgement(t *testing.T) {
 	h := newHarness(t)
 	out := h.register(t, lane.OrgAppDomain, testOrg, appParent)
 	h.publishProof(t, out)
@@ -1212,11 +1229,14 @@ func TestCompleteRefusesAWildcardStateThatWasNeverAcknowledged(t *testing.T) {
 	}
 	if _, err := h.svc.Complete(t.Context(), CompleteRequest{
 		State: state, Code: "auth-code", CodeVerifier: "verifier", ExpectDigest: out.Digest,
-	}); !errors.Is(err, ErrConsentRequired) {
-		t.Fatalf("want ErrConsentRequired, got %v", err)
+	}); err != nil {
+		t.Fatalf("an unacknowledged wildcard state must complete: %v", err)
 	}
-	if h.oauth.tokenCalls != 0 {
-		t.Fatal("nothing may be exchanged for an unacknowledged wildcard")
+	// The exchange is the observable half: refusing at the consent gate used to
+	// leave this at zero, so asserting it moved is what distinguishes "completed"
+	// from "returned nil without doing anything".
+	if h.oauth.tokenCalls != 1 {
+		t.Fatalf("the authorization code must have been exchanged, got %d calls", h.oauth.tokenCalls)
 	}
 }
 
