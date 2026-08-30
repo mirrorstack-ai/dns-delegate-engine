@@ -701,8 +701,11 @@ const testConsentReference = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 // listable set. Sealing one on every lane would hide the refusal below.
 func registrationFor(t *testing.T, s *grantcrypto.Sealer, l lane.Lane, anchor string) string {
 	t.Helper()
+	// Mirrors register()'s rule exactly: a lane gets a reference if it has a page
+	// to serve OR an acknowledgement to demand. Mirroring only one half is how this
+	// helper silently stopped minting one for the lane that still has a page.
 	reference := ""
-	if consent.Required(l) {
+	if consent.HasPage(l) || consent.Required(l) {
 		reference = testConsentReference
 	}
 	return sealRegistration(t, s, l, anchor, reference)

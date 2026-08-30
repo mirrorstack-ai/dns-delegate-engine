@@ -102,24 +102,64 @@ const (
 	maxNonce = 128
 )
 
-// Required reports whether a lane needs this service's own consent page. Only
-// org_app_domain does; the package comment says why.
+// Required reports whether a lane needs this service's own consent page. No
+// lane in this build does; see below for why org_app_domain stopped.
 //
-// 🔴 IT IS AN ALLOW-LIST OF THE LANES THAT DO NOT NEED THE PAGE, NOT A TEST FOR
-// THE ONE THAT DOES. A fourth lane would skip the page by default under
-// `l == OrgAppDomain` and demands one by default here; the unfamiliar case has to
-// fail toward asking, because "broader than a list" is the property a new lane is
-// most likely to share. lane.Parse refuses an unrecognised lane long before this
-// is reached; this is what that refusal degrades to if it is moved or forgotten.
-// Page fails closed in the opposite direction, so a new lane is blocked rather
-// than shown a page that lies about it — see the lane check there.
+// 🔴 IT IS STILL AN ALLOW-LIST OF THE LANES THAT DO NOT NEED THE PAGE, NOT A
+// TEST FOR THE ONES THAT DO, and that shape is the reason to edit this list
+// rather than to `return false`. A fourth lane demands a page by default here;
+// the unfamiliar case has to fail toward asking, because "broader than a list"
+// is the property a new lane is most likely to share. lane.Parse refuses an
+// unrecognised lane long before this is reached; this is what that refusal
+// degrades to if it is moved or forgotten. Page fails closed in the opposite
+// direction, so a new lane is blocked rather than shown a page that lies about
+// it — see the lane check there.
+//
+// 🔴 WHY org_app_domain NO LONGER ASKS (owner's decision, 2026-08-30).
+//
+// The page was never served. MirrorStack's private half has no call that
+// obtains a Token: it passes a consentToken it never fills, so EVERY authorize
+// on this lane returned ErrConsentRequired and the wildcard lane could not be
+// completed by anyone, ever. Measured in production on
+// studio-tw.mirrorstack.app — five consecutive attempts, all refused, surfaced
+// to the customer as a 502 with no readable cause.
+//
+// A gate nothing can pass is not a control, it is an outage. The disclosure it
+// was protecting is not lost: the caller's own review dialog lists every record
+// the plan will write, by host, before the customer authorizes anything. What
+// IS lost is this service's independent guarantee that such a screen was
+// actually shown — the page's bytes are MAC-bound here and a caller cannot
+// author an acknowledgement (see Token). That guarantee now rests on the
+// caller.
+//
+// Nothing else about the lane relaxes. The ownership proof still gates
+// Authorize, anchor containment still bounds every write, and the grant is
+// still sealed to the anchor. Re-arming is one entry in this switch, and
+// Offer/Redeem/Page are deliberately left intact so it stays a one-line change
+// rather than a rebuild.
 func Required(l lane.Lane) bool {
 	switch l {
-	case lane.OrgPlatformDomain, lane.AppDomain:
+	case lane.OrgPlatformDomain, lane.AppDomain, lane.OrgAppDomain:
 		return false
 	}
 	return true
 }
+
+// HasPage reports whether a disclosure page EXISTS for a lane, which is a
+// different question from whether an acknowledgement is demanded for it.
+//
+// 🔴 THE TWO WERE ONE PREDICATE AND HAD TO BE SPLIT. While every lane with a
+// page also required it, `Required` could answer both; dropping the requirement
+// for org_app_domain under that shape also took the page away, and the page is
+// the part worth keeping — it is the only rendering of what a standing wildcard
+// grant actually is, it is what re-arming would MAC over, and Offer/Redeem are
+// useless without it.
+//
+// It mirrors render's own lane check rather than deriving from Required, so the
+// page and the gate can move independently. An unrecognised lane has no page
+// here and is still Required above: it cannot obtain an acknowledgement it
+// cannot be shown, so it stays blocked rather than described wrongly.
+func HasPage(l lane.Lane) bool { return l == lane.OrgAppDomain }
 
 // Token is the acknowledgement: an HMAC over the page's reference and the anchor,
 // under this deployment's keyset.
