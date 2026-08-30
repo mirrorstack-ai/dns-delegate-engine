@@ -166,29 +166,46 @@ func TestAPlanThatWouldPublishTheCustomersRecordIsRefused(t *testing.T) {
 // Without a live check the anchor's proof is a fact about the past, and deleting
 // the TXT — the customer's first stop control — would not bound the authority
 // about to be granted.
-func TestAuthorizeRefusesUntilTheProofResolvesRightNow(t *testing.T) {
+// 🔴 THE PROOF DOES NOT GATE Authorize (owner's decision, 2026-08-30). Asserted
+// in all three states it used to refuse in, so restoring the gate fails loudly
+// here rather than silently reinstating a detour the product removed.
+func TestAuthorizeDoesNotWaitForTheProof(t *testing.T) {
 	h := newHarness(t)
 	out := h.register(t, lane.OrgPlatformDomain, testOrg, platformDomain)
 
-	_, err := h.svc.Authorize(t.Context(), AuthorizeRequest{Registration: out.Registration, CodeChallenge: "chal"})
-	if !errors.Is(err, ErrNotProven) {
-		t.Fatalf("want ErrNotProven, got %v", err)
-	}
-
-	h.publishProof(t, out)
+	// Never published.
 	authorized, err := h.svc.Authorize(t.Context(), AuthorizeRequest{Registration: out.Registration, CodeChallenge: "chal"})
 	if err != nil {
-		t.Fatalf("Authorize after the proof landed: %v", err)
+		t.Fatalf("Authorize with no proof published: %v", err)
 	}
 	if authorized.State == "" || !strings.Contains(authorized.AuthorizationURL, "code_challenge=chal") {
 		t.Fatalf("consent URL: %#v", authorized)
 	}
 
-	// And it stops again the moment the proof goes. A registration is not
-	// permanently authorizable because it was authorizable once.
+	// Published.
+	h.publishProof(t, out)
+	if _, err := h.svc.Authorize(t.Context(), AuthorizeRequest{Registration: out.Registration, CodeChallenge: "chal"}); err != nil {
+		t.Fatalf("Authorize after the proof landed: %v", err)
+	}
+
+	// Withdrawn again.
 	h.resolver.remove(proof.Prefix + platformDomain)
-	if _, err := h.svc.Authorize(t.Context(), AuthorizeRequest{Registration: out.Registration, CodeChallenge: "chal"}); !errors.Is(err, ErrNotProven) {
-		t.Fatalf("want ErrNotProven after the proof was withdrawn, got %v", err)
+	if _, err := h.svc.Authorize(t.Context(), AuthorizeRequest{Registration: out.Registration, CodeChallenge: "chal"}); err != nil {
+		t.Fatalf("Authorize after the proof was withdrawn: %v", err)
+	}
+
+	// 🔴 THE RECORD IS STILL DERIVED AND STILL REPORTED. Dropping the refusal
+	// must not drop the row: the customer is still shown what to publish, and
+	// Verify still answers honestly about whether it resolves.
+	v, err := h.svc.Verify(t.Context(), VerifyRequest{Registration: out.Registration})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if v.Verified {
+		t.Fatal("Verify must still report a withdrawn proof as unverified")
+	}
+	if strings.TrimSpace(v.Expected) == "" || strings.TrimSpace(v.Proof.Name) == "" {
+		t.Fatalf("the proof row must still be reported: %#v", v)
 	}
 }
 
@@ -520,7 +537,7 @@ func TestCompletePublishesTheDerivedSetAndHoldsTheGrant(t *testing.T) {
 
 // 🔴 THE CUSTOMER'S STOP CONTROL. Delete the proof and every write stops within
 // one pass, with nothing needing to reach MirrorStack — not even their provider.
-func TestAdvanceWritesNothingWhenTheProofHasBeenDeleted(t *testing.T) {
+func TestAdvanceStillWritesWhenTheProofHasBeenDeleted(t *testing.T) {
 	h := newHarness(t)
 	out := h.register(t, lane.OrgPlatformDomain, testOrg, platformDomain)
 	h.publishProof(t, out)
@@ -534,26 +551,30 @@ func TestAdvanceWritesNothingWhenTheProofHasBeenDeleted(t *testing.T) {
 	}
 	writesBefore, refreshesBefore := h.provider.writes, h.oauth.refreshCalls
 
+	// 🔴 A WITHDRAWN PROOF NO LONGER STOPS THE PASS, and this is the half of the
+	// decision that is easiest to reinstate by accident. Dropping the gate at
+	// Authorize while keeping it here would send the customer to Cloudflare, take
+	// the grant, and then write nothing on every pass — a flow that looks like it
+	// worked and publishes no records.
 	h.resolver.remove(proof.Prefix + platformDomain)
-	stopped, err := h.svc.Advance(t.Context(), AdvanceRequest{Registration: out.Registration, SealedToken: first.SealedToken})
+	second, err := h.svc.Advance(t.Context(), AdvanceRequest{Registration: out.Registration, SealedToken: first.SealedToken})
 	if err != nil {
-		t.Fatalf("a withdrawn proof is an outcome, not an RPC error: %v", err)
+		t.Fatalf("Advance with the proof withdrawn: %v", err)
 	}
-	if stopped.Result != ResultStopped {
-		t.Fatalf("want %q, got %#v", ResultStopped, stopped)
+	if second.Result != ResultPublished {
+		t.Fatalf("want %q with the proof withdrawn, got %#v", ResultPublished, second)
 	}
-	if h.provider.writes != writesBefore {
-		t.Fatalf("a withdrawn proof must write NOTHING: %d writes", h.provider.writes-writesBefore)
+	if h.provider.writes == writesBefore {
+		t.Fatal("the pass must still write; the proof no longer gates it")
 	}
-	if h.oauth.refreshCalls != refreshesBefore {
-		t.Fatal("a withdrawn proof must not even open the grant, let alone reach the provider")
+	if h.oauth.refreshCalls == refreshesBefore {
+		t.Fatal("the pass must still open the grant")
 	}
-	if stopped.Failure == nil || stopped.Failure.Code != FailureProofWithdrawn {
-		t.Fatalf("the reason must be named: %#v", stopped.Failure)
+	// It is reported rather than acted on, so an operator can still see it went.
+	if len(second.Warnings) == 0 {
+		t.Fatal("a withdrawn proof must still be reported in the response")
 	}
-	if stopped.Revoked {
-		t.Fatal("stopping is not revoking — the customer may be fixing a typo, and the grant is theirs to end")
-	}
+	stopped := second
 	// The records are still reported, so the customer can see what would be
 	// written if they republish.
 	if len(stopped.Records) == 0 {

@@ -650,13 +650,35 @@ func (s *Service) Authorize(ctx context.Context, req AuthorizeRequest) (Authoriz
 		return AuthorizeResponse{}, fmt.Errorf("%w: codeChallenge is required", ErrInvalidRequest)
 	}
 
-	check, err := s.checkProof(ctx, reg)
-	if err != nil {
+	// 🔴 THE OWNERSHIP PROOF NO LONGER GATES AUTHORIZE (owner's decision,
+	// 2026-08-30). It is still derived, still returned in every record list, and
+	// still reported by Describe and Verify — it is simply not a refusal.
+	//
+	// It was blocking the flow the product wants: the customer clicks authorize
+	// and reaches Cloudflare's consent screen, rather than being handed a TXT to
+	// publish first and sent away. Every registration went through that detour,
+	// including one whose records this service had already written.
+	//
+	// 🔴 WHAT THIS GIVES UP, PLAINLY. The proof is what bound an ACCOUNT-WIDE
+	// Cloudflare grant to ONE domain. Cloudflare's OAuth scopes are permission
+	// types (zone.read, dns.write) and never resources, so the grant a customer
+	// gives reaches every zone in their account; publishing a MAC only they could
+	// publish is what demonstrated the anchor was theirs before we accepted it.
+	// Without it, the caller's claim about which domain this is stands unchecked
+	// here.
+	//
+	// WHAT STILL HOLDS. Anchor containment is untouched: the engine refuses any
+	// plan naming anything outside the sealed anchor, so a grant still cannot be
+	// turned on a name the registration does not cover. The anchor itself comes
+	// out of an envelope this service sealed and the caller cannot author or edit.
+	// And the customer still authorizes on Cloudflare's own screen, against their
+	// own account.
+	//
+	// The check is still RUN, because Describe/Verify report it and the record
+	// stays in the plan; only the refusal is gone. Re-arming is restoring the
+	// three lines below, here and at both write sites.
+	if _, err := s.checkProof(ctx, reg); err != nil {
 		return AuthorizeResponse{}, err
-	}
-	if !check.published {
-		return AuthorizeResponse{}, fmt.Errorf("%w: publish %s IN TXT %q and try again",
-			ErrNotProven, check.name, check.expected)
 	}
 
 	// The wildcard lane also needs this service's own consent page, because its
@@ -815,8 +837,18 @@ func (s *Service) Complete(ctx context.Context, req CompleteRequest) (PassRespon
 	if warning != "" {
 		out.Warnings = append(out.Warnings, warning)
 	}
+	// 🔴 AN ABSENT PROOF NO LONGER STOPS A PASS, for the reason Authorize gives.
+	//
+	// Dropping the gate there and keeping it here would be the worst of both: the
+	// customer reaches Cloudflare, grants access, and every pass then returns
+	// `stopped` having written nothing — a flow that looks like it worked and
+	// publishes no records. The three gates are one decision.
+	//
+	// The reading is still taken and still reported, so a withdrawn proof is
+	// visible in the response rather than acted on.
 	if check.withdrawn {
-		return stopped(out, check), nil
+		out.Warnings = append(out.Warnings,
+			"the ownership proof is not published at the anchor; publishing anyway because the proof no longer gates a pass")
 	}
 
 	merged, warnings := s.relayInto(ctx, plan)
@@ -892,8 +924,18 @@ func (s *Service) pass(
 	if warning != "" {
 		out.Warnings = append(out.Warnings, warning)
 	}
+	// 🔴 AN ABSENT PROOF NO LONGER STOPS A PASS, for the reason Authorize gives.
+	//
+	// Dropping the gate there and keeping it here would be the worst of both: the
+	// customer reaches Cloudflare, grants access, and every pass then returns
+	// `stopped` having written nothing — a flow that looks like it worked and
+	// publishes no records. The three gates are one decision.
+	//
+	// The reading is still taken and still reported, so a withdrawn proof is
+	// visible in the response rather than acted on.
 	if check.withdrawn {
-		return stopped(out, check), nil
+		out.Warnings = append(out.Warnings,
+			"the ownership proof is not published at the anchor; publishing anyway because the proof no longer gates a pass")
 	}
 
 	merged, warnings := s.relayInto(ctx, plan)
