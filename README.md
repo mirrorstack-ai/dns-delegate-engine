@@ -152,7 +152,7 @@ settles it.
 </tr>
 <tr>
 <td>Can you stop it once you have started?</td>
-<td><strong>Two controls, and one of them does not depend on us.</strong> Revoke at your provider — immediate, and works whether or not we behave. Or delete the ownership TXT: every write stops on the first pass after the deletion is visible in <em>public</em> DNS, which is your record's TTL and then up to one interval plus the jitter. A pass that cannot reach a resolver at all does <strong>not</strong> stop — it publishes and records a warning, because a nameserver failure must not be read as you saying no.</td>
+<td><strong>One control, and it does not depend on us.</strong> Revoke at your provider — immediate, and it works whether or not we behave. 🔴 Deleting the ownership TXT is <em>not</em> a second control any more: this service publishes that record and republishes it if it goes, and no pass is gated on it.</td>
 <td><code>checkProof</code> in <a href="internal/intent/service.go"><code>intent/service.go</code></a>, and <a href="internal/observe/observe.go"><code>observe.go</code></a> on why "unknown" is not "withdrawn"</td>
 </tr>
 <tr>
@@ -274,12 +274,18 @@ Three things about this lane:
   and nothing here refuses a caller that invokes `Advance` in a loop. What you get
   is a published number to hold us to and a change log at your provider to check
   it against — which is worth having, and is not the same as a limit.
-- **The ownership TXT is yours, and it is `derive.SourceCustomer`.** It is
-  computed in [`internal/proof`](internal/proof/proof.go) so we can tell you the
-  exact value, handed to you to publish, and **never published by this service** —
-  the whole plan is refused if that record appears in the publishable set.
-  `IntentAuthorize` then refuses unless it resolves in public DNS at that moment,
-  which is what makes deleting it a control rather than a gesture.
+- 🔴 **The ownership TXT is a MARKER, not a proof, and MirrorStack publishes it.**
+  It is computed in [`internal/proof`](internal/proof/proof.go) — the name still
+  says `challenge` — but it gates nothing: `IntentAuthorize`, `Complete` and
+  `Advance` all run whether or not it resolves, and this service republishes it
+  if you delete it.
+
+  It **was** yours to publish and it **was** the gate. Both changed together, on
+  the owner's decision, because authorize now goes straight to the provider. A
+  self-published marker combined with proof-based authorization would be the
+  original defect — our own write satisfying our own check — so neither half can
+  be restored alone. **Revocation at your DNS provider is the only control that
+  stops us.**
 - **Three records arrive late** because they are answers from AWS and Cloudflare
   that do not exist when you authorize. That is why the credential is held rather
   than spent once, and it is not going to change.
