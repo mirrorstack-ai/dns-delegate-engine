@@ -26,6 +26,10 @@ on:
 permissions:
   id-token: write
   contents: read
+  # attestations: write is what lets actions/attest-build-provenance record a
+  # signed provenance statement against this repository. Without it the step
+  # fails at the API rather than silently skipping.
+  attestations: write
 
 # Serialize publishes so a slow run cannot interleave with the next merge — the
 # SSM pointer must always name a fully-uploaded artifact set.
@@ -95,6 +99,35 @@ jobs:
               exit 1
             fi
           done
+
+      # 🔴 THE CLAIM "THE CODE YOU READ IS THE CODE WE RUN" WAS A PROMISE UNTIL
+      # HERE. This repository is public so a customer can audit what may touch
+      # their DNS — but what actually runs is a private artifact in a private
+      # bucket, and nothing tied the two together. A reader could verify the
+      # source and still not know it was the source that was deployed.
+      #
+      # attest-build-provenance signs a SLSA statement binding this zip's sha256
+      # to this repository, this commit and this workflow, through Sigstore. It
+      # is verifiable by anyone, against public infrastructure, with no access to
+      # our AWS account:
+      #
+      #     gh attestation verify <artifact> --repo mirrorstack-ai/dns-delegate-engine
+      #
+      # BEFORE the upload, deliberately: attesting an artifact we then failed to
+      # upload is harmless, while uploading one we failed to attest is the state
+      # this step exists to prevent.
+      #
+      # 🔴 WHAT IT DOES NOT PROVE, and the honest limit to quote in a security
+      # review: that the Lambda AWS runs IS this artifact. The service reports
+      # its own build commit (see cmd/dns-delegate-api, `build`), and a
+      # determined operator could ship a binary that lies about it. This moves
+      # the attack from "unfalsifiable claim" to "someone deliberately built a
+      # lying artifact", which is a different and much harder thing — not to
+      # zero.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: dist/dns-delegate-api.zip
 
       - name: Upload zips
         run: |
