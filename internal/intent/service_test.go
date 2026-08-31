@@ -83,9 +83,9 @@ func TestRegisteringTouchesNoCredentialAndWritesNothing(t *testing.T) {
 			if out.Lane != string(tc.lane) || out.Anchor != tc.anchor || len(out.Hosts) != tc.hosts {
 				t.Fatalf("lane/anchor/hosts: %#v", out)
 			}
-			if out.Proof.Source != string(derive.SourceCustomer) ||
+			if out.Proof.Source != string(derive.SourceDerived) ||
 				out.Proof.Name != proof.Prefix+tc.anchor || out.Proof.Value == "" {
-				t.Fatalf("the proof must be the CUSTOMER's, at the anchor, with a value: %#v", out.Proof)
+				t.Fatalf("the proof must be derived, at the anchor, with a value: %#v", out.Proof)
 			}
 			// The sealed registration opens, and carries exactly the three facts
 			// every later call is derived from.
@@ -101,7 +101,7 @@ func TestRegisteringTouchesNoCredentialAndWritesNothing(t *testing.T) {
 // defect this rebuild exists to fix: an ownership proof this service publishes
 // itself proves nothing, because the gate on proceeding is a public lookup of
 // that same record.
-func TestTheOwnershipRecordIsNeverInWhatIsPublished(t *testing.T) {
+func TestTheOwnershipRecordIsPublishedWithEverythingElse(t *testing.T) {
 	h := newHarness(t)
 	for _, lane := range []struct {
 		anchor string
@@ -133,10 +133,20 @@ func TestTheOwnershipRecordIsNeverInWhatIsPublished(t *testing.T) {
 		if len(records) == 0 {
 			t.Fatalf("%s derived nothing publishable", lane.anchor)
 		}
+		// 🔴 INVERTED WITH THE GATE. This asserted the proof was ABSENT from the
+		// publishable set, which was right while it was the customer's to publish
+		// and satisfying it with our own write would have proved nothing. The
+		// proof gates nothing now, so a row nobody writes is a manual step for no
+		// effect — a two-record plan published one, measured on
+		// studio.mirrorstack.app. It must be published like any other row.
+		found := false
 		for _, record := range records {
 			if record.Name == proof.Prefix+lane.anchor {
-				t.Fatalf("%s: the ownership proof is in the publishable set: %#v", lane.anchor, record)
+				found = true
 			}
+		}
+		if !found {
+			t.Fatalf("%s: the ownership proof must be in the publishable set: %v", lane.anchor, records)
 		}
 	}
 }
@@ -519,14 +529,21 @@ func TestCompletePublishesTheDerivedSetAndHoldsTheGrant(t *testing.T) {
 	if pass.GrantSeconds != 86400 {
 		t.Fatalf("lane 1 holds for 24 hours, got %d seconds", pass.GrantSeconds)
 	}
-	// Four routing CNAMEs and four DCV pointers; no ownership TXT.
-	if len(pass.Published) != 8 {
-		t.Fatalf("want 8 published identities, got %d: %v", len(pass.Published), pass.Published)
+	// The ownership TXT, four routing CNAMEs and four DCV pointers.
+	if len(pass.Published) != 9 {
+		t.Fatalf("want 9 published identities, got %d: %v", len(pass.Published), pass.Published)
 	}
+	// 🔴 THE PROOF REACHES THE PROVIDER NOW, and this assertion is inverted
+	// rather than deleted: it was the guard that the row stayed the customer's,
+	// and it is now the guard that a plan claiming to publish it actually does.
+	reachedProvider := false
 	for _, name := range h.provider.created {
 		if strings.HasPrefix(name, proof.Prefix) {
-			t.Fatalf("the ownership proof reached the provider: %q", name)
+			reachedProvider = true
 		}
+	}
+	if !reachedProvider {
+		t.Fatalf("the ownership proof must reach the provider: %v", h.provider.created)
 	}
 	// The sealed grant opens only under this registration.
 	reg := h.open(t, out.Registration)
@@ -1141,8 +1158,8 @@ func TestRelayedRecordsArePublishedWithoutMovingTheReviewedDigest(t *testing.T) 
 		t.Fatalf("the reviewable digest must not move: %#v", pass)
 	}
 	// 8 derived + 1 ACM + 2 serving proofs.
-	if len(pass.Published) != 11 {
-		t.Fatalf("want 11 published identities, got %d: %v", len(pass.Published), pass.Published)
+	if len(pass.Published) != 12 {
+		t.Fatalf("want 12 published identities, got %d: %v", len(pass.Published), pass.Published)
 	}
 
 	// 🔴 cdn is never asked of the certificate authority: the CDN worker
@@ -1190,7 +1207,7 @@ func TestARelayFailureWarnsAndStillPublishesWhatIsDerived(t *testing.T) {
 	if err != nil {
 		t.Fatalf("an unreadable upstream must not fail the pass: %v", err)
 	}
-	if pass.Result != ResultPublished || len(pass.Published) != 8 {
+	if pass.Result != ResultPublished || len(pass.Published) != 9 {
 		t.Fatalf("the derived records must still publish: %#v", pass)
 	}
 	if len(pass.Warnings) != 2 {

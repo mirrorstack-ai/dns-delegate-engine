@@ -129,15 +129,24 @@ func render(p derive.Plan, nonce, challenge string) (string, error) {
 
 	// The ownership row is required because the page's first stop control names it:
 	// "delete this record and every write stops". Without it the customer is handed
-	// a control they cannot find, and its source must be the customer — the
-	// sentence would be false of a row we publish.
+	// a control they cannot find.
 	if ownership == nil {
 		return "", fmt.Errorf("%w: the plan carries no ownership proof, so the page cannot name what to delete", ErrConsent)
 	}
-	if ownership.Source != derive.SourceCustomer {
-		return "", fmt.Errorf("%w: the ownership proof is marked %q rather than %q, and a proof we publish is not a stop control",
-			ErrConsent, lane.Echo(string(ownership.Source)), derive.SourceCustomer)
-	}
+	// 🔴 ITS SOURCE IS NO LONGER ASSERTED, AND THE STOP CONTROL IT DESCRIBED IS
+	// NO LONGER REAL. This refused anything but SourceCustomer, on the correct
+	// reasoning that a proof we publish ourselves is not evidence and deleting a
+	// row we would just rewrite is not a control.
+	//
+	// Both halves went with the gate: the proof stopped gating Authorize,
+	// Complete and Advance, and the row became ours to publish (see
+	// derive.ownershipItem). Keeping the assertion would refuse to render the
+	// page at all for every plan this build derives — measured as a 404 on the
+	// consent route — which is a worse answer than a page whose deletion
+	// sentence has been corrected.
+	//
+	// writerWord still reports who writes it, so the page tells the truth about
+	// the row either way; re-arming the gate must restore this check with it.
 	// The wildcard is the grant: present, ours to write, and AT THIS ANCHOR — the
 	// page names it in its heading, so a plan with some other routing name would be
 	// consented to under a description of a name it does not contain. A per-app

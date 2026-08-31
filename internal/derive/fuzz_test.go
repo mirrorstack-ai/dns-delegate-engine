@@ -198,9 +198,12 @@ func FuzzEveryDerivedPlanIsSafe(f *testing.F) {
 				continue
 			}
 			ownership++
-			if item.Source != SourceCustomer {
-				t.Fatalf("the ownership proof for %q is sourced %q, and a proof we write ourselves proves nothing",
-					fuzzEcho(plan.Anchor), item.Source)
+			// The SOURCE is no longer asserted: the row is ours to publish now that it
+			// gates nothing (see derive.ownershipItem). That it is derived exactly ONCE
+			// still is — two rows at one owner is a conflict no pass can resolve.
+			if item.Record.Type != "TXT" {
+				t.Fatalf("the ownership proof for %q is a %q record, want TXT",
+					fuzzEcho(plan.Anchor), item.Record.Type)
 			}
 		}
 		if ownership != 1 {
