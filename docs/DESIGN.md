@@ -479,13 +479,19 @@ having been thought of.
 
 ## 6 · What lands in your zone
 
-Record 1 is the one that changed hands: the record-list surface wrote it itself,
-which is the second defect in §1. [`RECORDS.md`](RECORDS.md) gives every row,
-per lane.
+🔴 **Record 1 changed hands twice, and it is ours again.** The record-list
+surface wrote it itself, which is the second defect in §1; the intent surface
+made it the customer's and gated every write on it; and it is now published by
+this service and gates nothing, because authorize goes straight to the provider.
+
+The name still says `challenge`. It is a marker: it identifies the domain as
+registered here, and deleting it stops nothing — see [`RECORDS.md`](RECORDS.md),
+which gives every row per lane, and note that revocation at the provider is now
+the only control.
 
 | # | name | type | value | lane | written by |
 |---|---|---|---|---|---|
-| 1 | `_mirrorstack-challenge.<anchor>` | TXT | `HMAC(K, lane‖id‖anchor)` | all three | 🔴 **you, by hand** |
+| 1 | `_mirrorstack-challenge.<anchor>` | TXT | `HMAC(K, lane‖id‖anchor)` | all three | this service — a marker, not a proof |
 | 2 | `account api apps cdn .<anchor>` | CNAME | the org routing target | 1 | this service |
 | 3 | `*.<anchor>` | CNAME | the app routing target | 2 | this service |
 | 4 | `<hostname>` | CNAME | the app routing target | 3 | this service |
@@ -574,22 +580,19 @@ you proved.
 
 ## 8 · What you can stop, and what you cannot
 
-Two controls, and both are yours alone.
+🔴 **One control, and it is yours alone.** There were two. Deleting the
+ownership record is no longer one of them.
 
-**Delete the ownership proof.** Every write from this service stops on the
-first pass after the deletion becomes visible in public DNS — your record's TTL,
-then up to one interval plus the jitter, which is five minutes and one more with
-the numbers this build declares. Nothing needs to reach MirrorStack for it to
-take effect.
+**Deleting the ownership marker stops nothing.** It was the second control, and
+the reasoning was sound while the record was yours to publish and every write was
+gated on it. Neither is true now: this service publishes that record, republishes
+it if it goes, and `Authorize`, `Complete` and `Advance` all run whether or not it
+resolves. `checkProof` still reads it and still reports what it saw — the reading
+travels in the response as a warning — but nothing acts on it.
 
-🔴 **A pass that cannot reach a resolver at all does not stop.** It publishes,
-and records a warning. That is deliberate and it is the one place in this
-repository where a failure does not fail closed: folding "I could not look" into
-"you deleted it" would let a nameserver blip on our side release a live
-credential and strand a working domain, so the stop is on an **answer** — the
-name resolved and the proof was not among its values — never on the absence of
-one. `internal/intent`'s `checkProof` is where that asymmetry lives, in about
-five lines, and it is worth reading before you rely on this control.
+That is a real reduction, and naming it is the point of this section: a control
+that no longer works is worse than one that never existed, because you would plan
+around it.
 
 **Revoke at your provider.** Works whether or not we cooperate, takes effect
 immediately, and returns you to the manual path above rather than breaking the
