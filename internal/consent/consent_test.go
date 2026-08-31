@@ -675,10 +675,11 @@ func TestPageRefusesRowsItCannotHonestlyShow(t *testing.T) {
 			i[1].Record.Value = "192.0.2.1"
 			return i
 		})},
-		{"a proxied record", mutate(func(i []derive.Item) []derive.Item {
-			i[1].Record.Proxied = true
-			return i
-		})},
+		// 🔴 "a proxied record" WAS HERE AND IS GONE. Page refused every proxied
+		// row, which 404'd the consent page for exactly the MirrorStack-owned
+		// exempt anchors whose routing must be orange (core-v2#1022). A proxied
+		// row is now SHOWN, with a Proxy column saying so —
+		// TestThePageRendersAProxiedPlanAndSaysWhichRowsAreProxied covers it.
 		{"a record with no value", mutate(func(i []derive.Item) []derive.Item {
 			i[0].Record.Value = ""
 			return i
@@ -805,5 +806,54 @@ func TestARefusalDoesNotQuoteBackAnUnboundedValue(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "truncated") {
 		t.Errorf("the refusal does not say it truncated: %v", err)
+	}
+}
+
+// 🔴 THE PAGE MUST RENDER FOR THE PLANS IT DESCRIBES, AND SAY WHAT THEY DO.
+//
+// Page refused every proxied row, so a Registration for an exempt
+// MirrorStack-owned anchor — whose routing rows must be orange, because the
+// routing target is itself proxied and a grey record beside it answers 526 —
+// could not pass into ConsentPage at all. The dispatcher maps that refusal to a
+// 404, so the consent page was unreachable for exactly the class the proxy
+// change existed to repair (core-v2#1022).
+//
+// Dropping the refusal is only half the fix. The other half is disclosure: a
+// customer consenting to a table that does not say which rows Cloudflare
+// terminates is agreeing to something the page did not tell them.
+func TestThePageRendersAProxiedPlanAndSaysWhichRowsAreProxied(t *testing.T) {
+	items := []derive.Item{
+		{
+			Record: dnsplan.Record{
+				Type: "TXT", Name: "_mirrorstack-challenge." + fixtureAnchor, Value: "msv1-x",
+			},
+			Purpose: derive.PurposeOwnership,
+			Source:  derive.SourceDerived,
+			Explain: "marks the domain as registered",
+		},
+		{
+			Record: dnsplan.Record{
+				Type: "CNAME", Name: "*." + fixtureAnchor,
+				Value: "connect.mirrorstack.app", Proxied: true,
+			},
+			Purpose: derive.PurposeRouting,
+			Source:  derive.SourceDerived,
+			Host:    "*." + fixtureAnchor,
+			Explain: "routes every app you deploy",
+		},
+	}
+	plan := derive.Plan{
+		Lane: lane.OrgAppDomain, Anchor: fixtureAnchor,
+		Hosts: []string{"*." + fixtureAnchor}, Items: items,
+	}
+	page, err := Page(plan, fixtureNonce)
+	if err != nil {
+		t.Fatalf("a proxied plan must render: %v", err)
+	}
+	if !strings.Contains(page, "Proxied (Cloudflare terminates it)") {
+		t.Error("the page must say which rows Cloudflare terminates")
+	}
+	if !strings.Contains(page, "DNS only") {
+		t.Error("the page must distinguish the rows Cloudflare does not terminate")
 	}
 }

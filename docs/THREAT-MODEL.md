@@ -183,13 +183,16 @@ What it does not close, at any threshold:
 - **An on-path attacker at our own egress**, who rewrites every vantage point's
   traffic alike.
 
-One direction is deliberately not hardened: agreement that the proof is **gone**
-is still absence, and still stops every write. Your stop control must not need a
-quorum to work.
+🔴 **This section describes a control that no longer exists.** The ownership
+record stopped gating publication, and MirrorStack publishes it (see
+`docs/RECORDS.md`), so deleting it stops nothing and the readings above are
+reported rather than acted on.
 
-There is a second, milder version of the same thing: we see what public DNS
-*serves*, which can lag your deletion by the record's TTL. So "deleting the proof
-stops every write" is bounded below by a number you chose, not by us.
+The stop control is now revocation at your DNS provider: it takes effect
+immediately, needs no quorum, needs no lookup to succeed, and does not depend on
+MirrorStack cooperating — which are the properties this section was written to
+guarantee. They are stronger there than they ever were here, because they do not
+rest on a reading of public DNS at all.
 
 ### We assume your DNS provider enforces the scope it showed you
 

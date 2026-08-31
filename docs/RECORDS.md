@@ -169,24 +169,25 @@ Identical in both lanes, so described once.
 
 ### ownership · `_mirrorstack-challenge.<anchor>` TXT
 
-Proves the domain is yours. Everything downstream is gated on it: no custom
-hostname is created until a public lookup returns the token, and no certificate
-record can exist before a custom hostname does.
+Marks the domain as registered with MirrorStack.
 
-**Written by you.** The surface this replaced wrote it itself, which is the whole
-point of the rebuild: a proof we write ourselves proves nothing.
+🔴 **It is not a proof, and it does not gate anything.** It was both, and the
+history matters because the name still says `challenge`: the value is a MAC over
+(lane, identity, anchor), it used to be yours to publish, and `Authorize`,
+`Complete` and `Advance` all refused without it.
 
-**It is a stop control.** Delete it and every write from this service stops on
-the first pass after the deletion is visible in public DNS
-— your record's TTL, then up to one interval plus the jitter, which is five
-minutes and one more with the numbers this build declares. Nothing has to reach
-MirrorStack for that to take effect, and nobody has to agree to it.
+**Written by MirrorStack.** Published with the rest of the plan, and republished
+on a later pass if you delete it.
 
-The limit, stated because it is the interesting case: **a pass that cannot reach
-a resolver at all does not stop.** It publishes and records a warning. A
-nameserver failure must not be read as you saying no — otherwise a blip on our
-side would release a live credential and strand a working domain — so the stop
-is on an answer, never on the absence of one.
+🔴 **It is NOT a stop control.** Deleting it stops nothing — publication
+continues whether or not it resolves. To stop MirrorStack writing to your zone,
+revoke the credential at your DNS provider; that is the only control that works,
+it takes effect immediately, and it does not need us to cooperate.
+
+Both halves changed together, deliberately. A self-published marker combined
+with proof-based authorization would be the original defect — our own write
+satisfying our own check — so the gate went when the authorship did. Restoring
+either without the other is the one change this record must never take.
 
 **Retained.** Nothing in this service deletes a record, this one included.
 

@@ -123,6 +123,7 @@ func render(p derive.Plan, nonce, challenge string) (string, error) {
 			Type:    item.Record.Type,
 			Value:   item.Record.Value,
 			Writer:  writerWord(item.Source),
+			Proxy:   proxyWord(item.Record.Proxied),
 			Explain: item.Explain,
 		})
 	}
@@ -212,13 +213,23 @@ func checkItem(anchor string, item derive.Item) error {
 		return fmt.Errorf("%w: %q has no explanation to show, and an unexplained row is not consented to",
 			ErrConsent, lane.Echo(record.Name))
 	}
-	if record.Proxied {
-		// There is no column for this, and adding one would document a capability
-		// this service does not have: a customer-zone record is never proxied (see
-		// derive.routingItem).
-		return fmt.Errorf("%w: %q is marked proxied, and a customer-zone record never is",
-			ErrConsent, lane.Echo(record.Name))
-	}
+	// 🔴 A PROXIED ROW IS SHOWN, NOT REFUSED — AND THE PAGE SAYS WHICH IT IS.
+	//
+	// This refused every proxied row on the reasoning that a customer-zone record
+	// is never proxied. That is still true of a CUSTOMER's zone, and derive keeps
+	// enforcing it there. It stopped being true of ours: a routing row under an
+	// exempt MirrorStack suffix must be orange, because the routing target is
+	// itself proxied and a grey record beside it answers 526.
+	//
+	// So this refusal made the consent page 404 for exactly the
+	// studio.mirrorstack.app / studio-tw.mirrorstack.app class the proxy change
+	// existed to repair — a page that cannot render for the plans it describes.
+	// Reported on core-v2#1022.
+	//
+	// The honest fix is disclosure, not silence: proxyWord puts the value in the
+	// table so a customer reads which rows Cloudflare terminates. Refusing to
+	// render was never a control — derive.checkItem is the gate, and it bounds
+	// proxied to our own zones.
 	if !dnsplan.Contains(anchor, record.Name) {
 		// Both sentinels: a caller checking this package keeps one answer, and an
 		// operator grepping for every containment failure finds this one too. A page
@@ -262,11 +273,34 @@ type pageData struct {
 // says what the row is for in words a person can act on, and a one-word category
 // beside it is what a reader would skim to instead.
 type pageRow struct {
-	Name    string
-	Type    string
-	Value   string
-	Writer  string
+	Name   string
+	Type   string
+	Value  string
+	Writer string
+	// Proxy is what Cloudflare's own UI calls the orange cloud, in words.
+	//
+	// 🔴 IT EXISTS BECAUSE THE PAGE STOPPED REFUSING PROXIED ROWS. checkItem
+	// used to reject them outright, which meant the disclosure never had to
+	// mention proxying — and when routing under our own suffixes had to go
+	// orange, that refusal 404'd the page for exactly those plans
+	// (core-v2#1022). Dropping the refusal without adding this column would
+	// have removed a control and disclosed nothing in its place: a customer
+	// would consent to a table that does not say which rows Cloudflare
+	// terminates and reads their traffic at.
+	Proxy   string
 	Explain string
+}
+
+// proxyWord states whether Cloudflare terminates a row, in the words its own
+// dashboard uses. "DNS only" is spelled out rather than left blank: a blank cell
+// in a consent table reads as "not applicable", and the difference between a
+// record Cloudflare terminates and one it merely answers is the whole of what a
+// customer is agreeing to here.
+func proxyWord(proxied bool) string {
+	if proxied {
+		return "Proxied (Cloudflare terminates it)"
+	}
+	return "DNS only"
 }
 
 // writerWord answers the only question anybody asks about an unfamiliar row in
@@ -383,9 +417,10 @@ write belong to apps that have not been created, so a window that closed would
 mean every future deployment on this domain needing a manual DNS step, forever.</p>
 
 <p>That is the trade, and it is the thing to think hardest about on this page.
-It ends when you revoke at your DNS provider, when you delete the ownership proof
-named below, or when MirrorStack releases it — which it does when this domain is
-removed. What it does not do is end on a clock.</p>
+It ends when you revoke at your DNS provider, or when MirrorStack releases it —
+which it does when this domain is removed. What it does not do is end on a clock,
+and deleting the ownership marker below does NOT end it either: that record is
+published by MirrorStack and no longer gates anything.</p>
 
 <h2>What the credential can reach</h2>
 
@@ -432,12 +467,12 @@ as it does today, and anything you add later takes precedence over it.</li>
 
 <div class="scroll">
 <table>
-<tr><th>Record</th><th>Type</th><th>Value</th><th>Written by</th></tr>
+<tr><th>Record</th><th>Type</th><th>Value</th><th>Written by</th><th>Proxy</th></tr>
 {{range .Rows}}<tr>
 <td class="mono">{{.Name}}</td>
 <td>{{.Type}}</td>
 <td class="mono">{{.Value}}</td>
-<td>{{.Writer}}</td>
+<td>{{.Writer}}</td><td>{{.Proxy}}</td>
 </tr>
 <tr class="why"><td colspan="4">{{.Explain}}</td></tr>
 {{end}}</table>
@@ -477,7 +512,7 @@ still works; you add them by hand.</p>
 
 <h2>What you can stop, and how</h2>
 
-<p><strong>Delete the ownership proof.</strong> This record, in your zone:</p>
+<p><strong>The ownership marker.</strong> This record, in your zone:</p>
 
 <div class="scroll">
 <table>
@@ -486,10 +521,15 @@ still works; you add them by hand.</p>
 </table>
 </div>
 
-<p>MirrorStack cannot publish that record — a proof we wrote ourselves would
-prove nothing — and it is re-checked on every pass. Delete it and every write
-from this service stops within one pass. Nothing needs to reach MirrorStack for
-that to take effect, and nobody here can undo it.</p>
+<p><strong>MirrorStack publishes that record for you, and deleting it does not
+stop anything.</strong> It marks this domain as registered here; it is not a
+proof, it does not gate publication, and this service will keep writing the
+records below whether or not it is present. If you delete it, MirrorStack will
+publish it again on a later pass.</p>
+
+<p>It used to be the stop control, and it is not any more. To actually stop
+MirrorStack writing to this zone, use the revocation below — that is now the
+only control that works.</p>
 
 <p><strong>Revoke at your DNS provider.</strong> This works whether or not
 MirrorStack cooperates, takes effect immediately, and does not break your domain:
