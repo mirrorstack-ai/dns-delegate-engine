@@ -1017,35 +1017,51 @@ func TestValidateLaneRefusesAnUnusableIdentifier(t *testing.T) {
 	}
 }
 
-// 🔴 PROXIED IS DECIDED BY SUFFIX, SO SUFFIX CONFUSION IS THE FAILURE TO PIN.
+// 🔴 PROXIED IS DECIDED BY THE LANE'S OWN ZONE, AND EVERY WRONG ANSWER IS
+// SILENT IN PRODUCTION.
 //
-// Both wrong answers are silent. A customer name matched as ours would be
-// published orange into THEIR zone, flattened at their edge, and fail at a
-// renewal months later with every dashboard green. One of ours matched as a
-// customer's is published grey beside a proxied target and answers 526.
+// A customer name matched as ours is published orange into THEIR zone, flattened
+// at their edge, and fails at a renewal months later with every dashboard green.
+// One of ours matched as a customer's is published grey beside a proxied target
+// and answers 526.
 //
-// `notmirrorstack.ai` and `mirrorstack.ai.evil.com` are the two shapes a naive
+// And the case that actually broke: a CROSS-ZONE name — ours, but in the other
+// lane's zone. platform.mirrorstack.app is an app-zone name on the ORG lane; its
+// records live in mirrorstack.app while its custom hostnames live in
+// mirrorstack.ai, so proxying it in mirrorstack.app reaches an origin that zone
+// has no certificate for. Measured live 2026-08-31: 526 orange, 404 grey.
+//
+// notmirrorstack.ai and mirrorstack.ai.evil.com are the two shapes a
 // strings.Contains or a missing dot separator would admit.
-func TestProxyRoutingMatchesOurZonesAndNothingThatMerelyLooksLikeThem(t *testing.T) {
+func TestProxyRoutingIsDecidedByTheLanesOwnZone(t *testing.T) {
 	c := Config{
 		ReservedSuffixes: []string{"mirrorstack.ai", "mirrorstack.app"},
 		OrgRoutingTarget: testOrgTarget,
 		AppRoutingTarget: testAppTarget,
 	}
 	for _, tc := range []struct {
+		lane   lane.Lane
 		anchor string
 		want   bool
 	}{
-		{"studio-tw.mirrorstack.app", true},
-		{"studio.mirrorstack.ai", true},
-		{"mirrorstack.ai", true},
-		{"example.com", false},
-		{"notmirrorstack.ai", false},
-		{"mirrorstack.ai.evil.com", false},
-		{"", false},
+		// Same zone as the lane's routing target — orange.
+		{lane.OrgPlatformDomain, "studio.mirrorstack.ai", true},
+		{lane.OrgAppDomain, "studio-tw.mirrorstack.app", true},
+		{lane.AppDomain, "app.mirrorstack.app", true},
+
+		// 🔴 CROSS-ZONE: ours, but the OTHER lane's zone. Orange here is the 526.
+		{lane.OrgPlatformDomain, "platform.mirrorstack.app", false},
+		{lane.OrgAppDomain, "app.mirrorstack.ai", false},
+
+		// Customer domains, and names that merely look like ours.
+		{lane.OrgPlatformDomain, "example.com", false},
+		{lane.OrgAppDomain, "shop.example.com", false},
+		{lane.OrgPlatformDomain, "notmirrorstack.ai", false},
+		{lane.OrgPlatformDomain, "mirrorstack.ai.evil.com", false},
+		{lane.OrgPlatformDomain, "", false},
 	} {
-		if got := c.proxyRouting(tc.anchor); got != tc.want {
-			t.Errorf("proxyRouting(%q) = %v, want %v", tc.anchor, got, tc.want)
+		if got := c.proxyRouting(tc.lane, tc.anchor); got != tc.want {
+			t.Errorf("proxyRouting(%s, %q) = %v, want %v", tc.lane, tc.anchor, got, tc.want)
 		}
 	}
 }

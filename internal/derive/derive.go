@@ -489,33 +489,62 @@ func validateTarget(what, env, target string) error {
 // hardcoded MirrorStack suffixes. Only ever called after Validate, which is what
 // guarantees neither target is empty here; an empty entry would make
 // lane.ValidateDomain refuse every domain.
-// proxyRouting reports whether a routing record for this anchor belongs to one
-// of MIRRORSTACK's zones, and must therefore be published proxied.
+// proxyRouting reports whether a routing record for this anchor may be published
+// proxied: only when the anchor sits in THIS LANE'S OWN zone.
 //
-// 🔴 IT IS EXACTLY THE RESERVED-SUFFIX TEST, WHICH IS WHY IT NEEDS NO NEW
-// CONFIGURATION. A name under a reserved suffix is one this service would refuse
-// outright — the proof would be published BY US and prove nothing — and reaches
-// derivation only through an explicit staging exemption. So "was admitted only
-// because it is ours" and "is inside our zone" are the same fact, already
-// spelled once, and a third list to keep in step would be a third thing to drift.
+// 🔴 "OURS" IS NOT THE QUESTION — "THE SAME ZONE AS THIS LANE'S CUSTOM
+// HOSTNAMES" IS. This tested the anchor against every reserved suffix, so an
+// anchor in EITHER of our zones went orange on either lane. That is wrong for a
+// cross-zone name, and it took production down.
+//
+// Measured 2026-08-31 on platform.mirrorstack.app — an app-zone name registered
+// on the ORG lane. Its DNS records live in mirrorstack.app; its CF-for-SaaS
+// custom hostnames live in mirrorstack.ai. Proxied in mirrorstack.app, that zone
+// terminates the request knowing nothing of the SaaS hostname in the other zone,
+// goes straight to the CNAME target as an origin, and answers 526. Grey worked
+// precisely because resolution then followed the CNAME INTO mirrorstack.ai,
+// where the custom hostname matches and the edge certificate exists.
+//
+// So the anchor and the lane's routing target must sit in the same zone. The
+// target already names that zone — no new configuration, and nothing to keep in
+// step beyond what routingItem is handed anyway.
 //
 // A customer domain matches nothing here and stays grey, which is the answer
 // that must not be got wrong: the failure is silent and arrives at a renewal.
-func (c Config) proxyRouting(anchor string) bool {
+func (c Config) proxyRouting(l lane.Lane, anchor string) bool {
 	anchor = dnsplan.NormalizeName(anchor)
-	if anchor == "" {
+	target := dnsplan.NormalizeName(c.routingTargetFor(l))
+	if anchor == "" || target == "" {
 		return false
 	}
-	for _, entry := range c.reserved() {
-		suffix := dnsplan.NormalizeName(entry)
-		if suffix == "" {
+	// ReservedSuffixes, not reserved(): the routing TARGETS are in that wider
+	// list, and a target is not a zone. Asking whether the anchor sits under
+	// `connect.mirrorstack.ai` would answer false for every real anchor.
+	for _, entry := range c.ReservedSuffixes {
+		zone := dnsplan.NormalizeName(entry)
+		if zone == "" {
 			continue
 		}
-		if anchor == suffix || strings.HasSuffix(anchor, "."+suffix) {
+		under := func(name string) bool {
+			return name == zone || strings.HasSuffix(name, "."+zone)
+		}
+		if under(target) && under(anchor) {
 			return true
 		}
 	}
 	return false
+}
+
+// routingTargetFor is the target THIS lane's routing records point at, and so
+// names the zone this lane's custom hostnames live in. Mirrors DCVUUID's shape
+// for the reason stated there: both answer "which of the two zones is this lane
+// in?", and two functions disagreeing about that is the bug class the per-zone
+// split exists to prevent.
+func (c Config) routingTargetFor(l lane.Lane) string {
+	if l == lane.OrgPlatformDomain {
+		return c.OrgRoutingTarget
+	}
+	return c.AppRoutingTarget
 }
 
 func (c Config) reserved() []string {
@@ -566,7 +595,7 @@ func (c Config) Registration(l lane.Lane, identity, anchor, proofValue string) (
 	// Decided ONCE, from the anchor, and applied to every routing record in the
 	// plan: the siblings of one registration are all in the same zone, so a
 	// per-host answer could only ever disagree with itself.
-	proxied := c.proxyRouting(anchor)
+	proxied := c.proxyRouting(parsed, anchor)
 	hosts := parsed.Hosts(anchor)
 	if len(hosts) == 0 {
 		// Unreachable today, and retained: it is the guard a fourth lane added to
@@ -672,7 +701,7 @@ func (c Config) BindApp(parentAnchor, slug string) (Plan, error) {
 	}
 	// BindApp derives only a DCV pointer, which is grey on every zone — the flag
 	// is passed for the gate's sake, not because this plan can use it.
-	return newPlan(lane.OrgAppDomain, anchor, []string{host}, []Item{item}, c.proxyRouting(anchor))
+	return newPlan(lane.OrgAppDomain, anchor, []string{host}, []Item{item}, c.proxyRouting(lane.OrgAppDomain, anchor))
 }
 
 const (
