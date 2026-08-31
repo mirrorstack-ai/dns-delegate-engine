@@ -967,9 +967,25 @@ func TestTheGatewayServesTheConsentPathAndProbesEverythingElse(t *testing.T) {
 
 	// 🔴 Unchanged for every other path: the probe answers 200 without touching
 	// the dispatcher, whatever stage or base path infra puts in front of it.
+	//
+	// It now also carries the build commit, and THIS is the copy that reaches a
+	// customer: every production request arrives through API Gateway and lands
+	// here, not on httpHandler's mux. Stamping only the mux left the public
+	// probe answering a bare {"ok":true}, which was caught in production on v9.
+	// The commit is what makes the published provenance checkable — see
+	// docs/THREAT-MODEL.md — so asserting its presence is asserting that the
+	// claim is testable at all.
+	//
+	// The body is matched by CONTENT rather than as a literal, because the
+	// commit is "unknown" in a test binary and a real sha in a released one, and
+	// pinning the literal would make this test assert the build system instead
+	// of the handler.
 	probe := gatewayCall(t, d, "GET", "/dns-delegate/healthz", "", "")
-	if probe["statusCode"] != http.StatusOK || probe["body"] != `{"ok":true}` {
-		t.Fatalf("the health probe must keep its static answer, got %#v", probe)
+	probeBody, _ := probe["body"].(string)
+	if probe["statusCode"] != http.StatusOK ||
+		!strings.Contains(probeBody, `"ok":true`) ||
+		!strings.Contains(probeBody, `"commit":`) {
+		t.Fatalf("the health probe must answer statically and name its build, got %#v", probe)
 	}
 	// 🔴 And on the transport a real customer arrives over, the page is reachable
 	// with no internal secret at all — the whole point of removing the gate. The
