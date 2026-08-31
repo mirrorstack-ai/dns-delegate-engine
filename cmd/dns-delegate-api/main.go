@@ -564,7 +564,19 @@ type gatewayRequest struct {
 // mux pattern here cannot know it.
 func (d *dispatcher) serveGateway(ctx context.Context, req gatewayRequest) map[string]any {
 	if d.web == nil || !strings.HasSuffix(req.RawPath, consentPath) {
-		return gatewayResponse(http.StatusOK, http.Header{"Content-Type": {"application/json"}}, `{"ok":true}`)
+		// 🔴 THE COMMIT GOES HERE TOO, AND THIS IS THE COPY THAT REACHES A
+		// CUSTOMER. The mux handler in httpHandler answers direct HTTP; every
+		// request that arrives through API Gateway — which is every production
+		// request — lands on this branch instead. Stamping only the other one
+		// left the public probe answering a bare {"ok":true}, so the build a
+		// customer is checking was still unreadable to them. Caught in
+		// production on v9, after the change was verified in the wrong place.
+		//
+		// Built with fmt rather than a struct so this stays the static answer
+		// its comment above promises: no dispatcher, no service, nothing that
+		// can fail. commit is a build-time constant.
+		return gatewayResponse(http.StatusOK, http.Header{"Content-Type": {"application/json"}},
+			fmt.Sprintf(`{"ok":true,"commit":%q}`, commit))
 	}
 	body := []byte(req.Body)
 	if req.IsBase64Encoded {
