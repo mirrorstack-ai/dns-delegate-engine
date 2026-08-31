@@ -489,6 +489,35 @@ func validateTarget(what, env, target string) error {
 // hardcoded MirrorStack suffixes. Only ever called after Validate, which is what
 // guarantees neither target is empty here; an empty entry would make
 // lane.ValidateDomain refuse every domain.
+// proxyRouting reports whether a routing record for this anchor belongs to one
+// of MIRRORSTACK's zones, and must therefore be published proxied.
+//
+// 🔴 IT IS EXACTLY THE RESERVED-SUFFIX TEST, WHICH IS WHY IT NEEDS NO NEW
+// CONFIGURATION. A name under a reserved suffix is one this service would refuse
+// outright — the proof would be published BY US and prove nothing — and reaches
+// derivation only through an explicit staging exemption. So "was admitted only
+// because it is ours" and "is inside our zone" are the same fact, already
+// spelled once, and a third list to keep in step would be a third thing to drift.
+//
+// A customer domain matches nothing here and stays grey, which is the answer
+// that must not be got wrong: the failure is silent and arrives at a renewal.
+func (c Config) proxyRouting(anchor string) bool {
+	anchor = dnsplan.NormalizeName(anchor)
+	if anchor == "" {
+		return false
+	}
+	for _, entry := range c.reserved() {
+		suffix := dnsplan.NormalizeName(entry)
+		if suffix == "" {
+			continue
+		}
+		if anchor == suffix || strings.HasSuffix(anchor, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c Config) reserved() []string {
 	out := make([]string, 0, len(c.ReservedSuffixes)+2)
 	out = append(out, c.ReservedSuffixes...)
@@ -534,6 +563,10 @@ func (c Config) Registration(l lane.Lane, identity, anchor, proofValue string) (
 	if err := c.ValidateLane(parsed); err != nil {
 		return Plan{}, err
 	}
+	// Decided ONCE, from the anchor, and applied to every routing record in the
+	// plan: the siblings of one registration are all in the same zone, so a
+	// per-host answer could only ever disagree with itself.
+	proxied := c.proxyRouting(anchor)
 	hosts := parsed.Hosts(anchor)
 	if len(hosts) == 0 {
 		// Unreachable today, and retained: it is the guard a fourth lane added to
@@ -557,7 +590,7 @@ func (c Config) Registration(l lane.Lane, identity, anchor, proofValue string) (
 		for _, host := range hosts {
 			items = append(items, routingItem(host, c.OrgRoutingTarget, fmt.Sprintf(
 				"Points %s at MirrorStack. This is the only record here a browser follows, so deleting it takes that hostname down immediately.",
-				host)))
+				host), proxied))
 		}
 		for _, host := range hosts {
 			item, err := dcvItem(parsed, host, c.DCVUUID(parsed))
@@ -573,7 +606,7 @@ func (c Config) Registration(l lane.Lane, identity, anchor, proofValue string) (
 		// Each app's pointer is minted per app, at deploy time, by BindApp.
 		items = append(items, routingItem(hosts[0], c.AppRoutingTarget, fmt.Sprintf(
 			"Routes every app you deploy at <app>.%s through MirrorStack. A wildcard answers only names your zone holds no record of its own for, so everything you already publish keeps resolving exactly as it does today; deleting it takes every app on this domain down at once.",
-			anchor)))
+			anchor), proxied))
 
 	case lane.AppDomain:
 		// The anchor itself is the host — the tightest of the three lanes, nothing
@@ -583,7 +616,7 @@ func (c Config) Registration(l lane.Lane, identity, anchor, proofValue string) (
 		// provider rather than being pre-judged here.
 		items = append(items, routingItem(anchor, c.AppRoutingTarget, fmt.Sprintf(
 			"Points %s at MirrorStack. This is the only record here a browser follows, so deleting it takes the site down immediately.",
-			anchor)))
+			anchor), proxied))
 		item, err := dcvItem(parsed, anchor, c.DCVUUID(parsed))
 		if err != nil {
 			return Plan{}, err
@@ -591,7 +624,7 @@ func (c Config) Registration(l lane.Lane, identity, anchor, proofValue string) (
 		items = append(items, item)
 	}
 
-	return newPlan(parsed, anchor, hosts, items)
+	return newPlan(parsed, anchor, hosts, items, proxied)
 }
 
 // BindApp derives what ONE app owes under an org app domain, at deploy time.
@@ -637,7 +670,9 @@ func (c Config) BindApp(parentAnchor, slug string) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
-	return newPlan(lane.OrgAppDomain, anchor, []string{host}, []Item{item})
+	// BindApp derives only a DCV pointer, which is grey on every zone — the flag
+	// is passed for the gate's sake, not because this plan can use it.
+	return newPlan(lane.OrgAppDomain, anchor, []string{host}, []Item{item}, c.proxyRouting(anchor))
 }
 
 const (
@@ -730,27 +765,56 @@ func ownershipItem(anchor, value string) (Item, error) {
 			Proxied: false,
 		},
 		Purpose: PurposeOwnership,
-		Source:  SourceCustomer,
-		Host:    "",
+		// 🔴 THIS ROW IS OURS TO PUBLISH NOW, AND ONLY BECAUSE IT GATES NOTHING.
+		//
+		// It was SourceCustomer, and the reasoning was sound while the proof was a
+		// GATE: a proof we publish ourselves is satisfied by our own write and
+		// demonstrates nothing, so the one thing this service must not do is write
+		// it. Authorize, Complete and Advance all refused without it.
+		//
+		// None of them refuse any more. With the gate gone the row became the worst
+		// of both: nobody wrote it, nothing read it, and a customer who had already
+		// authorized was handed one record to publish by hand for no effect —
+		// measured on studio.mirrorstack.app, where a two-record plan published one.
+		//
+		// So it is derived and published like any other row. It still names the
+		// anchor and still identifies the domain in a zone somebody inherits; it is
+		// simply no longer evidence, and the Explain below must not claim it is.
+		//
+		// 🔴 RE-ARMING MEANS RESTORING BOTH HALVES. Putting the gate back while
+		// this stays SourceDerived is the original defect exactly: our own write
+		// satisfying our own check.
+		Source: SourceDerived,
+		Host:   "",
 		Explain: fmt.Sprintf(
-			"Proves you control %s. MirrorStack cannot publish this one — a proof we write ourselves proves nothing — and deleting it stops every write from this service within one pass.",
+			"Identifies %s as registered with MirrorStack. Published for you along with the rest of the plan; safe to keep, and safe to delete once the domain is serving.",
 			anchor),
 	}, nil
 }
 
 // routingItem is records 2, 3 and 4: the CNAME that carries traffic for one name.
 //
-// 🔴 Proxied IS FALSE ON EVERY RECORD THIS PACKAGE DERIVES, AND IT IS NOT AN
-// UNCONSIDERED DEFAULT. The proxy decision belongs to MirrorStack's private half
-// and applies only inside MirrorStack's own zones. A record in a CUSTOMER's zone
-// flipped to proxied would be flattened at THEIR edge: the name answers with
-// addresses instead of following the delegation, the request never reaches our
-// zone, and issuance — or a renewal months later — fails with every dashboard on
-// both sides green. Cloudflare accepts `proxied: true` here without an error,
-// which is what makes it silent rather than a rejected write.
-func routingItem(host, target, explain string) Item {
+// 🔴 THE PROXY DECISION IS PER ZONE, AND BOTH ANSWERS ARE WRONG IN THE OTHER'S
+// PLACE. It is passed in rather than defaulted because there is no safe default:
+//
+//   - In a CUSTOMER's zone it must be GREY. Proxied there is flattened at THEIR
+//     edge: the name answers with addresses instead of following the delegation,
+//     the request never reaches our zone, and issuance — or a renewal months
+//     later — fails with every dashboard on both sides green. Cloudflare accepts
+//     `proxied: true` without an error, which is what makes it silent rather
+//     than a rejected write.
+//
+//   - In one of OUR OWN zones it must be ORANGE. The routing target is itself
+//     proxied, so a grey record beside it is the in-zone grey shape that answers
+//     526 — measured on the org lane, and again on studio-tw.mirrorstack.app
+//     after this package started deriving the flag and hardcoded the customer
+//     answer for both.
+//
+// Cloudflare Support settled the shape on 2026-08-24: DNS-only in a customer's
+// zone, proxied in ours. See Config.proxyRouting for how the two are told apart.
+func routingItem(host, target, explain string, proxied bool) Item {
 	return Item{
-		Record:  dnsplan.Record{Type: "CNAME", Name: host, Value: target, Proxied: false},
+		Record:  dnsplan.Record{Type: "CNAME", Name: host, Value: target, Proxied: proxied},
 		Purpose: PurposeRouting,
 		Source:  SourceDerived,
 		// A routing record serves the name it IS.
@@ -804,9 +868,9 @@ func dcvItem(l lane.Lane, host, uuid string) (Item, error) {
 // two packages later names only the symptom. dnsplan's copy is the boundary a
 // hostile caller cannot get past; this copy tells whoever broke it what they
 // broke.
-func newPlan(l lane.Lane, anchor string, hosts []string, items []Item) (Plan, error) {
+func newPlan(l lane.Lane, anchor string, hosts []string, items []Item, proxyAllowed bool) (Plan, error) {
 	for _, item := range items {
-		if err := checkItem(anchor, item); err != nil {
+		if err := checkItem(anchor, item, proxyAllowed); err != nil {
 			return Plan{}, err
 		}
 	}
@@ -815,7 +879,7 @@ func newPlan(l lane.Lane, anchor string, hosts []string, items []Item) (Plan, er
 
 // checkItem re-derives, from the finished record, every property this package
 // claims about what it produces.
-func checkItem(anchor string, item Item) error {
+func checkItem(anchor string, item Item, proxyAllowed bool) error {
 	record := item.Record
 	// The vocabulary is closed: CNAME and TXT. No A, AAAA, MX, NS or CAA, ever.
 	// An A record points a customer's hostname at an address outliving any
@@ -840,7 +904,20 @@ func checkItem(anchor string, item Item) error {
 		// name digest differently on the next pass.
 		return fmt.Errorf("%w: derived a name that is not normalized: %q", ErrDerive, lane.Echo(record.Name))
 	}
-	if record.Proxied {
+	// 🔴 PROXIED IS ALLOWED IN OUR OWN ZONES AND NOWHERE ELSE, and this gate is
+	// what keeps that from becoming "allowed everywhere".
+	//
+	// It refused every proxied record, which was right while the only zone a plan
+	// could name was a customer's. Staging exemptions admit names inside
+	// mirrorstack.ai and mirrorstack.app, and those must be ORANGE — the routing
+	// target is itself proxied, so a grey record beside it answers 526.
+	//
+	// The predicate is the anchor's, not the record's, and it is re-derived here
+	// rather than trusted from the caller: checkItem is the last gate before a
+	// plan leaves this package, and a gate that believes the value it is checking
+	// is not one. A proxied record under a customer anchor is still refused, which
+	// is the failure that matters — it is silent, and arrives at a renewal.
+	if record.Proxied && !proxyAllowed {
 		return fmt.Errorf("%w: derived a proxied record for %q, and a customer-zone record is never proxied",
 			ErrDerive, lane.Echo(record.Name))
 	}

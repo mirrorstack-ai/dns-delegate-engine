@@ -60,28 +60,37 @@ func TestTheReviewableSetIsExactlyWhatTheDigestBinds(t *testing.T) {
 	}
 }
 
-// 🔴 AND IT IS A STRICT SUBSET OF Records, WHICH IS THE WHOLE REASON IT EXISTS.
+// 🔴 REVIEWABLE NOW EQUALS Records, AND THE OWNERSHIP ROW IS IN BOTH.
 //
-// Records carries the ownership proof — the customer's to publish, never ours to
-// write — so a caller binding to Records would compare against a row whose value
-// this service recomputes and which can never match what a console rendered from
-// its own derivation.
-func TestTheReviewableSetExcludesWhatTheCustomerPublishes(t *testing.T) {
+// It was a STRICT subset, because Records carried the ownership proof and that
+// row was the customer's to publish. Both halves changed with the gate: the
+// proof stopped gating Authorize, Complete and Advance, so a row nobody writes
+// and nothing reads is a manual step for no effect, and derive.ownershipItem
+// publishes it like any other.
+//
+// What must still hold is that the customer reviews EVERYTHING this service
+// writes. Reviewing fewer rows than are published is the defect the equality
+// catches — the set is what Complete's digest binds.
+func TestTheReviewableSetIsEverythingThisServiceWrites(t *testing.T) {
 	h := newHarness(t)
 	out := h.register(t, lane.OrgPlatformDomain, testOrg, platformDomain)
 
-	if len(out.Reviewable) >= len(out.Records) {
-		t.Fatalf("reviewable (%d) must be smaller than records (%d): the ownership proof is not ours to write",
+	if len(out.Reviewable) != len(out.Records) {
+		t.Fatalf("reviewable (%d) must equal records (%d): everything derived is written",
 			len(out.Reviewable), len(out.Records))
 	}
+	seen := false
 	for _, id := range out.Reviewable {
 		rec, ok := recordFromIdentity(id)
 		if !ok {
 			t.Fatalf("malformed identity %q", id)
 		}
 		if rec.Name == proofName(t, out) {
-			t.Fatal("the ownership proof must never appear in the set this service binds itself to writing")
+			seen = true
 		}
+	}
+	if !seen {
+		t.Fatal("the ownership proof must appear in the set this service binds itself to writing")
 	}
 }
 

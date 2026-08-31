@@ -651,10 +651,12 @@ func TestPageRefusesRowsItCannotHonestlyShow(t *testing.T) {
 		{"no wildcard, so no standing grant to describe", mutate(func(i []derive.Item) []derive.Item { return i[:1] })},
 		{"two ownership proofs", mutate(func(i []derive.Item) []derive.Item { return append(i, ownership()) })},
 		{"two routing records", mutate(func(i []derive.Item) []derive.Item { return append(i, routing()) })},
-		{"an ownership proof this service would publish", mutate(func(i []derive.Item) []derive.Item {
-			i[0].Source = derive.SourceDerived
-			return i
-		})},
+		// 🔴 "an ownership proof this service would publish" WAS HERE AND IS GONE.
+		// It asserted Page refused a derived ownership row, which was right while
+		// the row was a stop control the customer published. It is ours to write
+		// now (derive.ownershipItem), so every plan this build derives would trip
+		// it and the page would 404 for all of them. Restoring the gate must
+		// restore this case with it.
 		{"a wildcard the customer publishes", mutate(func(i []derive.Item) []derive.Item {
 			i[1].Source = derive.SourceCustomer
 			return i

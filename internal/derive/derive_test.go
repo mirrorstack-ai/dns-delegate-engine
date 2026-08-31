@@ -146,7 +146,7 @@ func TestLaneOnePlanIsExactlyThisRecordSet(t *testing.T) {
 		t.Fatalf("Registration: %v", err)
 	}
 	assertPlan(t, plan, []row{
-		{"TXT", "_mirrorstack-challenge.example.com", testProof, PurposeOwnership, SourceCustomer, ""},
+		{"TXT", "_mirrorstack-challenge.example.com", testProof, PurposeOwnership, SourceDerived, ""},
 
 		{"CNAME", "account.example.com", testOrgTarget, PurposeRouting, SourceDerived, "account.example.com"},
 		{"CNAME", "api.example.com", testOrgTarget, PurposeRouting, SourceDerived, "api.example.com"},
@@ -191,7 +191,7 @@ func TestLaneTwoPlanIsExactlyThisRecordSet(t *testing.T) {
 		t.Fatalf("Registration: %v", err)
 	}
 	assertPlan(t, plan, []row{
-		{"TXT", "_mirrorstack-challenge.example.net", testProof, PurposeOwnership, SourceCustomer, ""},
+		{"TXT", "_mirrorstack-challenge.example.net", testProof, PurposeOwnership, SourceDerived, ""},
 		{"CNAME", "*.example.net", testAppTarget, PurposeRouting, SourceDerived, "*.example.net"},
 	})
 	for _, item := range plan.Items {
@@ -210,7 +210,7 @@ func TestLaneThreePlanIsExactlyThisRecordSet(t *testing.T) {
 		t.Fatalf("Registration: %v", err)
 	}
 	assertPlan(t, plan, []row{
-		{"TXT", "_mirrorstack-challenge.example.org", testProof, PurposeOwnership, SourceCustomer, ""},
+		{"TXT", "_mirrorstack-challenge.example.org", testProof, PurposeOwnership, SourceDerived, ""},
 		{"CNAME", "example.org", testAppTarget, PurposeRouting, SourceDerived, "example.org"},
 		{"CNAME", "_acme-challenge.example.org",
 			"example.org." + testUUID + ".dcv.cloudflare.com",
@@ -300,7 +300,7 @@ func TestTheRecordVocabularyIsClosed(t *testing.T) {
 		err := checkItem(orgAnchor, Item{
 			Record:  dnsplan.Record{Type: forbidden, Name: "account." + orgAnchor, Value: testOrgTarget},
 			Purpose: PurposeRouting, Source: SourceDerived, Explain: "x",
-		})
+		}, false)
 		assertRefused(t, err, "checkItem type "+forbidden)
 	}
 }
@@ -321,29 +321,42 @@ func TestNothingDerivedIsProxied(t *testing.T) {
 	err := checkItem(orgAnchor, Item{
 		Record:  dnsplan.Record{Type: "CNAME", Name: "account." + orgAnchor, Value: testOrgTarget, Proxied: true},
 		Purpose: PurposeRouting, Source: SourceDerived, Explain: "x",
-	})
+	}, false)
 	assertRefused(t, err, "checkItem proxied")
 }
 
-// 🔴 THE SPLIT IS THE SAFETY PROPERTY. The ownership proof is the customer's to
-// publish, and a plan that handed it to a provider would return this design to
-// the defect it was built to close: a proof satisfied by our own write.
-func TestOwnershipIsTheCustomersAndIsNeverPublishable(t *testing.T) {
+// 🔴 THE OWNERSHIP ROW IS PUBLISHED BY US NOW, and this test is the record of
+// the trade rather than of the old property.
+//
+// It asserted the opposite — customer-sourced, absent from Publishable(), the
+// only entry in Manual() — and that was right while the proof was a GATE: a
+// proof satisfied by our own write demonstrates nothing. The gate is gone from
+// Authorize, Complete and Advance, and a row nobody writes and nothing reads is
+// a manual step for no effect: a two-record plan published one.
+//
+// So it must be publishable, and Manual() must be EMPTY — a customer who has
+// authorized is asked for nothing. Re-arming the gate must restore both halves
+// together, or our own write satisfies our own check.
+func TestOwnershipIsPublishedWithTheRestOfThePlan(t *testing.T) {
 	for name, plan := range everyPlan(t) {
 		for _, item := range plan.Items {
 			if item.Purpose != PurposeOwnership {
 				continue
 			}
-			if item.Source != SourceCustomer {
-				t.Fatalf("%s: the ownership proof is sourced %q", name, item.Source)
+			if item.Source != SourceDerived {
+				t.Fatalf("%s: the ownership proof is sourced %q, want %q", name, item.Source, SourceDerived)
 			}
+			found := false
 			for _, record := range plan.Publishable() {
 				if record.Name == item.Record.Name {
-					t.Fatalf("%s: the ownership record %q is in Publishable()", name, record.Name)
+					found = true
 				}
 			}
-			if manual := plan.Manual(); len(manual) != 1 || manual[0].Record != item.Record {
-				t.Fatalf("%s: Manual() = %v, want exactly the ownership record", name, manual)
+			if !found {
+				t.Fatalf("%s: the ownership record %q must be in Publishable()", name, item.Record.Name)
+			}
+			if manual := plan.Manual(); len(manual) != 0 {
+				t.Fatalf("%s: Manual() = %v, want nothing left for the customer to publish", name, manual)
 			}
 		}
 	}
@@ -755,7 +768,7 @@ func TestTheGuardsRefuseADerivationBug(t *testing.T) {
 		Record:  dnsplan.Record{Type: "CNAME", Name: "account." + orgAnchor, Value: testOrgTarget},
 		Purpose: PurposeRouting, Source: SourceDerived, Explain: "x",
 	}
-	if err := checkItem(orgAnchor, ok); err != nil {
+	if err := checkItem(orgAnchor, ok, false); err != nil {
 		t.Fatalf("the well-formed item was refused: %v", err)
 	}
 
@@ -788,11 +801,11 @@ func TestTheGuardsRefuseADerivationBug(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			item := ok
 			breakIt(&item)
-			assertRefused(t, checkItem(orgAnchor, item), "checkItem")
+			assertRefused(t, checkItem(orgAnchor, item, false), "checkItem")
 			// And newPlan refuses the whole plan rather than dropping the row:
 			// a silently omitted record is a hostname that never serves, with
 			// nothing anywhere saying why.
-			plan, err := newPlan(lane.OrgPlatformDomain, orgAnchor, nil, []Item{ok, item})
+			plan, err := newPlan(lane.OrgPlatformDomain, orgAnchor, nil, []Item{ok, item}, false)
 			assertRefused(t, err, "newPlan")
 			if len(plan.Items) != 0 {
 				t.Fatalf("a refused newPlan returned %d records", len(plan.Items))
@@ -1001,5 +1014,38 @@ func TestValidateLaneRefusesAnUnusableIdentifier(t *testing.T) {
 				t.Fatal("Registration derived a plan under an unusable identifier")
 			}
 		})
+	}
+}
+
+// 🔴 PROXIED IS DECIDED BY SUFFIX, SO SUFFIX CONFUSION IS THE FAILURE TO PIN.
+//
+// Both wrong answers are silent. A customer name matched as ours would be
+// published orange into THEIR zone, flattened at their edge, and fail at a
+// renewal months later with every dashboard green. One of ours matched as a
+// customer's is published grey beside a proxied target and answers 526.
+//
+// `notmirrorstack.ai` and `mirrorstack.ai.evil.com` are the two shapes a naive
+// strings.Contains or a missing dot separator would admit.
+func TestProxyRoutingMatchesOurZonesAndNothingThatMerelyLooksLikeThem(t *testing.T) {
+	c := Config{
+		ReservedSuffixes: []string{"mirrorstack.ai", "mirrorstack.app"},
+		OrgRoutingTarget: testOrgTarget,
+		AppRoutingTarget: testAppTarget,
+	}
+	for _, tc := range []struct {
+		anchor string
+		want   bool
+	}{
+		{"studio-tw.mirrorstack.app", true},
+		{"studio.mirrorstack.ai", true},
+		{"mirrorstack.ai", true},
+		{"example.com", false},
+		{"notmirrorstack.ai", false},
+		{"mirrorstack.ai.evil.com", false},
+		{"", false},
+	} {
+		if got := c.proxyRouting(tc.anchor); got != tc.want {
+			t.Errorf("proxyRouting(%q) = %v, want %v", tc.anchor, got, tc.want)
+		}
 	}
 }
