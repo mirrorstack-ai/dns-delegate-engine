@@ -630,8 +630,31 @@ func (d *dispatcher) httpHandler(secret string) http.Handler {
 	mux := http.NewServeMux()
 	// Unauthenticated on purpose: a liveness probe that needs a credential
 	// cannot report that the credential is missing.
+	// 🔴 THE COMMIT IS PUBLISHED HERE BECAUSE THIS IS THE ONE PROBE A CUSTOMER
+	// CAN REACH, AND IT IS WHAT MAKES THE REPOSITORY CHECKABLE.
+	//
+	// This repository is public so a customer can audit what may touch their
+	// DNS. What runs is a private artifact in a private bucket, so reading the
+	// source proved nothing about the deployment: "the code you read is the code
+	// we run" was a promise with no way to test it.
+	//
+	// With .github/workflows/publish.yml attesting each artifact through
+	// Sigstore, this line closes the loop — a customer reads the commit here,
+	// verifies its provenance against GitHub, and reads that exact source. All
+	// three steps are on public infrastructure and need nothing from us:
+	//
+	//     curl https://account.<domain>/dns-consent/healthz
+	//     gh attestation verify <artifact> --repo mirrorstack-ai/dns-delegate-engine
+	//
+	// The RPC Health action already reported it, but that surface is behind the
+	// internal secret — visible to MirrorStack, which is the party a customer is
+	// checking, and therefore the one place it was worth nothing.
+	//
+	// It is a build stamp and nothing else: no configuration, no zone, no
+	// identity, no state. "unknown" means a binary built outside the publish
+	// workflow, which is itself the answer to "is this a release build?".
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		httputil.WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		httputil.WriteJSON(w, http.StatusOK, map[string]string{"ok": "true", "commit": commit})
 	})
 	// 🔴 THE CONSENT PAGE IS THE ONE ROUTE OUTSIDE THE GATE, AND IT IS AN
 	// EXCEPTION RATHER THAN A RELAXATION. Everything else on this transport —

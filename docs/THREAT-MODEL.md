@@ -225,6 +225,89 @@ let anyone take a domain; it lets them make a proof that only you could satisfy.
 
 ---
 
+## Why we hold access to your whole Cloudflare account
+
+You will notice this on the consent screen, and it is the right thing to notice.
+
+🔴 **Cloudflare's OAuth scopes are permission TYPES, never resources.** `dns.write`
+means "DNS writes", not "DNS writes on example.com". There is no zone-scoped
+OAuth grant to ask for — only API *tokens* can be restricted to a zone, and
+tokens have no consent flow. So the grant you give reaches, in principle, every
+zone in the account you authorized. We cannot narrow it by asking differently.
+
+What actually bounds it is four things, and three of them are not our promises:
+
+1. **Cloudflare bounds it to the account you chose.** `FindZone` resolves the
+   zone through YOUR token — see `internal/provider/cloudflare`, which walks the
+   hostname's parents until an authorized zone answers. A name outside the
+   granting account has no authorized zone, so there is nothing to write into.
+   That is Cloudflare's enforcement, not ours.
+
+2. **The anchor bounds it to one domain.** Every write is refused unless the name
+   is at or under the anchor sealed into the registration — `internal/derive`,
+   and again at the publish boundary in `internal/dnsplan`. The seal is under a
+   key MirrorStack's private half does not hold, so it cannot author or edit one.
+
+3. **You saw the anchor before you authorized.** The console names the domain and
+   lists every record it will write, and the digest of that list is what
+   `Complete` refuses to run without. If the domain on that screen was not yours,
+   the answer was to cancel.
+
+4. **Nothing is ever deleted.** `internal/reconcile` creates and patches; it has
+   no delete path. So the worst outcome of a mistake is extra records you can see
+   and remove.
+
+**The residual, stated plainly.** MirrorStack's private half chooses the anchor.
+Combined with (1), a bug there could target the wrong zone — but only one of YOUR
+zones, inside the account you already authorized, writing records you can see and
+delete. It cannot reach another customer, and it cannot reach an account you did
+not grant.
+
+That used to be narrower: an ownership proof you published, which this service
+could not write, was checked before any authorization was minted. It is gone —
+see `RECORDS.md` — and this section is what remains in its place.
+
+**If that is not enough for you, it does not have to be.** Put the delegated
+domain in a Cloudflare account of its own: account-wide is then zone-wide, the
+consent screen lets you pick which account, and nothing above changes.
+
+## How to check that the code you are reading is the code we run
+
+Everything above is a claim about source you can read. What touches your DNS is a
+compiled artifact in a private bucket, so until you can tie the two together, all
+of it reduces to trusting us — which is the opposite of why this repository is
+public.
+
+Three steps, all on public infrastructure, none of them needing anything from
+MirrorStack:
+
+```
+# 1. ask the running service which build it is
+curl https://account.<your-org-domain>/dns-consent/healthz
+    -> {"ok":"true","commit":"<sha>"}
+
+# 2. verify that artifact was built from this repository, at that commit
+gh attestation verify <artifact> --repo mirrorstack-ai/dns-delegate-engine
+
+# 3. read that exact commit
+git -C dns-delegate-engine show <sha>
+```
+
+Step 2 works because `.github/workflows/publish.yml` records a Sigstore-signed
+SLSA provenance statement binding each artifact's SHA-256 to this repository,
+this commit and that workflow, before the artifact is uploaded.
+
+🔴 **The limit, stated so a reviewer does not have to find it.** This proves the
+artifact was built from the source, and that the service reports that commit. It
+does NOT prove the Lambda AWS runs is that artifact — the build stamp is
+self-reported, and an operator determined to lie could ship a binary that lies.
+What it removes is the *unfalsifiable* version of the claim: a lie now requires
+deliberately building and deploying a divergent artifact, rather than merely
+saying something untrue about code nobody could match to a deployment.
+
+If `commit` reads `unknown`, the binary was not built by the publish workflow and
+nothing above applies to it.
+
 ## What we do NOT defend against, and will not claim to
 
 - **A withheld request.** The private half can always simply decline to advance
