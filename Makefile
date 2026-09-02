@@ -1,4 +1,4 @@
-.PHONY: build lint test test-race dev fmt check
+.PHONY: build lint sec test test-race dev fmt check
 
 # Build every package.
 build:
@@ -20,8 +20,19 @@ test-race:
 fmt:
 	gofmt -w .
 
+# Security analysis (gosec, through golangci-lint so //nolint:gosec is honoured).
+# Same linter and same version CI pins; see .golangci.yml for what is excluded.
+# It fails rather than skips when the tool is absent: a security check that
+# quietly does nothing is the failure this gate exists to prevent.
+sec:
+	@command -v golangci-lint >/dev/null 2>&1 || { \
+		echo "golangci-lint not found. Install v2.13.2 to match CI:"; \
+		echo "  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2"; \
+		exit 1; }
+	golangci-lint run ./...
+
 # What CI runs, in the order CI runs it.
-check: lint build test-race
+check: lint sec build test-race
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...
 
 # Local HTTP transport on :8093. MS_INTERNAL_SECRET gates every route except

@@ -1,0 +1,72 @@
+version: "2"
+
+run:
+  # 🔴 TEST FILES ARE EXEMPT; NOTHING THAT SHIPS IS.
+  #
+  # Test code is not deployed. gosec on a _test.go file reports reading a
+  # fixture by path and ignoring an error in a table-driven case — neither is a
+  # property of the binary a customer's zone is exposed to, and a gate that
+  # fails on them trains people to ignore it.
+  #
+  # This exempts ONLY files ending _test.go. internal/testsupport and
+  # internal/testsupport/derivefixture are ordinary packages, they are still
+  # analysed, and they are not excluded by path below — they had no findings, so
+  # there was nothing to decide about them. If one ever appears there, fix it or
+  # justify it; do not add a path exclusion to make it go away.
+  tests: false
+
+# Security analysis for a repository whose whole purpose is to be read.
+#
+# This repository is PUBLIC, and its README settles "could MirrorStack break our
+# website?" by pointing at code rather than at a support reply. GitHub provides
+# code scanning free on a public repository — and this one had never turned any
+# on. A public claim with no automated analysis behind it is the weakest link in
+# that story, so this is the first such analysis the repository owns.
+#
+# gosec runs THROUGH golangci-lint rather than standalone, for one specific
+# reason: standalone gosec does not honour `//nolint:gosec`, so it would report
+# annotated sites as new findings and make the gate unpassable for no reason.
+# This tree carries such annotations (internal/shared/auth, and the two added
+# alongside this file). Run `golangci-lint run` locally, or `make sec`.
+#
+# 🔴 THE GATE BLOCKS, AND THE TREE IS CLEAN SO THAT IT CAN. There is no
+# continue-on-error on the CI step. A check nobody has to pass is not a control.
+linters:
+  default: none
+  enable:
+    - gosec
+
+  settings:
+    gosec:
+      excludes:
+        # G101 "Potential hardcoded credentials" matches IDENTIFIER NAMES
+        # against a word list, not the VALUES assigned to them. Enumerated
+        # rather than described, because "they're all fine" is the sentence this
+        # repository exists to not accept. Three kinds, and nothing else:
+        #
+        #   - Constants holding the NAME of an environment variable a secret is
+        #     read from at runtime, in internal/shared/cfedge/loader.go,
+        #     internal/shared/cfoauth/loader.go and
+        #     internal/shared/grantcrypto/loader.go. The name is the string; the
+        #     secret is what the loader fetches with it.
+        #   - The HTTP header name in internal/shared/auth/internal_secret.go,
+        #     which carries its own //nolint:gosec.
+        #   - Cloudflare's published OAuth endpoint URLs in
+        #     internal/shared/cfoauth/cfoauth.go, matched because the struct
+        #     field is called TokenURL. A documented third-party URL.
+        #
+        # No secret VALUE is a literal anywhere in this repository, and none may
+        # become one: everything sensitive arrives from the environment or from
+        # a secrets manager, through those loaders.
+        #
+        # 🔴 WHAT WOULD MAKE THIS EXCLUSION WRONG: G101 changing to inspect the
+        # assigned VALUE rather than the identifier name. Then it would start
+        # finding the thing it is named for, and excluding it would hide a
+        # committed credential in a repository the whole internet can read.
+        #
+        # 🔴 THE HIT SET IS VERSION-DEPENDENT, SO RE-READ IT ON EVERY BUMP. The
+        # gosec inside golangci-lint v2.13.2 finds three of the six above; a
+        # newer standalone gosec finds all six. A bump therefore changes which
+        # sites this line is speaking for, and the list above has to be re-walked
+        # rather than assumed to still be complete.
+        - G101

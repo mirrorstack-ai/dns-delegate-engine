@@ -42,6 +42,31 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Security analysis. This repository is PUBLIC and settles "could
+      # MirrorStack break our website?" by inviting people to read the code —
+      # and until this step it had no automated analysis of any kind, on a
+      # platform that offers it free to exactly this class of repository. A
+      # public security claim with nothing checking it is the weakest part of
+      # the claim.
+      #
+      # gosec runs through golangci-lint rather than standalone so that the
+      # `//nolint:gosec` annotations in the tree are honoured — standalone gosec
+      # ignores them and would report annotated sites as new. See .golangci.yml
+      # for what is excluded and why, and for what would make each exclusion
+      # wrong.
+      #
+      # 🔴 NO continue-on-error, DELIBERATELY. The tree is clean as of this
+      # step's first run, so this blocks from the start. A gate that reports a
+      # failure nobody has to fix teaches people that a red security check is
+      # normal, which is worse than not having one.
+      #
+      # Pinned to a full commit SHA and allowlisted at the org: a moving tag is
+      # rejected by the org's action policy, so `@v9` here would not run at all.
+      - name: Security analysis (gosec)
+        uses: golangci/golangci-lint-action@d583c34f0599d37dbac4a198b9c83201be380893 # v9.3.0
+        with:
+          version: v2.13.2
+
       - name: Build
         run: go build ./...
 

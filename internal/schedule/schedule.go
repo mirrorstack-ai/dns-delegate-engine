@@ -251,6 +251,19 @@ func (c Cadence) Spread(key string) time.Duration {
 	}
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(key)) // hash.Hash.Write never returns an error
+	// 🔴 G115 (uint64 -> int64) IS BOUNDED BY THE `c.Jitter <= 0` RETURN ABOVE,
+	// four lines up, and by nothing else — do not move it or delete it. Past that
+	// guard c.Jitter is a POSITIVE time.Duration, so uint64(c.Jitter) is its exact
+	// value in [1, MaxInt64]; a modulo by it lands in [0, MaxInt64-1], which is
+	// representable as an int64 with a value to spare. The conversion cannot
+	// truncate and cannot go negative.
+	//
+	// That is the same fact as this function's stated invariant — "the result is
+	// in [0, Jitter), it is ADDED to a pass time, and Spread only ever delays". A
+	// wrapped conversion would produce a NEGATIVE duration, which would pull a
+	// pass EARLIER than the floor Due enforces; the guard is what makes the
+	// invariant true, so re-verify this line if it ever changes.
+	//nolint:gosec // bounded by the c.Jitter <= 0 early return above
 	return time.Duration(h.Sum64() % uint64(c.Jitter))
 }
 

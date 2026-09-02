@@ -1814,7 +1814,12 @@ func (s *Service) revokeToken(
 				"lane", reg.Lane, "anchor", reg.Anchor, "token_type", t.hint, "reason", reason, "error", err)
 			continue
 		}
-		resp.Body.Close()
+		// Explicitly discarded: the request has been sent and the provider has
+		// answered, so a Close error changes neither what was revoked nor what
+		// this loop does next — the StatusCode below is the outcome that matters.
+		// Written as a blank assignment rather than left bare so that "nobody
+		// looked at this" and "somebody decided" are distinguishable by reading.
+		_ = resp.Body.Close()
 		if resp.StatusCode >= 300 {
 			slog.Error("intent: the provider rejected token revocation — REVOKE BY HAND",
 				"lane", reg.Lane, "anchor", reg.Anchor, "token_type", t.hint, "reason", reason,
