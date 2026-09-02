@@ -39,19 +39,34 @@ linters:
   settings:
     gosec:
       excludes:
-        # G101 "Potential hardcoded credentials" matches IDENTIFIER NAMES, not
-        # values. Every hit in this tree is a constant holding the NAME of an
-        # environment variable that a secret is read FROM at runtime — the three
-        # in internal/shared/cfedge/loader.go and
-        # internal/shared/grantcrypto/loader.go — plus the HTTP header name in
-        # internal/shared/auth/internal_secret.go, which carries its own
-        # annotation. No secret VALUE is a literal anywhere in this repository,
-        # and none may become one: everything sensitive arrives from the
-        # environment or from a secrets manager through those loaders.
+        # G101 "Potential hardcoded credentials" matches IDENTIFIER NAMES
+        # against a word list, not the VALUES assigned to them. Enumerated
+        # rather than described, because "they're all fine" is the sentence this
+        # repository exists to not accept. Three kinds, and nothing else:
+        #
+        #   - Constants holding the NAME of an environment variable a secret is
+        #     read from at runtime, in internal/shared/cfedge/loader.go,
+        #     internal/shared/cfoauth/loader.go and
+        #     internal/shared/grantcrypto/loader.go. The name is the string; the
+        #     secret is what the loader fetches with it.
+        #   - The HTTP header name in internal/shared/auth/internal_secret.go,
+        #     which carries its own //nolint:gosec.
+        #   - Cloudflare's published OAuth endpoint URLs in
+        #     internal/shared/cfoauth/cfoauth.go, matched because the struct
+        #     field is called TokenURL. A documented third-party URL.
+        #
+        # No secret VALUE is a literal anywhere in this repository, and none may
+        # become one: everything sensitive arrives from the environment or from
+        # a secrets manager, through those loaders.
         #
         # 🔴 WHAT WOULD MAKE THIS EXCLUSION WRONG: G101 changing to inspect the
-        # assigned VALUE rather than the identifier name. At that point it would
-        # start finding the thing it is named for, and excluding it would hide a
+        # assigned VALUE rather than the identifier name. Then it would start
+        # finding the thing it is named for, and excluding it would hide a
         # committed credential in a repository the whole internet can read.
-        # Re-check on every golangci-lint bump that moves the gosec version.
+        #
+        # 🔴 THE HIT SET IS VERSION-DEPENDENT, SO RE-READ IT ON EVERY BUMP. The
+        # gosec inside golangci-lint v2.13.2 finds three of the six above; a
+        # newer standalone gosec finds all six. A bump therefore changes which
+        # sites this line is speaking for, and the list above has to be re-walked
+        # rather than assumed to still be complete.
         - G101
