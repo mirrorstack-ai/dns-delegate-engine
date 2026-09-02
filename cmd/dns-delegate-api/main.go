@@ -747,6 +747,30 @@ func (d *dispatcher) serveConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// 🔴 G705 (XSS via taint analysis) TRACES THE ?registration QUERY PARAMETER
+	// TO THIS WRITE. Two named things bound it, and the annotation is worth
+	// exactly as much as they are:
+	//
+	//   1. `page` is not assembled from that parameter. It is the output of
+	//      html/template — internal/consent's pageTemplate, executed in
+	//      consent.render — and every action in it is a plain {{.Field}} on a
+	//      string in an HTML text or attribute context. There is no <script>, no
+	//      template.HTML, template.JS or template.URL anywhere in the package, so
+	//      contextual escaping applies to every value without exception.
+	//      internal/consent's TestPageEscapesEveryValueItRenders drives a plan of
+	//      deliberately hostile values through it and asserts none survives
+	//      unescaped; TestPageLoadsNothingAndPostsNowhere keeps the markup free of
+	//      any src or href.
+	//
+	//   2. The parameter itself never reaches the page. It is an AES-GCM sealed
+	//      envelope, opened by sealed.OpenRegistration under this deployment's own
+	//      keyset (Service.openRegistration); a value this service did not seal
+	//      fails authentication and leaves on the 404 path above with a constant
+	//      body. What renders is the plan DERIVED from the opened envelope.
+	//
+	// Re-verify this line if either changes: a template.HTML conversion, a
+	// <script> block, or a value spliced into the page outside the template.
+	//nolint:gosec // html/template escapes every value (TestPageEscapesEveryValueItRenders); the query parameter is an AES-GCM envelope opened by sealed.OpenRegistration and never rendered
 	if _, err := io.WriteString(w, page); err != nil {
 		slog.Error("dns-delegate-api: write consent page", "error", err)
 	}
