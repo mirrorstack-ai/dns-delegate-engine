@@ -6,8 +6,17 @@
 // proofs exist and false of every byte — a difference someone deciding whether to
 // hand this service a DNS credential is owed.
 //
-//	5  _<token>.<host>             CNAME  <token>.acm-validations.aws   lane 1 only
-//	7  _cf-custom-hostname.<host>  TXT    the serving proof             all lanes
+//	5   _<token>.<host>             CNAME  <token>.acm-validations.aws   lane 1 only
+//	7   _cf-custom-hostname.<host>  TXT    the serving proof             all lanes
+//	8-10 <token>._domainkey.<anchor> CNAME <token>.dkim.amazonses.com    all lanes
+//
+// Records 8-10 are the SES DKIM selectors, and they are the reason branded mail
+// works at all: without them a customer's zone carries no key AWS can sign with,
+// so every invitation this platform sends AS that customer is unsigned. They are
+// relayed for the same reason record 5 is — AWS chooses the tokens and nothing
+// here can predict them — and they arrive on the SAME schedule, which is to say
+// not at once. Three of them, always: SES Easy DKIM issues exactly three keys so
+// it can rotate one out without the customer touching DNS again.
 //
 // Record 6 (_acme-challenge.<host>) is derived rather than relayed, so it is not
 // here: it is a pointer whose halves are known before anything is asked of anyone,
@@ -63,6 +72,43 @@ var ErrUnexpectedRecord = errors.New("relay: upstream returned a record this ser
 // dropped quietly: a dropped one looks identical to a certificate AWS has simply
 // not filled in yet.
 const ValidationTargetSuffix = ".acm-validations.aws"
+
+// DkimTargetSuffix is the only zone a DKIM selector may point at, and it bounds
+// the half containment cannot for the same reason ValidationTargetSuffix does:
+// the token is AWS's, so the only thing knowable in advance is where it lives.
+//
+// 🔴 THE VALUE IS NOT FREE-FORM AND THE NAME IS NOT AN UNDERSCORE NAME. A DKIM
+// owner is `<token>._domainkey.<anchor>` — the token comes FIRST, so unlike every
+// other relayed record here the name does not begin with `_` and checkedRelayedName
+// would refuse it. That is why records 8-10 get their own check below rather than
+// riding the shared one; a "just relax the underscore rule" fix would have removed
+// the bound from records 5 and 7 as well.
+const DkimTargetSuffix = ".dkim.amazonses.com"
+
+// DkimTargetRoot is what a DKIM target is actually BOUNDED to. SES reports the
+// hosted zone its keys live in (DkimAttributes.SigningHostedZone) and that string
+// is not identical in every region, so the bound cannot be the full
+// DkimTargetSuffix without refusing legitimate identities outside the region we
+// happen to run in.
+//
+// 🔴 THIS IS A REAL WEAKENING, AND IT IS BOUNDED ON THE OTHER AXIS INSTEAD. What
+// still holds is that the target sits in a zone Amazon operates AND that its first
+// label is this record's own selector — so a relayed value can name a different
+// AWS region, and cannot name a different key, a different owner's identity, or
+// somebody else's domain. Dropping the selector check and keeping only this suffix
+// would be the weakening that matters.
+const DkimTargetRoot = ".amazonses.com"
+
+// DkimOwnerInfix is the label a DKIM selector hangs under. Asserted against, never
+// constructed from: the name is relayed verbatim and this only checks that what
+// came back is shaped like the record that was asked for.
+//
+// Exported for the reason ValidationTargetSuffix is — a reader deciding whether to
+// hand this service a DNS credential is owed the shape of every name it will
+// write. It is NOT read by internal/consent: that page renders whatever the plan
+// holds, row by row, from each item's own Explain, so these three appear there
+// without anything naming them.
+const DkimOwnerInfix = "._domainkey."
 
 // ServingProofPrefix is the owner name Cloudflare mints the serving proof at. It
 // is asserted against here, never constructed from: the name is relayed verbatim,
@@ -142,6 +188,154 @@ type EdgeHostnames interface {
 // in a test implements EdgeHostnames alone and reports no zones, truthfully.
 type EdgeZoneReporter interface {
 	EdgeZones() EdgeZones
+}
+
+// MailIdentity is AWS SES, read for records 8-10.
+//
+// 🔴 STATELESS AND READ-ONLY, AND THE READ-ONLY HALF IS A SAFETY PROPERTY, NOT AN
+// ACCIDENT. There is no VerifyDomainDkim here and there must never be: that call
+// MINTS an identity and starts SES's 72-hour verification clock, and api-platform
+// owns that lifecycle (its advance pass asks for the identity keyed on the
+// registration's apex). An engine that could mint would race the service that
+// already does, and could start a clock nobody is watching.
+//
+// 🔴 ABSENT IS A WAIT, AND SO IS "NO IDENTITY AT ALL". Two different empty
+// answers reach this interface and BOTH are legitimate: an identity SES has not
+// finished issuing tokens for, and an anchor with no identity yet because
+// api-platform has not asked for one. Return no records and no error for either.
+// What must NOT arrive as an empty answer is a read the credentials were refused
+// — that is a fault, it is spelled as an error, and the caller turns it into a
+// warning naming the missing grant. Collapsing the two is how an ungranted engine
+// looks exactly like a customer who has not onboarded yet.
+//
+// An implementation finds the tokens and spells the upstream's errors; DkimRecords
+// decides what may be published, re-checking every one.
+type MailIdentity interface {
+	DkimRecords(ctx context.Context, anchor string) ([]dnsplan.Record, error)
+}
+
+// DkimRecords returns the DKIM selectors this registration's apex owes, bounded.
+//
+// Keyed on the ANCHOR, not on the hosts: a registration has ONE sending identity
+// and it belongs to the apex. api-platform keys the SES identity on the group's
+// ownership_domain and sends as "noreply@" that same name, so asking per host
+// would ask for identities that do not exist and, if they ever did, would publish
+// three keys under a hostname nothing sends as.
+func DkimRecords(ctx context.Context, mail MailIdentity, anchor string) ([]dnsplan.Record, error) {
+	if mail == nil {
+		return nil, nil
+	}
+	anchor = dnsplan.NormalizeName(anchor)
+	if anchor == "" || len(anchor) > dnsplan.MaxDNSName {
+		return nil, nil
+	}
+	records, err := mail.DkimRecords(ctx, anchor)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(records))
+	out := make([]dnsplan.Record, 0, len(records))
+	for _, record := range records {
+		checked, err := checkedDkimRecord(anchor, record)
+		if err != nil {
+			return nil, err
+		}
+		identity := checked.Type + "|" + checked.Name + "|" + checked.Value
+		if _, ok := seen[identity]; ok {
+			continue
+		}
+		seen[identity] = struct{}{}
+		out = append(out, checked)
+	}
+	// Same reserve, same reason, same place in the order as ValidationRecords:
+	// after dedup, against the relay's share rather than the plan's whole budget.
+	if len(out) > MaxRelayed {
+		return nil, fmt.Errorf("%w: %d distinct DKIM records for %q, past the %d this relay may add to a plan",
+			ErrUnexpectedRecord, len(out), anchor, MaxRelayed)
+	}
+	// Sorted for the reason ValidationRecords is: the plan digest is order-sensitive
+	// and is taken before the customer authorizes, so two orders over one unchanged
+	// SES answer would tell someone on the consent screen the plan changed at random.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Value < out[j].Value
+	})
+	return out, nil
+}
+
+// checkedDkimRecord bounds one relayed selector.
+//
+// It does NOT call checkedRelayedName: a DKIM owner is `<token>._domainkey.<anchor>`
+// and does not begin with an underscore, so the shared check would refuse every
+// one. Everything that check does is done here against the anchor instead — a
+// usable name, within the DNS limit, contained by the anchor — plus the two bounds
+// only this record has.
+func checkedDkimRecord(anchor string, record dnsplan.Record) (dnsplan.Record, error) {
+	out := relayedRecord(record.Type, record.Name, record.Value)
+	if out.Name == "" || len(out.Name) > dnsplan.MaxDNSName {
+		return dnsplan.Record{}, fmt.Errorf("%w: a DKIM record has no usable name", ErrUnexpectedRecord)
+	}
+	if out.Type != "CNAME" {
+		return dnsplan.Record{}, fmt.Errorf("%w: the DKIM record for %q is a %s, not a CNAME",
+			ErrUnexpectedRecord, out.Name, out.Type)
+	}
+	// 🔴 CONTAINED BY THE ANCHOR, checked here rather than left to dnsplan. These
+	// records are the only relayed ones addressed at the registration's apex rather
+	// than beneath a host this pass named, so "beneath a host we asked about" — the
+	// bound records 5 and 7 get — does not apply and something has to replace it.
+	if !dnsplan.Contains(anchor, out.Name) {
+		return dnsplan.Record{}, fmt.Errorf("%w: the DKIM record %q is not beneath %q",
+			ErrUnexpectedRecord, out.Name, anchor)
+	}
+	// The selector label must actually be a selector: `<token>._domainkey.<anchor>`
+	// with a token that is exactly one label. Without this a bare
+	// `_domainkey.<anchor>`, or the infix buried anywhere beneath the anchor, passes.
+	token, ok := dkimSelectorToken(out.Name, anchor)
+	if !ok {
+		return dnsplan.Record{}, fmt.Errorf("%w: the DKIM record %q is not named <token>%s%s",
+			ErrUnexpectedRecord, out.Name, DkimOwnerInfix, anchor)
+	}
+	if len(out.Value) > dnsplan.MaxDNSName {
+		return dnsplan.Record{}, fmt.Errorf("%w: the DKIM record for %q has a %d-byte target, past the %d-byte DNS limit",
+			ErrUnexpectedRecord, out.Name, len(out.Value), dnsplan.MaxDNSName)
+	}
+	if !strings.HasSuffix(out.Value, DkimTargetRoot) {
+		return dnsplan.Record{}, fmt.Errorf("%w: the DKIM record for %q points at %q, which is not under %s",
+			ErrUnexpectedRecord, out.Name, out.Value, DkimTargetRoot)
+	}
+	// 🔴 THE TOKEN IN THE NAME MUST BE THE FIRST LABEL OF THE VALUE. SES publishes
+	// the public key for selector T at T.<hosted zone>, so a record whose halves
+	// disagree points a working-looking selector at another identity's key. Nothing
+	// downstream would notice: the name is contained, the target is an Amazon zone,
+	// and mail simply fails DKIM forever.
+	//
+	// Checked as a PREFIX rather than against the whole value, because the hosted
+	// zone between them is SES's to choose per region — see DkimTargetRoot.
+	zone, ok := strings.CutPrefix(strings.ToLower(out.Value), strings.ToLower(token)+".")
+	if !ok || zone == "" {
+		return dnsplan.Record{}, fmt.Errorf("%w: the DKIM record %q points at %q, which is not its own selector's key",
+			ErrUnexpectedRecord, out.Name, out.Value)
+	}
+	return out, nil
+}
+
+// dkimSelectorToken pulls the selector label out of `<token>._domainkey.<anchor>`,
+// reporting whether the name has exactly that shape.
+func dkimSelectorToken(name, anchor string) (string, bool) {
+	suffix := DkimOwnerInfix + anchor
+	if !strings.HasSuffix(name, suffix) {
+		return "", false
+	}
+	token := name[:len(name)-len(suffix)]
+	if token == "" || strings.Contains(token, ".") {
+		return "", false
+	}
+	return token, true
 }
 
 // ValidationRecords reads record 5 through ca for the given hosts, and bounds

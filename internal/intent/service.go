@@ -114,7 +114,12 @@ type Service struct {
 	// those ids when this one can report them, so a lane pointed at the wrong zone
 	// is visible from outside rather than only as hosts that never start serving.
 	Certificates relay.CertificateAuthority
-	Edge         relay.EdgeHostnames
+
+	// Mail is the THIRD optional upstream relay: AWS SES, read for the DKIM
+	// selectors (records 8-10). Nil is a deployment that publishes no DKIM, which
+	// DkimRecords treats as a wait — the same shape as a nil Certificates.
+	Mail relay.MailIdentity
+	Edge relay.EdgeHostnames
 
 	// HTTPClient is used for token exchange, refresh and revocation. Nil means a
 	// 10-second default.
@@ -1432,6 +1437,42 @@ func (s *Service) relayInto(ctx context.Context, plan derive.Plan) (derive.Plan,
 				Explain: fmt.Sprintf(
 					"Amazon chose this name and this value when it issued the certificate for %s. Deleting it does not take anything down today; the certificate stops renewing and %s fails months later, with nothing in your zone looking wrong.",
 					host, host),
+			})
+		}
+	}
+
+	// Records 8-10 — the DKIM selectors — hang off the ANCHOR, not off the hosts,
+	// because a registration has ONE sending identity and it belongs to the apex.
+	//
+	// 🔴 GATED BY THE LANE, NOT BY "the plan has an anchor". Every lane has an
+	// anchor, so testing for one published the ORG's mail keys under a lane-2 grant
+	// (an org's app parent) and a lane-3 grant (one app's domain, whose owner may
+	// be a person with no organization) — under consent pages that describe
+	// neither. See lane.MailIdentityAnchor.
+	if anchor := plan.Lane.MailIdentityAnchor(plan.Anchor); anchor != "" {
+		records, err := relay.DkimRecords(ctx, s.Mail, anchor)
+		if err != nil {
+			// 🔴 LOGGED, BECAUSE THE WARNING ALONE REACHES NOBODY. Warnings ride
+			// the response and api-platform's poller does not read them, so a
+			// relay this service could not perform was invisible on both sides —
+			// the exact silence that let DKIM go unpublished for months. Same
+			// shape as the DCV delegation read above.
+			slog.Warn("intent: the mail identity could not be read, so no DKIM records will be "+
+				"published and invitations cannot be signed as this domain",
+				"lane", plan.Lane, "anchor", anchor, "error", err)
+			// 🔴 THE CUSTOMER-FACING STRING CARRIES NO SDK ERROR. An AWS error text
+			// names the account id and the assumed role ARN, and this warning is
+			// rendered to whoever authorized the grant. The operator half is in the
+			// log line above, where those identifiers are ours to read.
+			warnings = append(warnings,
+				fmt.Sprintf("the mail identity for %s could not be read, so its DKIM records are not in this plan", anchor))
+		}
+		for _, record := range records {
+			items = append(items, derive.Item{
+				Record: record, Purpose: derive.PurposeDKIM, Source: derive.SourceRelayed, Host: anchor,
+				Explain: fmt.Sprintf(
+					"Amazon chose this name and this value when it created the mail identity for %s, and it holds the matching key. Publishing all three is what lets invitations be sent as %s and pass the checks a recipient's mail server runs; without them those messages are unsigned and land in spam. Deleting one takes nothing down and shows no error anywhere — mail just stops being signed as you.",
+					anchor, anchor),
 			})
 		}
 	}

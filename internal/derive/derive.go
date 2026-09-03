@@ -73,6 +73,17 @@ const (
 	// location. Derived here, carries no token, never changes. See DCVTarget.
 	PurposeCertDCV Purpose = "dcv"
 
+	// PurposeDKIM is records 8, 9 and 10: the SES DKIM selectors, at the
+	// registration's APEX rather than under any host. Relayed, never derived — AWS
+	// chooses the tokens. Three of them, always, because SES Easy DKIM issues three
+	// keys so it can rotate one out without the customer touching DNS again.
+	//
+	// Its own purpose because deleting one is unlike deleting anything else here:
+	// nothing goes down, no certificate stops renewing, and no page 526s. Mail
+	// simply stops being signed as the customer, which their recipients see as
+	// spam placement and their console does not see at all.
+	PurposeDKIM Purpose = "dkim"
+
 	// PurposeServing is record 7: Cloudflare's second, separate proof, read by
 	// the edge before it will route a name. Relayed, never derived. Its absence
 	// is a 526 while the certificate reads healthy, hence its own purpose.

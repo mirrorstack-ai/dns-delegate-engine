@@ -157,6 +157,27 @@ func (l Lane) Hosts(anchor string) []string {
 // CertificateHosts.
 const cdnLabel = "cdn"
 
+// MailIdentityAnchor is the name this lane's SES sending identity is keyed on, or
+// empty for a lane that has none.
+//
+// 🔴 ONLY LANE 1, AND THE OTHER TWO ARE NOT AN OVERSIGHT. The sending identity
+// belongs to an organization's own domain — MirrorStack sends invitations as
+// `noreply@<anchor>` for the console domain an org registered. Lanes 2 and 3
+// anchor an org's APPS and a single app's domain; nothing sends mail as either,
+// and an app domain's owner may be a person with no organization at all.
+//
+// Getting this wrong is not a missing record, it is a disclosure failure: a lane-2
+// grant would publish the ORG's mail keys under a consent page describing an app
+// parent, and a lane-3 grant would publish them under a domain whose owner never
+// asked to send mail. Same shape as CertificateHosts above — the lane decides,
+// never the anchor's spelling.
+func (l Lane) MailIdentityAnchor(anchor string) string {
+	if l != OrgPlatformDomain {
+		return ""
+	}
+	return strings.TrimSpace(anchor)
+}
+
 // CertificateHosts are the hostnames under anchor that an AWS certificate is
 // requested for: Hosts minus `cdn`, and only on the org platform lane
 // (docs/DESIGN.md §6 row 5).
