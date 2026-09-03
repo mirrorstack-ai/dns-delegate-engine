@@ -30,6 +30,7 @@ jobs:
     # RUNNER_LABELS is set org-wide to the self-hosted dgx-spark fleet. This
     # repository is PUBLIC: routing its jobs onto self-hosted hardware would let
     # any fork PR execute on our runners. Public repos never join the fleet.
+    timeout-minutes: 10  # p95 1.6m over 20 runs (gh-hosted); 2x p95
     runs-on: ubuntu-latest
 
     steps:
