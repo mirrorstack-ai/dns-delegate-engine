@@ -392,6 +392,7 @@ func main() {
 			Reach:    reach,
 
 			Certificates: certificateAuthority(context.Background()),
+			Mail:         mailIdentity(context.Background()),
 			Edge:         edge,
 			Delegation:   delegation,
 		},
@@ -436,6 +437,32 @@ func main() {
 // at Error because the alternative — a reader pointed at the wrong region —
 // answers "no records, no error", indistinguishable from an ACM that has not
 // filled them in yet, and would sit that way forever.
+// mailIdentity builds the SES reader for records 8-10, mirroring
+// certificateAuthority exactly — including the gate and the nil-on-failure.
+//
+// 🔴 NIL IS A DEPLOYMENT WITHOUT BRANDED MAIL, NOT A BROKEN ONE, which is why a
+// construction failure logs and returns nil rather than refusing to start: a
+// registration still needs its routing and certificate records published, and
+// taking the whole service down over the mail relay would trade an unsigned
+// invitation for an unrouted domain. What it must NOT do is fail quietly, hence
+// the log naming exactly what stops working.
+func mailIdentity(ctx context.Context) relay.MailIdentity {
+	if !config.IsLambda() {
+		return nil
+	}
+	// MS_SES_REGION overrides the case where the sending identity does not live in
+	// the function's own region. SES is regional and an identity verified in one
+	// region does not exist in another, so a wrong answer here reads as "this
+	// customer has no identity" rather than as a misconfiguration.
+	mail, err := relay.NewSES(ctx, os.Getenv("MS_SES_REGION"))
+	if err != nil {
+		slog.Error("dns-delegate-api: mail identity relay not wired, so no DKIM records will be "+
+			"published and branded invitations cannot be signed as the customer", "error", err)
+		return nil
+	}
+	return mail
+}
+
 func certificateAuthority(ctx context.Context) relay.CertificateAuthority {
 	if !config.IsLambda() {
 		return nil

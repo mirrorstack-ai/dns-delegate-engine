@@ -498,11 +498,32 @@ the only control.
 | 5 | `_<token>.<host>` | CNAME | `….acm-validations.aws` | 1 only | relayed from AWS |
 | 6 | `_acme-challenge.<host>` | CNAME | `<host>.<uuid>.dcv.cloudflare.com` | all three | this service — **derived** |
 | 7 | `_cf-custom-hostname.<host>` | TXT | the serving proof | all three | relayed from Cloudflare |
+| 8–10 | `<token>._domainkey.<anchor>` | CNAME | `<token>.dkim.amazonses.com` | all three | relayed from AWS |
 
-**Records 5 and 7 are relayed, not derived.** This service derives *that* a proof
-must exist and *why*; their bytes come from AWS and Cloudflare. "The engine
+**Records 5, 7 and 8–10 are relayed, not derived.** This service derives *that* a
+proof must exist and *why*; their bytes come from AWS and Cloudflare. "The engine
 derives the record set" is true of which proofs exist and false of every byte,
 and both halves of that belong in public.
+
+🔴 **Records 8–10 sit at the ANCHOR, and they are the only relayed rows that do.**
+A registration has one sending identity and it belongs to the apex: MirrorStack
+asks AWS for a DKIM identity keyed on the domain you registered, and sends
+invitations as `noreply@<anchor>`. Publishing them per host would ask for
+identities that do not exist and, if they ever did, would put three keys under a
+hostname nothing sends as.
+
+**Three of them, always.** SES Easy DKIM issues exactly three keys so it can
+rotate one out without you touching DNS again. AWS holds the private keys and
+publishes the public ones behind those three names, which is why they are CNAMEs
+into `dkim.amazonses.com` rather than a key written into your zone.
+
+🔴 **Deleting one is unlike deleting anything else in this table.** Nothing goes
+down, no certificate stops renewing, no page returns 526. Mail simply stops being
+signed as you — which your recipients see as spam placement and your console does
+not see at all. They must not be proxied, for a related reason: an orange-clouded
+DKIM CNAME is flattened at the edge, so the resolver checking a signature finds an
+address instead of the delegation and every signed message fails while the record
+looks correct in your dashboard.
 
 🔴 **Record 7 is read with MirrorStack's own Cloudflare token, in MirrorStack's
 own zone, and the zone is chosen by the LANE.** The org zone and the app/SaaS

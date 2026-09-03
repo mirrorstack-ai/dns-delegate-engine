@@ -68,14 +68,22 @@ registers up to four sibling hosts, and this is everything that lands:
 | `_<token>.apps.example.com` | CNAME | AWS certificate | ” |
 | `_acme-challenge.<host>` | CNAME | certificate | one per host, **permanent** |
 | `_cf-custom-hostname.<host>` | TXT | serving | one per host, when asked for |
+| `<token>._domainkey.example.com` | CNAME | mail (DKIM) | **three**, shared by all four hosts |
 
-Three things that table is saying quietly:
+Four things that table is saying quietly:
 
 - **`cdn` has no AWS certificate row, and that is not an omission.** A content
   host is terminated before it ever reaches AWS, so it owns no certificate there
   and is owed no validation record. The other three do.
 - **There is one ownership proof, not four.** It is anchored at the domain all
   four hosts have in common, which is what lets a single record cover the set.
+- **There are three DKIM rows and they are anchored, not per host.** One sending
+  identity belongs to the domain you registered, and invitations go out as
+  `noreply@example.com` — not as `noreply@account.example.com`, which reads as a
+  machine artifact and only aligns under relaxed DMARC. AWS issues three keys so
+  it can rotate one out without you touching DNS again. Leave them DNS-only: a
+  proxied DKIM CNAME is flattened at the edge and every signature fails while the
+  record still looks correct.
 - **The credential is held 24 hours**, because this record set is finite and
   known up front. See [lifetimes](#lifetimes).
 
