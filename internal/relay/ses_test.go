@@ -109,13 +109,26 @@ func TestSESWaitsRatherThanFailingWhenThereIsNothingToPublishYet(t *testing.T) {
 // can, so if this returned an empty answer instead, an ungranted engine would be
 // indistinguishable from a customer with no identity — on every pass, forever.
 func TestSESDeniedReadIsAnErrorThatNamesTheMissingGrant(t *testing.T) {
-	denied := errors.New("AccessDeniedException: User is not authorized to perform sesv2:GetEmailIdentity")
+	// 🔴 THE UPSTREAM MESSAGE MUST NOT CONTAIN THE ACTION, or this test is
+	// vacuous: it would pass on the fake's own text with the wrapper deleted. It
+	// also must not contain the identity, for the same reason. So the fixture is
+	// deliberately mute about both, and every assertion below can only be
+	// satisfied by something THIS package added.
+	denied := errors.New("AccessDeniedException: User is not authorized to perform that operation")
 	_, err := SES{API: &fakeSES{err: denied}}.DkimRecords(context.Background(), "emat.tw")
 	if err == nil {
 		t.Fatal("a denied read must be an error, not an empty answer")
 	}
-	if !strings.Contains(err.Error(), "sesv2:GetEmailIdentity") {
-		t.Errorf("the error must name the grant so the log says what to fix; got %q", err)
+	// 🔴 `ses:`, NOT `sesv2:`. v1 and v2 share one IAM service prefix, so a policy
+	// written `sesv2:GetEmailIdentity` grants nothing while looking correct —
+	// measured: it evaluates ses:GetEmailIdentity as an implicit deny. If this log
+	// line names an action that cannot be granted, it sends the next operator to
+	// write exactly that policy.
+	if !strings.Contains(err.Error(), "ses:GetEmailIdentity") {
+		t.Errorf("the error must name the grantable action so the log says what to fix; got %q", err)
+	}
+	if strings.Contains(err.Error(), "sesv2:") {
+		t.Errorf("the error names sesv2:, which is not an IAM action prefix; got %q", err)
 	}
 	if !strings.Contains(err.Error(), "emat.tw") {
 		t.Errorf("the error must name the identity it was reading; got %q", err)
@@ -241,3 +254,60 @@ func TestDkimRecordsWaitsWithoutARelayOrAnAnchor(t *testing.T) {
 		t.Fatalf("empty anchor must wait; got %+v %v", got, err)
 	}
 }
+
+// 🔴 THE HOSTED ZONE IS SES'S, NOT A LITERAL. An identity whose keys live in a
+// regionally-named zone must produce records pointing THERE. Hardcoding the zone
+// is right where we run today and wrong by construction, and the failure is
+// silent: three records resolving into a zone holding no key.
+func TestSESUsesTheHostedZoneSESReports(t *testing.T) {
+	out := identityWithTokens("aaa")
+	out.DkimAttributes.SigningHostedZone = ptrTo("dkim.eu-west-3.amazonses.com")
+	got, err := SES{API: &fakeSES{out: out}}.DkimRecords(context.Background(), "emat.tw")
+	if err != nil {
+		t.Fatalf("DkimRecords: %v", err)
+	}
+	if len(got) != 1 || got[0].Value != "aaa.dkim.eu-west-3.amazonses.com" {
+		t.Fatalf("want the reported zone, got %+v", got)
+	}
+	// And the bound above the interface must ACCEPT it — a bound that refused the
+	// regional zone would turn this fix into a refusal.
+	if _, err := DkimRecords(context.Background(), fakeMail{records: got}, "emat.tw"); err != nil {
+		t.Fatalf("the relayed record must survive its own bounds: %v", err)
+	}
+}
+
+// 🔴 BYODKIM IS NOT OURS TO PUBLISH. With EXTERNAL origin the customer's own
+// public key lives as a TXT at that selector; a CNAME over it replaces a working
+// key with a pointer to one AWS does not hold.
+func TestSESSkipsAnIdentityTheCustomerSignsThemselves(t *testing.T) {
+	out := identityWithTokens("aaa", "bbb", "ccc")
+	out.DkimAttributes.SigningAttributesOrigin = sesv2types.DkimSigningAttributesOriginExternal
+	got, err := SES{API: &fakeSES{out: out}}.DkimRecords(context.Background(), "emat.tw")
+	if err != nil {
+		t.Fatalf("BYODKIM is a skip, not a fault: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("must publish nothing over a customer-held key, got %+v", got)
+	}
+}
+
+// The control for the skip above, and it is the one that would have been missed:
+// the origin enum carries a dozen REGIONAL Easy DKIM values, and an equality test
+// against the bare AWS_SES would silently skip every identity outside one region.
+func TestSESPublishesRegionalEasyDkimOrigins(t *testing.T) {
+	for _, origin := range []sesv2types.DkimSigningAttributesOrigin{
+		sesv2types.DkimSigningAttributesOriginAwsSes,
+		sesv2types.DkimSigningAttributesOriginAwsSesEuWest3,
+		sesv2types.DkimSigningAttributesOriginAwsSesApSouth1,
+		"", // an older response that omits the field
+	} {
+		out := identityWithTokens("aaa")
+		out.DkimAttributes.SigningAttributesOrigin = origin
+		got, err := SES{API: &fakeSES{out: out}}.DkimRecords(context.Background(), "emat.tw")
+		if err != nil || len(got) != 1 {
+			t.Errorf("origin %q is Easy DKIM and must publish; got %+v %v", origin, got, err)
+		}
+	}
+}
+
+func ptrTo[T any](v T) *T { return &v }

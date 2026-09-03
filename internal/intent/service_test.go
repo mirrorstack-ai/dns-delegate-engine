@@ -1955,3 +1955,109 @@ func TestCapabilitiesNamesTheZoneEachLaneReadsItsServingProofFrom(t *testing.T) 
 		}
 	}
 }
+
+// stubMail answers relay.MailIdentity from a fixture, so an intent-level test can
+// wire the relay without an AWS account.
+type stubMail struct {
+	tokens []string
+	err    error
+	asked  []string
+}
+
+func (m *stubMail) DkimRecords(_ context.Context, anchor string) ([]dnsplan.Record, error) {
+	m.asked = append(m.asked, anchor)
+	if m.err != nil {
+		return nil, m.err
+	}
+	out := make([]dnsplan.Record, 0, len(m.tokens))
+	for _, token := range m.tokens {
+		out = append(out, dnsplan.Record{
+			Type:  "CNAME",
+			Name:  token + "._domainkey." + anchor,
+			Value: token + ".dkim.amazonses.com",
+		})
+	}
+	return out, nil
+}
+
+// 🔴 THE TEST THAT MAKES THE relayInto ARM LOAD-BEARING. Everything else about
+// DKIM is proven inside internal/relay, where the arm that CALLS it does not
+// exist — so deleting the block from relayInto passed the whole suite. This wires
+// Service.Mail and asserts the records reach a plan.
+func TestDkimRecordsReachThePlanForTheConsoleLane(t *testing.T) {
+	h := newHarness(t)
+	mail := &stubMail{tokens: []string{"aaa", "bbb", "ccc"}}
+	h.svc.Mail = mail
+
+	out := h.register(t, lane.OrgPlatformDomain, testOrg, platformDomain)
+	h.publishProof(t, out)
+	desc, err := h.svc.Describe(t.Context(), DescribeRequest{Registration: out.Registration})
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+
+	var got []RecordView
+	for _, r := range desc.Records {
+		if strings.Contains(r.Name, "._domainkey.") {
+			got = append(got, r)
+		}
+	}
+	if len(got) != 3 {
+		t.Fatalf("want the 3 DKIM records in the plan, got %d of %d records", len(got), len(desc.Records))
+	}
+	for _, r := range got {
+		// Keyed on the ANCHOR, never on a host: one identity per registration.
+		if !strings.HasSuffix(r.Name, "._domainkey."+platformDomain) {
+			t.Errorf("DKIM record %q is not keyed on the anchor", r.Name)
+		}
+		// checkItem refuses an item missing any of these, so the consent page
+		// cannot render a row nobody wrote an explanation for.
+		if r.Purpose == "" || r.Source == "" || r.Explain == "" {
+			t.Errorf("DKIM record %q has purpose=%q source=%q explain=%q; all three are required",
+				r.Name, r.Purpose, r.Source, r.Explain)
+		}
+		if r.Type != "CNAME" || r.Proxied {
+			t.Errorf("DKIM record %q must be a DNS-only CNAME, got type=%s proxied=%v", r.Name, r.Type, r.Proxied)
+		}
+	}
+	if len(mail.asked) == 0 || mail.asked[0] != platformDomain {
+		t.Errorf("the relay was asked for %v, want the anchor", mail.asked)
+	}
+}
+
+// 🔴 THE GATE, and it is a disclosure property rather than a missing feature. An
+// org's mail keys must not be published under a grant for its APP parent or for
+// one app's domain — consent pages that describe neither, and in lane 3 an owner
+// who may have no organization at all.
+func TestDkimRecordsAreNotPublishedOnTheAppLanes(t *testing.T) {
+	for _, tc := range []struct {
+		l        lane.Lane
+		identity string
+		domain   string
+	}{
+		{lane.OrgAppDomain, testOrg, appParent},
+		{lane.AppDomain, testApp, appHostname},
+	} {
+		t.Run(string(tc.l), func(t *testing.T) {
+			h := newHarness(t)
+			mail := &stubMail{tokens: []string{"aaa", "bbb", "ccc"}}
+			h.svc.Mail = mail
+
+			out := h.register(t, tc.l, tc.identity, tc.domain)
+			h.publishProof(t, out)
+			desc, err := h.svc.Describe(t.Context(), DescribeRequest{Registration: out.Registration})
+			if err != nil {
+				t.Fatalf("describe: %v", err)
+			}
+			for _, r := range desc.Records {
+				if strings.Contains(r.Name, "._domainkey.") {
+					t.Fatalf("lane %s published a DKIM record %q; the sending identity is lane 1's alone", tc.l, r.Name)
+				}
+			}
+			// And it must not even ASK: a read costs a grant we do not need here.
+			if len(mail.asked) != 0 {
+				t.Errorf("lane %s read the mail identity for %v; it has none", tc.l, mail.asked)
+			}
+		})
+	}
+}

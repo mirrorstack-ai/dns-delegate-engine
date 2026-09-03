@@ -85,12 +85,29 @@ const ValidationTargetSuffix = ".acm-validations.aws"
 // the bound from records 5 and 7 as well.
 const DkimTargetSuffix = ".dkim.amazonses.com"
 
+// DkimTargetRoot is what a DKIM target is actually BOUNDED to. SES reports the
+// hosted zone its keys live in (DkimAttributes.SigningHostedZone) and that string
+// is not identical in every region, so the bound cannot be the full
+// DkimTargetSuffix without refusing legitimate identities outside the region we
+// happen to run in.
+//
+// 🔴 THIS IS A REAL WEAKENING, AND IT IS BOUNDED ON THE OTHER AXIS INSTEAD. What
+// still holds is that the target sits in a zone Amazon operates AND that its first
+// label is this record's own selector — so a relayed value can name a different
+// AWS region, and cannot name a different key, a different owner's identity, or
+// somebody else's domain. Dropping the selector check and keeping only this suffix
+// would be the weakening that matters.
+const DkimTargetRoot = ".amazonses.com"
+
 // DkimOwnerInfix is the label a DKIM selector hangs under. Asserted against, never
 // constructed from: the name is relayed verbatim and this only checks that what
 // came back is shaped like the record that was asked for.
 //
-// Exported because internal/consent names these records on the page a customer
-// agrees to, and a copy there could describe a name this package would refuse.
+// Exported for the reason ValidationTargetSuffix is — a reader deciding whether to
+// hand this service a DNS credential is owed the shape of every name it will
+// write. It is NOT read by internal/consent: that page renders whatever the plan
+// holds, row by row, from each item's own Explain, so these three appear there
+// without anything naming them.
 const DkimOwnerInfix = "._domainkey."
 
 // ServingProofPrefix is the owner name Cloudflare mints the serving proof at. It
@@ -287,16 +304,20 @@ func checkedDkimRecord(anchor string, record dnsplan.Record) (dnsplan.Record, er
 		return dnsplan.Record{}, fmt.Errorf("%w: the DKIM record for %q has a %d-byte target, past the %d-byte DNS limit",
 			ErrUnexpectedRecord, out.Name, len(out.Value), dnsplan.MaxDNSName)
 	}
-	if !strings.HasSuffix(out.Value, DkimTargetSuffix) {
-		return dnsplan.Record{}, fmt.Errorf("%w: the DKIM record for %q points at %q, not %s",
-			ErrUnexpectedRecord, out.Name, out.Value, DkimTargetSuffix)
+	if !strings.HasSuffix(out.Value, DkimTargetRoot) {
+		return dnsplan.Record{}, fmt.Errorf("%w: the DKIM record for %q points at %q, which is not under %s",
+			ErrUnexpectedRecord, out.Name, out.Value, DkimTargetRoot)
 	}
-	// 🔴 THE TOKEN IN THE NAME MUST BE THE TOKEN IN THE VALUE. SES publishes the
-	// public key for selector T at T.dkim.amazonses.com, so a record whose halves
+	// 🔴 THE TOKEN IN THE NAME MUST BE THE FIRST LABEL OF THE VALUE. SES publishes
+	// the public key for selector T at T.<hosted zone>, so a record whose halves
 	// disagree points a working-looking selector at another identity's key. Nothing
-	// downstream would notice: the name is contained, the target is the right zone,
+	// downstream would notice: the name is contained, the target is an Amazon zone,
 	// and mail simply fails DKIM forever.
-	if !strings.EqualFold(out.Value, token+DkimTargetSuffix) {
+	//
+	// Checked as a PREFIX rather than against the whole value, because the hosted
+	// zone between them is SES's to choose per region — see DkimTargetRoot.
+	zone, ok := strings.CutPrefix(strings.ToLower(out.Value), strings.ToLower(token)+".")
+	if !ok || zone == "" {
 		return dnsplan.Record{}, fmt.Errorf("%w: the DKIM record %q points at %q, which is not its own selector's key",
 			ErrUnexpectedRecord, out.Name, out.Value)
 	}

@@ -437,6 +437,21 @@ func main() {
 // at Error because the alternative — a reader pointed at the wrong region —
 // answers "no records, no error", indistinguishable from an ACM that has not
 // filled them in yet, and would sit that way forever.
+func certificateAuthority(ctx context.Context) relay.CertificateAuthority {
+	if !config.IsLambda() {
+		return nil
+	}
+	// MS_ACM_REGION overrides the case where the certificates do not live in the
+	// function's own region. Empty is normal: the execution environment's.
+	ca, err := relay.NewACM(ctx, os.Getenv("MS_ACM_REGION"))
+	if err != nil {
+		slog.Error("dns-delegate-api: certificate relay not wired, so lane 1 will publish "+
+			"no ACM validation records and its certificates cannot validate", "error", err)
+		return nil
+	}
+	return ca
+}
+
 // mailIdentity builds the SES reader for records 8-10, mirroring
 // certificateAuthority exactly — including the gate and the nil-on-failure.
 //
@@ -461,21 +476,6 @@ func mailIdentity(ctx context.Context) relay.MailIdentity {
 		return nil
 	}
 	return mail
-}
-
-func certificateAuthority(ctx context.Context) relay.CertificateAuthority {
-	if !config.IsLambda() {
-		return nil
-	}
-	// MS_ACM_REGION overrides the case where the certificates do not live in the
-	// function's own region. Empty is normal: the execution environment's.
-	ca, err := relay.NewACM(ctx, os.Getenv("MS_ACM_REGION"))
-	if err != nil {
-		slog.Error("dns-delegate-api: certificate relay not wired, so lane 1 will publish "+
-			"no ACM validation records and its certificates cannot validate", "error", err)
-		return nil
-	}
-	return ca
 }
 
 // The two MirrorStack zones record 7 is read from, one per lane. Named beside

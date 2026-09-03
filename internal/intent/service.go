@@ -1443,10 +1443,29 @@ func (s *Service) relayInto(ctx context.Context, plan derive.Plan) (derive.Plan,
 
 	// Records 8-10 — the DKIM selectors — hang off the ANCHOR, not off the hosts,
 	// because a registration has ONE sending identity and it belongs to the apex.
-	if anchor := strings.TrimSpace(plan.Anchor); anchor != "" {
+	//
+	// 🔴 GATED BY THE LANE, NOT BY "the plan has an anchor". Every lane has an
+	// anchor, so testing for one published the ORG's mail keys under a lane-2 grant
+	// (an org's app parent) and a lane-3 grant (one app's domain, whose owner may
+	// be a person with no organization) — under consent pages that describe
+	// neither. See lane.MailIdentityAnchor.
+	if anchor := plan.Lane.MailIdentityAnchor(plan.Anchor); anchor != "" {
 		records, err := relay.DkimRecords(ctx, s.Mail, anchor)
 		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("the mail identity could not be read: %v", err))
+			// 🔴 LOGGED, BECAUSE THE WARNING ALONE REACHES NOBODY. Warnings ride
+			// the response and api-platform's poller does not read them, so a
+			// relay this service could not perform was invisible on both sides —
+			// the exact silence that let DKIM go unpublished for months. Same
+			// shape as the DCV delegation read above.
+			slog.Warn("intent: the mail identity could not be read, so no DKIM records will be "+
+				"published and invitations cannot be signed as this domain",
+				"lane", plan.Lane, "anchor", anchor, "error", err)
+			// 🔴 THE CUSTOMER-FACING STRING CARRIES NO SDK ERROR. An AWS error text
+			// names the account id and the assumed role ARN, and this warning is
+			// rendered to whoever authorized the grant. The operator half is in the
+			// log line above, where those identifiers are ours to read.
+			warnings = append(warnings,
+				fmt.Sprintf("the mail identity for %s could not be read, so its DKIM records are not in this plan", anchor))
 		}
 		for _, record := range records {
 			items = append(items, derive.Item{

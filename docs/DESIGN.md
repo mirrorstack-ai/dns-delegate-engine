@@ -512,6 +512,18 @@ invitations as `noreply@<anchor>`. Publishing them per host would ask for
 identities that do not exist and, if they ever did, would put three keys under a
 hostname nothing sends as.
 
+The zone half of the value comes from SES itself (`SigningHostedZone`), not from a
+constant here: it is not the same string in every region. What this service still
+bounds is that the target sits under `amazonses.com` and that its first label is
+the record's own selector — so a relayed value may name a different AWS region and
+may not name a different key. Those bounds are example-tested; a fuzz case over
+the relayed value is a follow-up.
+
+An identity the customer signs themselves (BYODKIM, `SigningAttributesOrigin =
+EXTERNAL`) is skipped entirely: their own public key already lives as a TXT at that
+selector, and a CNAME over it would replace a working key with a pointer to one AWS
+does not hold.
+
 **Three of them, always.** SES Easy DKIM issues exactly three keys so it can
 rotate one out without you touching DNS again. AWS holds the private keys and
 publishes the public ones behind those three names, which is why they are CNAMEs
