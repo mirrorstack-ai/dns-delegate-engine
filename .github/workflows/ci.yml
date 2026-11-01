@@ -67,6 +67,14 @@ jobs:
         with:
           version: v2.13.2
 
+      # Vulnerability scan (govulncheck). Owner decision D410: free scanner, no
+      # paid Code Security. Exit 3 means the code CALLS a vulnerable symbol.
+      - name: Vulnerability scan (govulncheck)
+        run: |
+          set -euo pipefail
+          GOBIN="$RUNNER_TEMP/govulncheck-bin" go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          "$RUNNER_TEMP/govulncheck-bin/govulncheck" ./...
+
       - name: Build
         run: go build ./...
 
