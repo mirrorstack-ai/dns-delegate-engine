@@ -43,6 +43,7 @@ env:
 jobs:
   publish:
     # Public repository: never the self-hosted fleet. See ci.yml.
+    timeout-minutes: 10  # p95 0.5m over 20 runs (gh-hosted); 2x p95
     runs-on: ubuntu-latest
 
     steps:
