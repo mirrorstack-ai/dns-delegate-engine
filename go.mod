@@ -2,7 +2,7 @@ module github.com/mirrorstack-ai/dns-delegate-engine
 
 go 1.26
 
-toolchain go1.26.10
+toolchain go1.26.11
 
 require (
 	github.com/aws/aws-lambda-go v1.54.0
